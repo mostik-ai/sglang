@@ -80,6 +80,7 @@ class SchedulerOutputStreamer:
     rust_server: Optional[RustServer] = None
     # Set when the scheduler first defers a response; see deferred_output.
     defer_outputs: bool = False
+    is_multimodal_gen: bool = False
     _test_stream_output_count: int = 0
 
     def __post_init__(self) -> None:
@@ -229,6 +230,8 @@ class SchedulerOutputStreamer:
                 acc.customized_info[key] = values
 
         # Send to detokenizer
+        if self.is_multimodal_gen:
+            return
         payload = acc.to_payload(
             dp_rank=get_parallel().dp_rank,
             is_idle_batch=is_idle_batch,
