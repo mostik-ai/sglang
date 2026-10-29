@@ -560,5 +560,6 @@ POSITIONAL_FIELD_ORDER = (
     "engram_config",
     "moe_ascend_ops_config",
     "enable_prefill_weight_versions",
+    "enable_token_space_processor",
 )
 # fmt: on
