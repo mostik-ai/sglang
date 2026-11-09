@@ -2114,6 +2114,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        # The language model knows the gated q_proj and the shared expert's
+        # width; the generic LoRA fallback sizes both wrongly.
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")
 
