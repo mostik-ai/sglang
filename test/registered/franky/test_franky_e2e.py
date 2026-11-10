@@ -32,6 +32,9 @@ _LAYERS = [6, 12, 18, 24]
 _TAP_SIZE = 256
 _MLP_SIZE = 256
 _PAGE_SIZE = 16
+# Qwen3.5's linear attention checkpoints its state, and so its cached prefix, at
+# whole chunks: https://github.com/fla-org/flash-linear-attention (chunk size 64).
+_STATE_CHUNK = 64
 _NEW_TOKENS = 8
 _TEXT = (
     "The river ran through the old town, past the mill and the bakery, under the "
@@ -296,10 +299,10 @@ class TestFrankyEndToEnd(CustomTestCase):
             franky_chain={"id": chain, "last_block": True},
         )
 
-        whole_pages = len(prompt) - len(prompt) % _PAGE_SIZE
+        whole_chunks = len(prompt) - len(prompt) % _STATE_CHUNK
         for url in (self.sandy_url, self.ricky_url):
             self.assertGreaterEqual(
-                second[url]["meta_info"]["cached_tokens"], whole_pages, url
+                second[url]["meta_info"]["cached_tokens"], whole_chunks, url
             )
         pairs = second[self.ricky_url]["meta_info"]["output_token_logprobs"]
         tokens = [pair[1] for pair in pairs]
