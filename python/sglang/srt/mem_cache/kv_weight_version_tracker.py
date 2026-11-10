@@ -34,8 +34,13 @@ class KvWeightVersionRecord(msgspec.Struct):
             and model_runner.server_args.enable_prefill_weight_versions
             and forward_batch.out_cache_loc is not None
         ):
+            slot_indices = forward_batch.out_cache_loc_virtual
+            if slot_indices is None:
+                slot_indices = forward_batch.origin_out_cache_loc
+            if slot_indices is None:
+                slot_indices = forward_batch.out_cache_loc
             return cls.capture(
-                slot_indices=forward_batch.out_cache_loc,
+                slot_indices=slot_indices,
                 version=get_serving().weight_version,
             )
         return None
@@ -79,12 +84,19 @@ class KvWeightVersionTracker:
         )
 
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 
-        if isinstance(allocator, SWATokenToKVPoolAllocator):
-            allocator = allocator.full_attn_allocator
+        if isinstance(allocator, ChainAllocator):
+            # Unified virtual ids reach past size_full, across the id space the
+            # direct-indexed draft pool is sized by.
+            num_slots = allocator.draft_virtual_id_space
+        else:
+            if isinstance(allocator, SWATokenToKVPoolAllocator):
+                allocator = allocator.full_attn_allocator
+            num_slots = allocator.size_full
 
         return cls(
-            num_slots=allocator.size_full + allocator.page_size,
+            num_slots=num_slots + allocator.page_size,
             device=allocator.device,
             req_to_token_pool=req_to_token_pool,
         )

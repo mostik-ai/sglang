@@ -107,44 +107,56 @@ class TestKvWeightVersionTracker(CustomTestCase):
             [WeightVersionSpan(version="v0", start=0, end=1)],
         )
 
-    def test_unified_swa_virtual_slots_above_the_static_quota_keep_their_versions(
+    def test_swa_full_allocator_slots_above_wrapper_capacity_keep_their_versions(
         self,
     ) -> None:
-        """Legal virtual slots above the static token quota remain addressable by the tracker."""
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
-        )
+        """The SWA tracker covers the full allocator's address range."""
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
         for page_size in (1, 4):
             with self.subTest(page_size=page_size):
-                allocator = UnifiedSWATokenToKVPoolAllocator.__new__(
-                    UnifiedSWATokenToKVPoolAllocator
-                )
+                allocator = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
                 allocator._size_full = 8
                 allocator.page_size = page_size
                 allocator.device = "cpu"
                 allocator.full_attn_allocator = SimpleNamespace(
                     size_full=32, page_size=page_size, device="cpu"
                 )
-                tracker = KvWeightVersionTracker.maybe_create(
-                    server_args=SimpleNamespace(
-                        enable_prefill_weight_versions=True, pp_size=1
-                    ),
-                    model_config=SimpleNamespace(
-                        is_encoder_decoder=False, is_generation=True
-                    ),
-                    allocator=allocator,
-                    req_to_token_pool=_ReqToTokenPoolStub([31]),
-                )
-                req = _ReqStub(num_prompt_tokens=1, kv_committed_len=1)
+                self._assert_slot_31_keeps_its_version(allocator)
 
-                tracker.record(slot_indices=_slots(31), version="v2")
-                tracker.fill_req_prefill_weight_versions(req)
+    def test_unified_virtual_slots_above_the_static_quota_keep_their_versions(
+        self,
+    ) -> None:
+        """Virtual ids the unified allocator hands out past size_full stay addressable."""
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 
-                self.assertEqual(
-                    req.prefill_weight_versions,
-                    [WeightVersionSpan(version="v2", start=0, end=1)],
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                allocator = ChainAllocator.__new__(ChainAllocator)
+                allocator._policy = SimpleNamespace(size_full=lambda chain: 8)
+                allocator.page_size = page_size
+                allocator.device = "cpu"
+                allocator.full_attn_allocator = SimpleNamespace(
+                    max_slots=32, shards_under_dcp=False
                 )
+                self._assert_slot_31_keeps_its_version(allocator)
+
+    def _assert_slot_31_keeps_its_version(self, allocator) -> None:
+        tracker = KvWeightVersionTracker.maybe_create(
+            server_args=SimpleNamespace(enable_prefill_weight_versions=True, pp_size=1),
+            model_config=SimpleNamespace(is_encoder_decoder=False, is_generation=True),
+            allocator=allocator,
+            req_to_token_pool=_ReqToTokenPoolStub([31]),
+        )
+        req = _ReqStub(num_prompt_tokens=1, kv_committed_len=1)
+
+        tracker.record(slot_indices=_slots(31), version="v2")
+        tracker.fill_req_prefill_weight_versions(req)
+
+        self.assertEqual(
+            req.prefill_weight_versions,
+            [WeightVersionSpan(version="v2", start=0, end=1)],
+        )
 
     def test_equal_neighbours_merge_while_a_returning_version_starts_a_new_span(self):
         """Run-length compression merges adjacent equal versions and never merges across a change."""

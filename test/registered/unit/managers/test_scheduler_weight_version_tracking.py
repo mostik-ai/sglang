@@ -212,6 +212,11 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         serving = _ServingStub("v0")
         scheduler = self._scheduler()
         batch = self._batch()
+        forward_batch = SimpleNamespace(
+            out_cache_loc=batch.out_cache_loc,
+            out_cache_loc_virtual=None,
+            origin_out_cache_loc=None,
+        )
 
         runner = ModelRunner.__new__(ModelRunner)
         runner.is_draft_worker = False
@@ -223,7 +228,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             result = GenerationBatchResult(
                 next_token_ids=torch.tensor([], dtype=torch.int64),
                 kv_weight_version_record=KvWeightVersionRecord.maybe_capture(
-                    model_runner=runner, forward_batch=batch
+                    model_runner=runner, forward_batch=forward_batch
                 ),
             )
             queued_batch = batch.copy()

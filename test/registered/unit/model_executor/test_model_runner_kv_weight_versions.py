@@ -30,7 +30,9 @@ class TestModelRunnerKvWeightVersions(CustomTestCase):
                     enable_prefill_weight_versions=enabled
                 )
                 batch = SimpleNamespace(
-                    out_cache_loc=torch.tensor([4, 5]) if has_slots else None
+                    out_cache_loc=torch.tensor([4, 5]) if has_slots else None,
+                    out_cache_loc_virtual=None,
+                    origin_out_cache_loc=None,
                 )
                 with patch(
                     "sglang.srt.mem_cache.kv_weight_version_tracker.get_serving",
@@ -97,6 +99,37 @@ class TestModelRunnerKvWeightVersions(CustomTestCase):
 
         self.assertEqual(record.slot_indices.tolist(), [4, 5])
         self.assertEqual(completed, [True])
+
+
+class TestKvProvenanceForwardPaths(CustomTestCase):
+    def test_translated_forward_records_request_table_slot_ids(self) -> None:
+        """Physical or rank-local writes retain allocator-global KV provenance."""
+        for translated in (False, True):
+            with self.subTest(translated=translated):
+                runner = SimpleNamespace(
+                    is_draft_worker=False,
+                    server_args=SimpleNamespace(enable_prefill_weight_versions=True),
+                )
+                logical_slots = torch.tensor([7, 9])
+                batch = SimpleNamespace(
+                    out_cache_loc=torch.tensor([1, 2]),
+                    out_cache_loc_virtual=logical_slots if translated else None,
+                    origin_out_cache_loc=torch.tensor([3, 4])
+                    if translated
+                    else logical_slots,
+                )
+
+                with patch(
+                    "sglang.srt.mem_cache.kv_weight_version_tracker.get_serving",
+                    return_value=SimpleNamespace(weight_version="v1"),
+                ):
+                    record = KvWeightVersionRecord.maybe_capture(
+                        model_runner=runner, forward_batch=batch
+                    )
+
+                logical_slots.fill_(0)
+                assert record.slot_indices.tolist() == [7, 9]
+                assert record.version == "v1"
 
 
 if __name__ == "__main__":
