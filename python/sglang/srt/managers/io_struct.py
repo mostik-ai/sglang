@@ -1142,8 +1142,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
-    franky_room: Optional[FrankyRoom] = None
-    franky_chain: Optional[FrankyChain] = None
 
     # For DP routing
     routed_dp_rank: Optional[int] = None
@@ -1202,6 +1200,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # Franky: where the request's taps meet, and the chain of blocks it is one of.
+    franky_room: Optional[FrankyRoom] = None
+    franky_chain: Optional[FrankyChain] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
