@@ -40,6 +40,7 @@ class RickyScheduler(Scheduler):
     """A Ricky engine that runs prefills: without PD, or as PD prefill. A request
     takes KV pages for its prompt at arrival, and joins a batch only for tokens
     whose taps have landed. PD prefill relays the taps to Ricky decode with the KV.
+    A cache flush drops every chain hold.
     """
 
     @override
@@ -200,6 +201,11 @@ class RickyScheduler(Scheduler):
                 reason_for_tokenizer=recv_req.finished_reason,
             )
         super().abort_request(recv_req)
+
+    @override
+    def flush_cache(self, empty_cache: bool = True) -> bool:
+        self.franky_chain_holds.release_all()
+        return super().flush_cache(empty_cache=empty_cache)
 
     @override
     def on_idle(self) -> None:
