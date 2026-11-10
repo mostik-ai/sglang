@@ -22,6 +22,17 @@ const PROMPT_FIELDS: [&str; 6] = [
 ];
 /// `meta_info` counts that add up over the blocks.
 const COUNTS: [&str; 2] = ["completion_tokens", "reasoning_tokens"];
+/// `meta_info` fields that tell how the current block went on its engine; the
+/// timings come with the engine's `--enable-metrics`.
+const BLOCK_REPORT_FIELDS: [&str; 7] = [
+    "prompt_tokens",
+    "cached_tokens",
+    "request_received_ts",
+    "queue_time",
+    "forward_entry_time",
+    "first_token_latency",
+    "request_finished_ts",
+];
 
 /// Output of one or more blocks: text, token ids, per-token fields and counts.
 #[derive(Default)]
@@ -84,6 +95,13 @@ impl Generated {
     }
 }
 
+fn fields_of(meta: &Value, names: &[&str]) -> Map<String, Value> {
+    names
+        .iter()
+        .filter_map(|name| Some(((*name).to_string(), meta.get(name)?.clone())))
+        .collect()
+}
+
 fn append(fields: &mut Map<String, Value>, field: &str, values: &[Value]) {
     if let Value::Array(existing) = fields
         .entry(field)
@@ -104,8 +122,7 @@ pub(super) struct ChainOutput {
     finished: Generated,
     current: Generated,
     prompt_meta: Option<Map<String, Value>>,
-    /// The current block's own prompt fields, as its engine reported them.
-    block_prompt: Map<String, Value>,
+    block_report: Map<String, Value>,
     last_block: bool,
     finish_reason: Value,
 }
@@ -118,7 +135,7 @@ impl ChainOutput {
             finished: Generated::default(),
             current: Generated::default(),
             prompt_meta: None,
-            block_prompt: Map::new(),
+            block_report: Map::new(),
             last_block: false,
             finish_reason: Value::Null,
         }
@@ -182,10 +199,11 @@ impl ChainOutput {
         self.finished.extend(current);
     }
 
-    /// The current block's prompt fields as its engine reported them, such as
-    /// `cached_tokens`, which shows what the chain's hold kept.
-    pub(super) fn block_prompt(&self) -> &Map<String, Value> {
-        &self.block_prompt
+    /// How the current block went on its engine, as its last frame said: its
+    /// `cached_tokens` show what the chain's hold kept, its timings where the
+    /// block waited.
+    pub(super) fn block_report(&self) -> &Map<String, Value> {
+        &self.block_report
     }
 
     /// The token ids every finished block generated, in order.
@@ -195,12 +213,9 @@ impl ChainOutput {
 
     fn record(&mut self, frame: &Value, incremental: bool) {
         let meta = &frame["meta_info"];
-        self.block_prompt = PROMPT_FIELDS
-            .iter()
-            .filter_map(|field| Some(((*field).to_string(), meta.get(field)?.clone())))
-            .collect();
+        self.block_report = fields_of(meta, &BLOCK_REPORT_FIELDS);
         if self.prompt_meta.is_none() {
-            self.prompt_meta = Some(self.block_prompt.clone());
+            self.prompt_meta = Some(fields_of(meta, &PROMPT_FIELDS));
         }
         if !meta["finish_reason"].is_null() {
             self.finish_reason = meta["finish_reason"].clone();
