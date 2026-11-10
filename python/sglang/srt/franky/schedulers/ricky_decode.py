@@ -17,8 +17,7 @@ if TYPE_CHECKING:
 
 class RickyDecodeScheduler(Scheduler):
     """A Ricky PD decode engine. Each request's taps come from Ricky prefill in the
-    room of its KV, and PD hands a request to decode only once both landed. It
-    keeps no cache, so ending a chain only aborts the chain's requests here.
+    room of its KV, and PD hands a request to decode only once both landed.
     """
 
     @override

@@ -15,7 +15,9 @@ import requests
 import torch
 from safetensors.torch import save_file
 from torch.nn import functional
+from transformers import AutoTokenizer
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as _STATE_CHUNK
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -32,9 +34,6 @@ _LAYERS = [6, 12, 18, 24]
 _TAP_SIZE = 256
 _MLP_SIZE = 256
 _PAGE_SIZE = 16
-# Qwen3.5's linear attention checkpoints its state, and so its cached prefix, at
-# whole chunks: https://github.com/fla-org/flash-linear-attention (chunk size 64).
-_STATE_CHUNK = 64
 _NEW_TOKENS = 8
 _TEXT = (
     "The river ran through the old town, past the mill and the bakery, under the "
@@ -188,8 +187,6 @@ class TestFrankyEndToEnd(CustomTestCase):
         return [pair[1] for pair in pairs], torch.tensor([pair[0] for pair in pairs])
 
     def _send(self, ids, room, **block):
-        """Both engines' answers to the prompt sent in one room; ``block`` adds a
-        chain block's ``rid`` and ``franky_chain``."""
         franky_room = {
             "bootstrap_host": "127.0.0.1",
             "bootstrap_port": self.bootstrap_port,
@@ -278,10 +275,6 @@ class TestFrankyEndToEnd(CustomTestCase):
             self.assertGreater(readers_effect, 4 * error)
 
     def test_a_chains_next_block_reuses_its_held_prompt_and_reads_new_taps(self):
-        """Block 2 of a chain finds block 1's prompt held on both engines, takes
-        taps only past it, and its tokens read the taps of block 2's context."""
-        from transformers import AutoTokenizer
-
         prompt = AutoTokenizer.from_pretrained(_MODEL).encode(_TEXT * 6)
         chain = "chain4200"
         first = self._send(
@@ -296,7 +289,7 @@ class TestFrankyEndToEnd(CustomTestCase):
             context,
             4201,
             rid=f"{chain}-2",
-            franky_chain={"id": chain, "last_block": True},
+            franky_chain={"id": chain, "block": 2, "last_block": True},
         )
 
         whole_chunks = len(prompt) - len(prompt) % _STATE_CHUNK

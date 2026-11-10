@@ -272,6 +272,22 @@ class TestHandleFranky(_WithFiles):
             server_args._resolved_overrides,
         )
 
+    def test_sandy_runs_without_overlap_scheduling(self):
+        sandy = self._server_args(side="sandy")
+        ricky = self._server_args(side="ricky")
+
+        handle_franky(sandy)
+        handle_franky(ricky)
+
+        self.assertIn(
+            ("handle_franky", {"disable_overlap_schedule": True}),
+            sandy._resolved_overrides,
+        )
+        self.assertNotIn(
+            ("handle_franky", {"disable_overlap_schedule": True}),
+            getattr(ricky, "_resolved_overrides", []),
+        )
+
     def test_each_side_picks_its_own_attention_dp_size(self):
         for side, attn_dp_size in (("sandy", 2), ("ricky", 4)):
             with self.subTest(side):

@@ -1,17 +1,24 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import msgspec
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
+
 
 class FrankyChain(msgspec.Struct, frozen=True, kw_only=True):
-    """The chain of blocks one client request runs as: the router sends each
-    block as a request whose rid starts with ``id``. After a block that is not
-    ``last_block``, each engine holds the chain's cached prefix for the next one.
+    """The chain of blocks a client request runs as, seen from one of its blocks.
+
+    Args:
+        id: the chain's id; the rid of each of its blocks starts with it.
+        block: this block's number, from 1.
+        last_block: no block follows this one, so the engines hold nothing after it.
     """
 
-    id: str
+    id: Annotated[str, msgspec.Meta(min_length=1)]
+    block: Annotated[int, msgspec.Meta(ge=1)] = 1
     last_block: bool = False
 
     @staticmethod
@@ -22,9 +29,22 @@ class FrankyChain(msgspec.Struct, frozen=True, kw_only=True):
                 chain would not reach the request.
         """
         chain = msgspec.convert(franky_chain, FrankyChain)
-        if not chain.id or not rid.startswith(chain.id):
+        if not rid.startswith(chain.id):
             raise ValueError(
                 f"A block of Franky chain {chain.id!r} needs a rid that starts "
                 f"with the chain id, not {rid!r}."
             )
         return chain
+
+    @property
+    def continues(self) -> bool:
+        return self.block > 1
+
+
+def put_continuations_first(requests: list[Req]) -> None:
+    """Keeps the order within the continuing blocks and within the others."""
+    requests.sort(key=_is_not_a_continuation)
+
+
+def _is_not_a_continuation(req: Req) -> bool:
+    return req.franky_chain is None or not req.franky_chain.continues

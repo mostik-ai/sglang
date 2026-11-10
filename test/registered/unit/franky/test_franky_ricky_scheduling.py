@@ -74,8 +74,6 @@ class _Receiver:
 
 
 class _Tree:
-    """Unlocking a node's last lock makes its tokens evictable."""
-
     def __init__(self):
         self.locked = []
         self.node_tokens = {}
@@ -144,6 +142,14 @@ class _Manager:
         self.acked_rooms.discard(room)
 
 
+def _held(chain_id, *, node, num_tokens):
+    return SimpleNamespace(
+        franky_chain=FrankyChain(id=chain_id),
+        last_node=node,
+        origin_input_ids=[0] * num_tokens,
+    )
+
+
 def _init_single_process_group():
     if dist.is_initialized():
         return
@@ -181,7 +187,10 @@ class TestFrankyReceiveQueue(CustomTestCase):
         receiver.start()
         self.addCleanup(receiver.stop)
         self.holds = FrankyChainHolds(
-            tree_cache=self.tree, max_held_tokens=_NUM_TOKENS, hold_seconds=60
+            tree_cache=self.tree,
+            max_held_tokens=_NUM_TOKENS,
+            hold_seconds=60,
+            chunked_prefill_size=2048,
         )
         self.queue = FrankyReceiveQueue(
             tap_cache=FrankyTapCache(
@@ -383,8 +392,8 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
     def test_an_arrival_that_does_not_fit_releases_the_oldest_holds_first(self):
         self.tree.node_tokens = {"held-a": 400, "held-b": 400}
-        self.holds.hold(chain_id="a", node="held-a", num_tokens=400)
-        self.holds.hold(chain_id="b", node="held-b", num_tokens=400)
+        self.holds.hold_for_next_block(_held("a", node="held-a", num_tokens=400))
+        self.holds.hold_for_next_block(_held("b", node="held-b", num_tokens=400))
         self._arrive(_Req("first", prompt_len=512))
 
         second = self._arrive(_Req("second", prompt_len=400))
@@ -394,7 +403,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
     def test_holds_too_small_to_make_room_are_kept(self):
         self.tree.node_tokens = {"held-a": 8}
-        self.holds.hold(chain_id="a", node="held-a", num_tokens=8)
+        self.holds.hold_for_next_block(_held("a", node="held-a", num_tokens=8))
         self._arrive(_Req("first", prompt_len=512))
 
         second = self._arrive(_Req("second", prompt_len=400))

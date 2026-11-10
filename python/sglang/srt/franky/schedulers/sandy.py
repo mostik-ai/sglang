@@ -8,6 +8,7 @@ from typing_extensions import override
 from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, is_aborted
+from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.franky.schedulers.sandy_batch_result_processor import (
@@ -34,8 +35,7 @@ if TYPE_CHECKING:
 class SandyScheduler(Scheduler):
     """The Sandy engine regime: prefill on input tokens, send taps, never decode.
     It runs the normal event loops; a request ends at its prefill and answers
-    with no tokens once its taps are sent. When no waiting request can start,
-    the oldest chain hold goes; a cache flush drops every hold.
+    with no tokens once its taps are sent.
     """
 
     @override
@@ -155,12 +155,19 @@ class SandyScheduler(Scheduler):
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass, running_batch: ScheduleBatch
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        put_continuations_first(self.waiting_queue)
         new_batch, running_batch = super()._get_new_batch_prefill_raw(
             prefill_delayer_single_pass, running_batch
         )
         if new_batch is None and self._waits_without_running(running_batch):
             self.franky_chain_holds.release_oldest()
         return new_batch, running_batch
+
+    @override
+    def get_chunked_prefill_size_for_batch(self) -> Optional[int]:
+        return self.franky_chain_holds.chunk_size_for_batch(
+            super().get_chunked_prefill_size_for_batch()
+        )
 
     @override
     def abort_request(self, recv_req: AbortReq) -> None:
