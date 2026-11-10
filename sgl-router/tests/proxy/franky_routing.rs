@@ -545,5 +545,10 @@ async fn requests_blocks_cannot_serve_are_refused() {
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{body}");
     }
+    let res = build_router(Arc::clone(&ctx))
+        .oneshot(chat())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     assert!(ricky.requests().is_empty());
 }

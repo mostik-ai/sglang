@@ -437,7 +437,9 @@ in the next block:
   when it ends: after a stop, an error, or a client that left.
 - Blocks need token ids (`input_ids`, or text or chat the router renders) and
   one sequence. Batches, `n` above 1, constrained decoding, hidden states,
-  routed experts and sessions are refused with `400`.
+  routed experts and sessions are refused with `400`, as is chat the router
+  does not lower to `/generate`: it lowers chat only for the templates it
+  renders as SGLang does (see [Chat rendering](#chat-rendering)).
 - A stop string across two blocks is not matched; each block checks its own
   output.
 - Between two blocks a chain waits for Sandy to prefill the last block's tokens
