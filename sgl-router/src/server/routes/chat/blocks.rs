@@ -359,12 +359,13 @@ impl BlockChain {
     }
 
     fn log_block(&self) {
-        let prompt = self.output.block_prompt();
+        let report = self.output.block_report();
         tracing::debug!(
             chain = %self.id,
             block = self.blocks_sent,
-            prompt_tokens = %prompt.get("prompt_tokens").unwrap_or(&serde_json::Value::Null),
-            cached_tokens = %prompt.get("cached_tokens").unwrap_or(&serde_json::Value::Null),
+            prompt_tokens = %report.get("prompt_tokens").unwrap_or(&serde_json::Value::Null),
+            cached_tokens = %report.get("cached_tokens").unwrap_or(&serde_json::Value::Null),
+            report = %serde_json::Value::Object(report.clone()),
             "franky block ended"
         );
     }
