@@ -83,9 +83,12 @@ impl BlockChain {
             return Ok(None);
         }
         if request.path != GENERATE_PATH {
-            return Err(refused(
-                "a request the router does not serve through /generate",
-            ));
+            return Err(refused(&format!(
+                "{} requests it does not lower to /generate; it lowers chat only \
+                 for chat templates it renders as SGLang does, so send /generate \
+                 or /v1/completions",
+                request.path
+            )));
         }
         if request.fans_out {
             return Err(refused("batches or n above 1"));
