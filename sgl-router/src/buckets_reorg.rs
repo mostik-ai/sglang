@@ -68,6 +68,23 @@ impl EngineGroup {
             .await
     }
 
+    /// Whether a live engine of `stage` belongs to this group.
+    pub fn has_members(&self, workers: &WorkerRegistry, model: &ModelId, stage: Stage) -> bool {
+        !self.members(workers, model, stage).is_empty()
+    }
+
+    /// Like [`Self::pick`], never offering an engine in `excluded`.
+    pub async fn pick_excluding(
+        &self,
+        workers: &WorkerRegistry,
+        request: &PickRequest<'_>,
+        excluded: &[WorkerId],
+    ) -> Result<Pick, PickError> {
+        let mut engines = self.members(workers, request.model, request.stage);
+        engines.retain(|engine| !excluded.contains(&engine.id));
+        self.pick_from(engines, request).await
+    }
+
     fn members(&self, workers: &WorkerRegistry, model: &ModelId, stage: Stage) -> Vec<Arc<Worker>> {
         workers
             .healthy_workers_for(model)

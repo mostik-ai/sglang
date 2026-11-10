@@ -113,7 +113,7 @@ engine's [native gRPC](#native-grpc) API.
 | Area | Flags |
 | --- | --- |
 | Model | `--model-id`, `--tokenizer-path`, `--no-tokenizer` |
-| Engines | `--worker-urls`, or `--service-discovery` with `--selector` (plain) or `--prefill-selector` + `--decode-selector` (P/D) |
+| Engines | `--worker-urls`, or `--service-discovery` with `--selector` (plain) or `--prefill-selector` + `--decode-selector` (P/D), plus `--sandy-selector` for Franky pairs |
 | Routing | `--chat-routing reorg`, `--policy`, `--bucket-config`, `--affinity-*`, `--session-id-header` |
 | Admission | `--max-inflight-requests`, `--max-waiting-requests`, `--max-pending-prefill-tokens`, `--max-running-usage`, `--max-kv-usage` |
 | Reliability | `--retry-max-attempts`, `--request-timeout-secs`, `--stale-request-timeout-secs` |
@@ -295,6 +295,12 @@ and [rerank](REFERENCE.md#rerank).
 routed like its HTTP route and forwarded to the same RPC on the engine's own
 native gRPC port, so engines must run with `--grpc-port` too. See
 [native gRPC](REFERENCE.md#native-grpc).
+
+### Franky pairs
+
+A Ricky engine's requests also go to a Sandy engine, which sends Ricky the
+prompt's taps; Sandy is picked by `--policy`, cache-aware by its own prefix. See
+[Franky pairs](REFERENCE.md#franky-pairs).
 
 ### Bucket file
 

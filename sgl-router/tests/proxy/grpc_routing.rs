@@ -244,6 +244,7 @@ fn router_ctx_with(
             protocol: WireProtocol::default(),
             dp_ranks: 1,
             grpc_port,
+            needs_taps: false,
         };
         registry
             .add_with_cb(spec, Some(Default::default()), profile)
@@ -260,7 +261,7 @@ fn router_ctx_with(
         Arc::new(build_registry_with_defaults(&cfg).unwrap()),
     );
     if reorg {
-        let (resolver, _) = build_resolver(&cfg.model, &KvEventIndex::new(), None).unwrap();
+        let (resolver, _, _) = build_resolver(&cfg.model, &KvEventIndex::new(), None).unwrap();
         ctx.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
     }
     Arc::new(ctx)

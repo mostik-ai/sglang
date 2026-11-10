@@ -202,6 +202,7 @@ class TestAnthropicServing(unittest.TestCase):
             bootstrap_room=2**62 + 17,
             routed_dp_rank=3,
             disagg_prefill_dp_rank=2,
+            franky_room={"bootstrap_host": "sandy.internal", "bootstrap_port": 8996, "room": 77},
         )
         converted = self._serving()._convert_to_chat_completion_request(request)
         self.assertEqual(converted.bootstrap_host, "prefill.internal")
@@ -209,6 +210,7 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(converted.bootstrap_room, 2**62 + 17)
         self.assertEqual(converted.routed_dp_rank, 3)
         self.assertEqual(converted.disagg_prefill_dp_rank, 2)
+        self.assertEqual(converted.franky_room, {"bootstrap_host": "sandy.internal", "bootstrap_port": 8996, "room": 77})
 
     def test_stream_closes_tool_block_before_text_delta(self):
         serving = self._serving(

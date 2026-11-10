@@ -30,6 +30,14 @@ pub enum AddWorkerError {
         /// (the *existing* worker has the opposite role).
         pd_mode: &'static str,
     },
+    /// The spec would serve a model next to workers of the other Franky kind:
+    /// Ricky workers need a Sandy per request and solo workers take none.
+    #[error(
+        "worker {worker:?} for model {model:?} would mix Franky Ricky workers with solo \
+         workers on the same model; launch every worker of the model with the same \
+         --franky-side"
+    )]
+    MixedFrankyAndSolo { worker: WorkerId, model: ModelId },
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +95,8 @@ impl WorkerRegistry {
         profile: impl Into<EngineProfile>,
     ) -> Result<(), AddWorkerError> {
         let incoming_mode = spec.mode;
+        let profile = profile.into();
+        let incoming_needs_taps = profile.needs_taps;
         // Hold the write lock for the entire validate→insert sequence.
         // Without it, two concurrent callers for conflicting modes on
         // the same model can both see an empty pool and both proceed
@@ -119,6 +129,15 @@ impl WorkerRegistry {
                         worker: spec.id,
                         model: model.clone(),
                         pd_mode: mode_name(incoming_mode),
+                    });
+                }
+                let ricky_sides = [incoming_mode, existing.mode()]
+                    .iter()
+                    .all(|&mode| mode != WorkerMode::Sandy);
+                if ricky_sides && incoming_needs_taps != existing.needs_taps() {
+                    return Err(AddWorkerError::MixedFrankyAndSolo {
+                        worker: spec.id,
+                        model: model.clone(),
                     });
                 }
             }
@@ -238,6 +257,7 @@ fn mode_name(m: WorkerMode) -> &'static str {
         WorkerMode::Plain => "plain",
         WorkerMode::Prefill => "prefill",
         WorkerMode::Decode => "decode",
+        WorkerMode::Sandy => "sandy",
     }
 }
 
@@ -278,6 +298,36 @@ mod tests {
         let mut ids: Vec<String> = r.all().into_iter().map(|w| w.id.0.clone()).collect();
         ids.sort();
         assert_eq!(ids, vec!["d", "p", "w1"]);
+    }
+
+    /// A Sandy serves next to plain and PD Ricky workers, but a Ricky that reads
+    /// taps never serves next to a solo worker of the same model.
+    #[test]
+    fn franky_ricky_and_solo_workers_never_share_a_model() {
+        let ricky = || EngineProfile {
+            needs_taps: true,
+            ..EngineProfile::from(WireProtocol::default())
+        };
+        let r = WorkerRegistry::default();
+        r.add(spec("s", WorkerMode::Sandy, &["m"])).unwrap();
+        r.add_with_cb(spec("p", WorkerMode::Prefill, &["m"]), None, ricky())
+            .unwrap();
+        r.add_with_cb(spec("d", WorkerMode::Decode, &["m"]), None, ricky())
+            .unwrap();
+        let solo = r.add(spec("solo", WorkerMode::Decode, &["m"]));
+        assert!(matches!(
+            solo,
+            Err(AddWorkerError::MixedFrankyAndSolo { .. })
+        ));
+
+        let r = WorkerRegistry::default();
+        r.add(spec("plain", WorkerMode::Plain, &["m"])).unwrap();
+        r.add(spec("s", WorkerMode::Sandy, &["m"])).unwrap();
+        let ricky = r.add_with_cb(spec("r", WorkerMode::Plain, &["m"]), None, ricky());
+        assert!(matches!(
+            ricky,
+            Err(AddWorkerError::MixedFrankyAndSolo { .. })
+        ));
     }
 
     #[test]

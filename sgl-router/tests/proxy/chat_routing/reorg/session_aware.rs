@@ -24,7 +24,7 @@ async fn session_aware_reuses_custom_header_binding_after_load_changes() {
         ..Default::default()
     });
     let state = sgl_router::state::kv_events::KvEventIndex::new();
-    let (resolver, cleanup) =
+    let (resolver, _, cleanup) =
         sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None)
             .unwrap();
     mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());

@@ -49,6 +49,7 @@ from sglang.srt.distributed import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -1702,7 +1703,7 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 )
 
 
-class Qwen3_5ForCausalLM(nn.Module):
+class Qwen3_5ForCausalLM(FrankyMixin, nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
     decoder_layer_types = ALL_DECODER_LAYER_TYPES
@@ -1936,6 +1937,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
+            self.franky_read_pp(pp_proxy_tensors=pp_proxy_tensors)
 
         aux_hidden_states = AuxHiddenStateList()
         # Pass through decoder layers
@@ -1966,8 +1968,16 @@ class Qwen3_5ForCausalLM(nn.Module):
                     input_deepstack_embeds[:, sep : sep + self.hidden_size],
                 )
 
+            hidden_states = self.franky_after_layer(
+                layer_idx=layer_idx,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
         if not self.pp_group.is_last_rank:
-            return residual_batch.to_pp(hidden_states, forward_batch)
+            pp_proxy_tensors = residual_batch.to_pp(hidden_states, forward_batch)
+            self.franky_write_pp(pp_proxy_tensors=pp_proxy_tensors)
+            return pp_proxy_tensors
 
         hidden_states = residual_batch.final_norm(
             hidden_states,
