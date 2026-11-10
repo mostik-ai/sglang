@@ -77,6 +77,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.franky.parts.franky_parts import FrankyParts
 from sglang.srt.kernel_plugins.amd.binding import (
     install_monokernel_forward,
 )
@@ -200,6 +201,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_device,
     get_exec,
+    get_franky,
     get_global_dwdp_manager,
     get_lora,
     get_memory,
@@ -329,6 +331,7 @@ class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     watermark_state: Optional[WatermarkState] = None
+    franky_parts: Optional[FrankyParts] = None
 
     @property
     def sampling_observer(self) -> Optional[SamplingObserver]:
@@ -692,6 +695,9 @@ class ModelRunner:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=self.draft_model_idx,
+            franky_kv_options=(
+                None if self.franky_parts is None else self.franky_parts.kv_options()
+            ),
         )
 
     def init_mindspore_runner(self):
@@ -743,6 +749,8 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        # before the KV cache is sized, so its budget counts the taps
+        self.maybe_init_franky()
         # after every post-load change to the model, before the KV cache is sized
         install_megakernel(
             model=self.model,
@@ -750,6 +758,29 @@ class ModelRunner:
             capture_tail_hooks=self.capture_tail_hooks,
             is_draft=self.is_draft_worker,
         )
+
+    def maybe_init_franky(self):
+        franky = get_franky()
+        self.franky_parts = (
+            FrankyParts.attach(
+                model=self.model,
+                side=franky.franky_side,
+                config_path=franky.franky_config,
+                weights_path=franky.franky_weights,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            if franky.franky_side != "null"
+            else None
+        )
+
+    def maybe_init_franky_tap_cache(self):
+        if self.franky_parts is not None:
+            self.franky_parts.init_tap_cache(
+                num_tokens=self.max_total_num_tokens,
+                kv_allocator=self.token_to_kv_pool_allocator,
+                req_to_token_pool=self.req_to_token_pool,
+            )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1010,6 +1041,7 @@ class ModelRunner:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
 
+        self.maybe_init_franky_tap_cache()
         self._init_post_memory_pool_components()
 
     def _init_post_memory_pool_components(self):

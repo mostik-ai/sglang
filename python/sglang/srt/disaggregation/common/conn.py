@@ -1512,15 +1512,9 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
-        # PP rank mapping — decode pp size should be equal to prefill pp size or 1
-        assert self.pp_size == info.pp_size or self.pp_size == 1, (
-            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
-        )
-        if info.pp_size == self.pp_size:
-            target_pp_ranks = [self.pp_rank]
-        else:
-            target_pp_ranks = list(range(info.pp_size))
-            required_prefill_response_num *= info.pp_size // self.pp_size
+        target_pp_ranks, decode_stages_per_prefill_stage = self._pair_pp_stages(info)
+        required_prefill_response_num *= len(target_pp_ranks)
+        required_dst_info_num *= decode_stages_per_prefill_stage
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
@@ -1528,6 +1522,17 @@ class CommonKVManager(BaseKVManager):
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
+
+    def _pair_pp_stages(self, info: PrefillServerInfo) -> Tuple[List[int], int]:
+        """The prefill PP stages this decode rank reads, and how many decode
+        stages read each of them."""
+        # Decode pp size should be equal to prefill pp size or 1.
+        assert self.pp_size == info.pp_size or self.pp_size == 1, (
+            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
+        )
+        if info.pp_size == self.pp_size:
+            return [self.pp_rank], 1
+        return list(range(info.pp_size)), 1
 
     def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
         """Broadcast world-rank-0's bootstrap port to all prefill ranks.

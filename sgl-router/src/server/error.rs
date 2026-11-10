@@ -142,6 +142,10 @@ pub enum ApiError {
     #[error("no decode workers available for model {model}")]
     NoDecodeWorkersAvailable { model: String },
 
+    /// The picked Ricky worker reads taps, and no Sandy worker can send them.
+    #[error("no Sandy workers available for model {model}")]
+    NoSandyWorkersAvailable { model: String },
+
     /// A request whose lifetime exceeded `stale_request_timeout` — the
     /// active-load janitor force-expired the in-flight bookkeeping
     /// AND fired the per-request cancellation token, which the chat
@@ -210,6 +214,7 @@ impl ApiError {
             ApiError::NoHealthyWorkers { .. } => ErrorClass::NoTarget,
             ApiError::NoPrefillWorkersAvailable { .. } => ErrorClass::NoTarget,
             ApiError::NoDecodeWorkersAvailable { .. } => ErrorClass::NoTarget,
+            ApiError::NoSandyWorkersAvailable { .. } => ErrorClass::NoTarget,
             ApiError::StaleRequestExpired { .. } => ErrorClass::Timeout,
             ApiError::PolicySelectionFailed { .. } => ErrorClass::NoTarget,
             ApiError::BreakerOpen { .. } => ErrorClass::NoTarget,
@@ -242,6 +247,7 @@ impl ApiError {
             ApiError::NoHealthyWorkers { .. } => "no_healthy_workers",
             ApiError::NoPrefillWorkersAvailable { .. } => "no_prefill_workers_available",
             ApiError::NoDecodeWorkersAvailable { .. } => "no_decode_workers_available",
+            ApiError::NoSandyWorkersAvailable { .. } => "no_sandy_workers_available",
             ApiError::StaleRequestExpired { .. } => "stale_request_expired",
             ApiError::PolicySelectionFailed { .. } => "policy_selection_failed",
             ApiError::BreakerOpen { .. } => "breaker_open",
@@ -269,6 +275,7 @@ impl ApiError {
             | ApiError::NoHealthyWorkers { .. }
             | ApiError::NoPrefillWorkersAvailable { .. }
             | ApiError::NoDecodeWorkersAvailable { .. }
+            | ApiError::NoSandyWorkersAvailable { .. }
             | ApiError::StaleRequestExpired { .. }
             | ApiError::PolicySelectionFailed { .. }
             | ApiError::BreakerOpen { .. }
@@ -398,6 +405,14 @@ impl ApiError {
                     "service unavailable",
                 );
                 "no decode workers available for the requested model".to_string()
+            }
+            ApiError::NoSandyWorkersAvailable { model } => {
+                tracing::warn!(
+                    model = %model,
+                    reason = "no_sandy_workers_available",
+                    "service unavailable",
+                );
+                "no Sandy workers available for the requested model".to_string()
             }
             ApiError::StaleRequestExpired { model } => {
                 tracing::warn!(
@@ -776,6 +791,13 @@ mod tests {
                 ApiError::NoDecodeWorkersAvailable { model: "m".into() },
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_decode_workers_available",
+                None,
+            ),
+            (
+                "no sandy workers",
+                ApiError::NoSandyWorkersAvailable { model: "m".into() },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_sandy_workers_available",
                 None,
             ),
             (

@@ -107,6 +107,12 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(internal.cache_salt, "tenant-a")
         self.assertEqual(internal.extra_key, "classification")
 
+    def test_franky_room_reaches_the_engine_request(self):
+        room = {"bootstrap_host": "sandy.internal", "bootstrap_port": 8996, "room": 77}
+        req = CompletionRequest(model="x", prompt=[1, 2], max_tokens=1, franky_room=room)
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertEqual(internal.franky_room, room)
+
     def test_single_request_rejects_batched_cache_salt(self):
         req = CompletionRequest(
             model="x",

@@ -1898,6 +1898,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # Handles all DONE => this room's writes landed; ack if it
                     # was aborted and nothing else is outstanding.
                     self._maybe_ack_drained_abort(room)
+                self.after_chunk_sent(kv_chunk, reqs_to_be_processed)
                 if kv_chunk.is_last_chunk:
                     self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
 
@@ -1968,6 +1969,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
                 # room_transfer_infos survives the sender's clear() of this room.
                 self._reload_invalidated_peers(room_transfer_infos or {})
+
+    def after_chunk_sent(
+        self, kv_chunk: TransferKVChunk, receivers: List[TransferInfo]
+    ) -> None:
+        """Runs on the transfer worker once one chunk's writes landed on every
+        receiver, before the last chunk concludes the room."""
 
     def register_buffer_to_engine(self):
         self.kv_descs = []

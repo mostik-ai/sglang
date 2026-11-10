@@ -73,6 +73,7 @@ mod tests {
             dp_ranks,
             openai: None,
             grpc_port: None,
+            needs_taps: false,
         };
         Worker::with_cb_config(spec, None, profile)
     }

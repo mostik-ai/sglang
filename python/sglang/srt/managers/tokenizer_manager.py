@@ -49,6 +49,7 @@ from typing import (
 )
 
 import fastapi
+import msgspec
 import numpy as np
 import pybase64
 import torch
@@ -70,6 +71,7 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
@@ -1696,6 +1698,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                franky_room=(
+                    msgspec.convert(obj.franky_room, FrankyRoom)
+                    if obj.franky_room is not None
+                    else None
+                ),
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,

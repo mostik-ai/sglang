@@ -6,6 +6,7 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 - [Discovery and KV signals](#discovery-and-kv-signals)
 - [Bucket file membership](#bucket-file-membership)
 - [Routing and reliability](#routing-and-reliability)
+- [Franky pairs](#franky-pairs)
 - [Chat rendering](#chat-rendering)
 - [Native `/generate`](#native-generate)
 - [OpenAI over /generate](#openai-over-generate)
@@ -381,6 +382,41 @@ What stays the router's to own either way is the enforcement half: the
 queue slot and no engine round-trip — the `sampling_contract_violation` code
 and per-parameter counter, bands, and one contract applied at a shared ingress
 across engines whose own flags the router operator may not control.
+
+## Franky pairs
+
+A Franky pair serves one model with two engines per request: a Ricky engine
+(`--franky-side ricky`, plain or PD) answers it, and a Sandy engine
+(`--franky-side sandy`) computes the prompt's taps and sends them to Ricky. Both
+run behind one router, under the Ricky model's `--model-id`:
+
+```bash
+sgl-router --model-id ricky --chat-routing reorg --policy cache_aware \
+  --worker-urls http://ricky-0:30000 http://sandy-0:30000
+```
+
+- The router reads each engine's side from `/server_info` (`franky_side`). A
+  Sandy joins the router's model whatever name it serves under, and its tap
+  port is its `franky_bootstrap_port`.
+- Each request to a Ricky worker also gets a Sandy, picked from all Sandy
+  workers, not per bucket, by `--policy` and the admission flags as a prefill
+  group is. `cache_aware` picks the Sandy holding the longest cached prefix of
+  the prompt (Sandy publishes KV events with `--kv-events-config`); the legacy
+  path picks by load for other policies. `--dp-aware` picks Sandy's rank as it
+  picks a prefill's.
+- The Sandy request and every Ricky request (both legs under PD) carry the same
+  `franky_room`: Sandy's host, its tap port and a random `room`. Sandy gets the
+  same prompt on the same path, without PD fields.
+- Sandy's request runs like a PD prefill: to the end even if the client leaves.
+  Its failure ends the request with `prefill_failed` before Ricky's first token,
+  and a retry avoids that Sandy.
+- With no Sandy available, a Ricky request gets `503 no_sandy_workers_available`.
+  One model cannot mix Ricky workers with solo workers.
+- Franky pairs serve generation over HTTP only: native gRPC, embeddings,
+  classify and rerank are refused.
+- With Kubernetes discovery, `--sandy-selector` (equality terms) finds Sandy
+  EndpointSlices in plain or PD mode; next to `--selector`, that selector must
+  use equality terms too.
 
 ## Chat rendering
 

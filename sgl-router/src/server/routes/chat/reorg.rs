@@ -9,18 +9,21 @@ use super::{
 };
 use crate::buckets_reorg::{BucketRequest, BucketResolver, SloPreference};
 use crate::discovery::{ModelId, WorkerId};
+use crate::policies_reorg::cache_aware::PrefixMemo;
 use crate::policies_reorg::{PickError, Stage};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use axum::http::HeaderMap;
 
 /// Bucket-first selection used when `AppContext::chat_routing` is reorg.
+/// `prefix` keeps the prompt's prefix lookup for the Sandy pick that follows.
 pub(super) async fn select_workers(
     ctx: &AppContext,
     resolver: &BucketResolver,
     request: &PreparedRequest,
     headers: &HeaderMap,
     excluded: &[WorkerId],
+    prefix: &PrefixMemo,
 ) -> Result<SelectedWorkers, ApiError> {
     let input_tokens = request.sequence_token_count as u64;
     if request
@@ -58,9 +61,8 @@ pub(super) async fn select_workers(
             None,
         ));
     }
-    let prefix = crate::policies_reorg::cache_aware::PrefixMemo::default();
     let bucket_request = BucketRequest {
-        prefix: Some(&prefix),
+        prefix: Some(prefix),
         model: &request.model,
         input_tokens,
         total_input_tokens: request.input_token_count as u64,
@@ -95,6 +97,7 @@ pub(super) async fn select_workers(
                 return Ok(SelectedWorkers {
                     prefill: picks.prefill.engine,
                     decode: picks.decode.map(|pick| pick.engine),
+                    sandy: None,
                     track_dispatch_timestamps: false,
                 });
             }
@@ -121,7 +124,7 @@ pub(super) async fn select_workers(
     Err(selection_error(error, &request.model, missing_stage))
 }
 
-fn selection_error(error: PickError, model: &ModelId, stage: Option<Stage>) -> ApiError {
+pub(super) fn selection_error(error: PickError, model: &ModelId, stage: Option<Stage>) -> ApiError {
     tracing::warn!(%model, ?stage, %error, "reorg selection failed");
     match error {
         PickError::NoMatchingBucket => {
@@ -132,6 +135,9 @@ fn selection_error(error: PickError, model: &ModelId, stage: Option<Stage>) -> A
                 model: model.0.clone(),
             },
             Some(Stage::Decode) => ApiError::NoDecodeWorkersAvailable {
+                model: model.0.clone(),
+            },
+            Some(Stage::Sandy) => ApiError::NoSandyWorkersAvailable {
                 model: model.0.clone(),
             },
             _ => ApiError::NoHealthyWorkers {

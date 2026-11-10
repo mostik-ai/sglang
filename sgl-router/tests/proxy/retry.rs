@@ -99,7 +99,7 @@ fn router_ctx(
     let mut ctx = AppContext::new(cfg, tokenizers, proxy, registry, policies);
     if reorg {
         let state = sgl_router::state::kv_events::KvEventIndex::new();
-        let (resolver, _) =
+        let (resolver, _, _) =
             sgl_router::policies_reorg::factory::build_resolver(&ctx.config.model, &state, None)
                 .unwrap();
         ctx.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());

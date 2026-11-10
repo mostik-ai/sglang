@@ -35,6 +35,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
     get_exec,
+    get_franky,
     get_lora,
     get_memory,
     get_mm,
@@ -2474,6 +2475,11 @@ class Scheduler(
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
         return PrefillAdder
 
+    def prefillable_queue_len(self) -> int:
+        """Waiting requests a prefill could take now; the prefill delayer waits
+        for enough of them."""
+        return len(self.waiting_queue)
+
     def get_rust_server_class(self) -> type[RustServer]:
         return RustServer
 
@@ -3032,6 +3038,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                franky_room=recv_req.franky_room,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -4191,7 +4198,7 @@ class Scheduler(
             prefill_max_requests=get_schedule().prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
-            waiting_queue_len=len(self.waiting_queue),
+            waiting_queue_len=self.prefillable_queue_len(),
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
@@ -6334,6 +6341,15 @@ def configure_scheduler_process(
             numa_bind_to_node(numa_node)
 
 
+def get_scheduler_class() -> type[Scheduler]:
+    franky_side = get_franky().franky_side
+    if franky_side == "null":
+        return Scheduler
+    from sglang.srt.franky.schedulers import franky_scheduler_class
+
+    return franky_scheduler_class(franky_side)
+
+
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -6386,7 +6402,7 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     scheduler = None
     try:
-        scheduler = Scheduler(server_args, port_args)
+        scheduler = get_scheduler_class()(server_args, port_args)
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())

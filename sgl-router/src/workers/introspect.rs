@@ -81,6 +81,17 @@ pub struct ServerInfo {
     /// arrived, so a prefill without either never starts. `None` when
     /// `/server_info` predates the field or did not answer.
     pub prefill_before_bootstrap: Option<bool>,
+    /// The engine's side of a Franky pair; `None` for a solo engine.
+    pub franky_role: Option<FrankyRole>,
+}
+
+/// A Franky engine's side, from `/server_info` `franky_side`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrankyRole {
+    /// Computes prompts' taps and serves them on its tap bootstrap port.
+    Sandy { bootstrap_port: u16 },
+    /// Reads taps: each request needs a Sandy.
+    Ricky,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -195,6 +206,11 @@ impl WorkerIntrospector {
             parsed.disaggregation_bootstrap_port,
             worker_url,
         );
+        let franky_role = resolve_franky_role(
+            parsed.franky_side.as_deref(),
+            parsed.franky_bootstrap_port,
+            worker_url,
+        );
 
         ServerInfo {
             served_model_name,
@@ -212,6 +228,7 @@ impl WorkerIntrospector {
                     || parsed.disaggregation_decode_allocation_policy.as_deref()
                         == Some("prefill_complete")
             }),
+            franky_role,
         }
     }
 
@@ -332,6 +349,29 @@ fn resolve_disaggregation_role(
     }
 }
 
+/// Map `/server_info` `franky_side` into a [`FrankyRole`]; `None` for a solo
+/// engine, an engine that predates the field, or a value this router does not know.
+fn resolve_franky_role(
+    side: Option<&str>,
+    bootstrap_port: Option<u16>,
+    worker_url: &str,
+) -> Option<FrankyRole> {
+    match (side?, bootstrap_port) {
+        ("null", _) => None,
+        ("sandy", Some(bootstrap_port)) => Some(FrankyRole::Sandy { bootstrap_port }),
+        ("ricky", _) => Some(FrankyRole::Ricky),
+        (side, _) => {
+            warn!(
+                worker_url = %worker_url,
+                franky_side = %side,
+                "introspect: /server_info has an unknown franky_side, or a sandy without \
+                 franky_bootstrap_port; treating the worker as a solo engine"
+            );
+            None
+        }
+    }
+}
+
 /// Substitute a wildcard bind host (`*`, `0.0.0.0`, `::`, `[::]`) with
 /// the host parsed from the worker URL — the gateway has to connect to
 /// a routable address.  An unparsable worker URL leaves the host
@@ -436,6 +476,12 @@ struct ServerInfoBody {
     /// `ServerArgs.disaggregation_decode_allocation_policy`.
     #[serde(default)]
     disaggregation_decode_allocation_policy: Option<String>,
+    /// `ServerArgs.franky_side`: `"null"` | `"sandy"` | `"ricky"`.
+    #[serde(default)]
+    franky_side: Option<String>,
+    /// `ServerArgs.franky_bootstrap_port`: the tap bootstrap port a Sandy serves on.
+    #[serde(default)]
+    franky_bootstrap_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -467,6 +513,32 @@ pub(crate) struct KvEventsBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a Sandy with its tap port, and a Ricky, are Franky roles; anything
+    /// else keeps the worker solo.
+    #[test]
+    fn franky_role_comes_from_franky_side() {
+        for (side, port, role) in [
+            (
+                Some("sandy"),
+                Some(8996),
+                Some(FrankyRole::Sandy {
+                    bootstrap_port: 8996,
+                }),
+            ),
+            (Some("ricky"), None, Some(FrankyRole::Ricky)),
+            (Some("null"), Some(8996), None),
+            (None, Some(8996), None),
+            (Some("sandy"), None, None),
+            (Some("other"), Some(8996), None),
+        ] {
+            assert_eq!(
+                resolve_franky_role(side, port, "http://w"),
+                role,
+                "{side:?}"
+            );
+        }
+    }
     use axum::{routing::get, Json, Router};
     use serde_json::{json, Value};
     use std::sync::Arc;

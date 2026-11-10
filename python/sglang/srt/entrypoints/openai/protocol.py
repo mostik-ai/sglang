@@ -357,6 +357,8 @@ class PDRoutingFields(BaseModel):
     routed_dp_rank: Optional[int] = None
     # For PD disagg -- hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # For Franky -- where the request's taps meet, as GenerateReqInput.franky_room
+    franky_room: Optional[Dict[str, Any]] = None
 
     def pd_routing_kwargs(self) -> Dict[str, Any]:
         return {name: getattr(self, name) for name in PDRoutingFields.model_fields}
