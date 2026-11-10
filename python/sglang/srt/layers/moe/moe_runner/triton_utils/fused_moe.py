@@ -157,7 +157,11 @@ def _activation_row_filter(
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
-    return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
+    return (
+        num_tokens <= 32
+        and not is_batch_invariant_mode_enabled()
+        and not get_exec().deterministic.enable_deterministic_inference
+    )
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -324,7 +328,7 @@ def fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
 ):
-    topk_weights, topk_ids, _ = topk_output
+    topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
@@ -1253,7 +1257,7 @@ def fused_moe(
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
     if _is_xpu and not get_moe_runner_backend().is_triton():
-        topk_weight, topk_ids, _ = topk_output
+        topk_weight, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         from sgl_kernel import fused_experts as sgl_fused_experts
 
         return sgl_fused_experts(

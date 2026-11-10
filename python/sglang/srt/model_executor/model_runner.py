@@ -104,6 +104,7 @@ from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -211,7 +212,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
-    remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -239,6 +239,7 @@ from sglang.srt.state_capturer.routed_experts import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+from sglang.srt.true_on_policy import is_tp_invariant_target
 from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
@@ -301,9 +302,13 @@ def _prefill_cuda_graph_allows_context_parallel(
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
+    # Per-rank padded size of the graph this forward replayed (None for eager);
+    # the dp-gathered buffer is strided by it.
+    graph_num_tokens: Optional[int] = None
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    kv_weight_version_record: Optional[KvWeightVersionRecord] = None
 
 
 def resolve_draft_attention_backend(
@@ -644,6 +649,7 @@ class ModelRunner:
 
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
+            server_args=self.server_args,
             get_model=lambda: self.model,
             gpu_id=self.gpu_id,
         )
@@ -752,7 +758,11 @@ class ModelRunner:
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
-        self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
+        # drafts publish once the spec worker binds the target's embed and head (Scheduler.init_memory_pools)
+        if not self.is_draft_worker:
+            self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info(
+                role="target"
+            )
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
             model_config=self.model_config,
@@ -777,8 +787,10 @@ class ModelRunner:
         )
 
     def maybe_init_remote_instance_transfer_engine(self):
-        if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
-            self.remote_instance_weight_transporter.init_engine()
+        self.remote_instance_weight_transporter.init_transports(
+            load_format=self.draft_load_format
+        )
+        self.remote_instance_weight_transporter.maybe_init_parallelism_config()
 
     def maybe_init_expert_location_metadata(self):
         if self.is_draft_worker:
@@ -874,6 +886,10 @@ class ModelRunner:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
+        if is_tp_invariant_target():
+            from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
+
+            enable_tp_invariant_mode()
 
     def get_pp_proxy_dspark_hidden_size(self) -> int:
         # Graph recapture reaches this outside the draft PP scope, so read the
@@ -1044,7 +1060,8 @@ class ModelRunner:
 
         self.maybe_init_hisparse_coordinator()
 
-        self.init_routed_experts_capturer()
+        if not self.is_draft_worker:
+            self.init_routed_experts_capturer()
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
@@ -1495,16 +1512,13 @@ class ModelRunner:
                 dtype=self.dtype,
             )
 
-    def load_lora_adapter(self, lora_ref: LoRARef):
+    def load_lora_adapter(self, lora_ref: LoRARef, upsert: bool = False):
         """Load a new lora adapter from disk or huggingface."""
-        return self.lora_manager.load_lora_adapter(lora_ref)
+        return self.lora_manager.load_lora_adapter(lora_ref, upsert=upsert)
 
-    def load_lora_adapter_from_tensors(
-        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
-    ):
-        return self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
-        )
+    def register_lora_adapter(self, lora_ref: LoRARef, config_dict):
+        logger.info(f"LoRA adapter registration: {lora_ref}.")
+        return self.lora_manager.register_lora_adapter(lora_ref, config_dict)
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
@@ -1902,6 +1916,14 @@ class ModelRunner:
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
+        # In speculative decoding more than one token is captured per request, so
+        # pass the actual number of tokens per DP rank in CUDA graph, not the batch
+        # size — the width is captured_req_width.
+
+        # From the runner that ran this forward: the decode runner's own bs is
+        # another graph's stride once a prefill graph replays.
+        cuda_graph_num_tokens = output.graph_num_tokens
+
         if (
             not self.is_draft_worker
             and (experts_capturer := get_global_experts_capturer()) is not None
@@ -1909,7 +1931,7 @@ class ModelRunner:
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -1917,9 +1939,13 @@ class ModelRunner:
             output.indexer_topk_output = indexer_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
+
+        output.kv_weight_version_record = KvWeightVersionRecord.maybe_capture(
+            model_runner=self, forward_batch=forward_batch
+        )
 
         # should_advance_eplb_counter is always True on non-hip platform
         if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
@@ -2036,13 +2062,20 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            graph_num_tokens = None
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+                return ModelRunnerOutput(
+                    logits_output=ret,
+                    can_run_graph=can_run_graph,
+                    graph_num_tokens=self.decode_cuda_graph_runner.bs
+                    * self.decode_cuda_graph_runner.captured_req_width,
+                )
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
@@ -2092,6 +2125,7 @@ class ModelRunner:
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
+                graph_num_tokens = self.prefill_cuda_graph_runner.last_replay_num_tokens
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
                 ret = self.eager_runner.execute(
@@ -2104,7 +2138,11 @@ class ModelRunner:
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            return ModelRunnerOutput(
+                logits_output=ret,
+                can_run_graph=can_run_graph,
+                graph_num_tokens=graph_num_tokens,
+            )
 
     def _preprocess_logits(
         self,
@@ -2263,6 +2301,7 @@ class ModelRunner:
         action: str,
         allow_quant_error: bool = False,
         skip_tensor_list: Optional[List[str]] = None,
+        names: Optional[List[str]] = None,
         *,
         role: str,
     ):
@@ -2271,6 +2310,7 @@ class ModelRunner:
             allow_quant_error=allow_quant_error,
             skip_tensor_list=skip_tensor_list,
             role=role,
+            names=names,
         )
 
     def _expand_eplb_metadata_for_scale(

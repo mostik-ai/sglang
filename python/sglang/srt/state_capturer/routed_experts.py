@@ -12,12 +12,14 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_resources,
     get_schedule,
+    is_scheduler_io_rank,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
@@ -31,11 +33,12 @@ def _is_scattered_a2a_backend() -> bool:
 class RoutedExpertsCapturer(BaseTopkCapturer):
     """Capturer for routed experts with host buffer.
 
-    Routed experts share a global device buffer across DP ranks (indexed by
-    dp_rank), so `_get_local_slice` overrides the default to apply DP-rank-aware
-    slicing. The device cache also holds extra columns for any fused shared
-    experts; the host cache and user-facing return drop them via the
+    DP-concatenated routing needs a DP-rank offset at readback; DP-local routing
+    already starts at buffer offset zero. The device cache holds extra columns
+    for fused shared experts; the host cache and user-facing return drop them via the
     [:topk_size] truncation.
+
+    Only the rank that sends outputs keeps a host cache.
     """
 
     @staticmethod
@@ -90,6 +93,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
+            # Other ranks compute the same ids (or join the gather below) and
+            # send nothing, so they keep no rows.
+            allocate_caches=is_scheduler_io_rank(),
         )
 
         # Rebuild the full token batch before routed-expert readback.
@@ -98,16 +104,15 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                 get_parallel().attn_tp_size if is_dp_attention_enabled() else 1
             )
             self.gather_buffer = torch.empty(
-                (
-                    self.device_cache.buffer.shape[0] * attn_tp_size,
-                    self.device_cache.buffer.shape[2],
-                ),
+                (max_batch_size * attn_tp_size, self.device_topk_size),
                 dtype=torch.int32,
                 device=device,
             )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
-        device_width = self.device_cache.buffer.shape[2]
+        if self.device_cache is None and not _is_scattered_a2a_backend():
+            return
+        device_width = self.device_topk_size
         if topk_indices.shape[1] != device_width:
             # Routes whose shared columns are appended after capture pass routed ids only.
             if topk_indices.shape[1] != device_width - self.num_fused_shared_experts:
@@ -125,6 +130,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                 : local_topk.size(0) * get_parallel().attn_tp_size
             ]
             attn_tp_all_gather_into_tensor(topk_indices, local_topk)
+        if self.device_cache is None:
+            # Joined the all-gather; the output rank keeps the rows.
+            return
         super().capture(layer_id, topk_indices)
 
     def _get_local_slice(
@@ -133,8 +141,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         can_run_graph: bool,
         cuda_graph_batch: Optional[int],
     ) -> torch.Tensor:
-        # Gathered rows start at buffer offset zero on every DP rank.
-        if is_dp_attention_enabled() and not _is_scattered_a2a_backend():
+        # DP-local routing and attention-TP gathered rows both start at zero.
+        if is_dp_attention_enabled() and not is_moe_input_scattered_across_dp_ranks():
             # GPU->CPU sync would break overlap; operate on CPU directly.
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
                 forward_batch, can_run_graph, cuda_graph_batch
@@ -177,14 +185,13 @@ def extract_routed_experts_from_meta_info(data):
 def disable_routed_experts_capture_for_draft(model: Any) -> None:
     """Opt every draft MoE ``TopK`` out of routed-experts (R3) capture.
 
-    Capture is target-only; a draft ``TopK`` must never write the target's
-    process-global buffer. ``HashTopK`` has no ``topk_config`` and never
-    captures, so it is left untouched.
+    Capture is target-only; draft ``TopK`` and ``HashTopK`` modules must never
+    write the target's process-global buffer.
     """
-    # Lazy import: ``layers.moe.topk`` imports ``get_global_experts_capturer``
-    # from this module, so a top-level import here would be circular.
+    # Lazy imports avoid circular dependencies with the capture call sites.
+    from sglang.srt.layers.moe.hash_topk import HashTopK
     from sglang.srt.layers.moe.topk import TopK
 
     for module in model.modules():
-        if isinstance(module, TopK):
+        if isinstance(module, (TopK, HashTopK)):
             module.topk_config.allow_routed_experts_capture = False

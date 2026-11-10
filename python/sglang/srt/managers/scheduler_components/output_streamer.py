@@ -80,6 +80,7 @@ class SchedulerOutputStreamer:
     rust_server: Optional[RustServer] = None
     # Set when the scheduler first defers a response; see deferred_output.
     defer_outputs: bool = False
+    is_multimodal_gen: bool = False
     _test_stream_output_count: int = 0
 
     def __post_init__(self) -> None:
@@ -229,6 +230,8 @@ class SchedulerOutputStreamer:
                 acc.customized_info[key] = values
 
         # Send to detokenizer
+        if self.is_multimodal_gen:
+            return
         payload = acc.to_payload(
             dp_rank=get_parallel().dp_rank,
             is_idle_batch=is_idle_batch,
@@ -382,6 +385,7 @@ class _GenerationStreamAccumulator:
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
     weight_versions: list = field(default_factory=list)
+    prefill_weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -551,12 +555,14 @@ class _GenerationStreamAccumulator:
                     num_output_tokens=len(output_ids_),
                 )
             )
+            self.prefill_weight_versions.append(req.prefill_weight_versions)
             if self.rust_server_mode and not req.stream:
                 latency = _scheduler_decode_latency(req.time_stats)
                 if latency is not None:
                     self.decode_latencies[len(self.rids) - 1] = latency
         else:
             self.weight_versions.append(None)
+            self.prefill_weight_versions.append(None)
 
         self.time_stats.append(req.time_stats)
 
@@ -726,6 +732,15 @@ class _GenerationStreamAccumulator:
         if not (self.rids or is_idle_batch):
             return None
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
+        indexer_topk_num_layers = None
+        if self.return_indexer_topk:
+            from sglang.srt.state_capturer.indexer_topk import (
+                get_global_indexer_capturer,
+            )
+
+            _idx_cap = get_global_indexer_capturer()
+            if _idx_cap is not None:
+                indexer_topk_num_layers = _idx_cap.num_indexer_layers
         return BatchTokenIDOutput(
             rids=self.rids,
             http_worker_ipcs=self.http_worker_ipcs,
@@ -786,6 +801,7 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
+            indexer_topk_num_layers=indexer_topk_num_layers,
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None
             ),
@@ -801,6 +817,11 @@ class _GenerationStreamAccumulator:
             ),
             weight_versions=(
                 self.weight_versions if any(self.weight_versions) else None
+            ),
+            prefill_weight_versions=(
+                self.prefill_weight_versions
+                if any(self.prefill_weight_versions)
+                else None
             ),
             dp_ranks=dp_ranks,
         )

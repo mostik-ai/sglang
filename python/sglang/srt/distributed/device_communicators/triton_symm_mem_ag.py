@@ -16,6 +16,7 @@ import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
@@ -465,32 +466,10 @@ class MultimemAllGatherer:
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
+        if envs.SGLANG_DISABLE_MULTIMEM_AG.get():
+            enabled = False
         # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
-        if self._state is self._UNINIT:
-            # Lazy import avoids a module-load dependency on the distributed facade.
-            from sglang.srt.distributed.parallel_state import (
-                get_tp_group,
-                in_the_same_node_as,
-            )
-
-            tp_group = get_tp_group()
-            # Only probe node topology when the deployment can actually span
-            # nodes. Check world_size first so a TP=1 gatherer short-circuits
-            # before reading the parallel config (which may be unpublished on
-            # offline paths). On a single node every TP rank is co-located, so skip the
-            # in_the_same_node_as() all-reduce, which can segfault under some
-            # EP/mooncake setups, and keep multimem enabled.
-            if (
-                tp_group.world_size > 1
-                and get_parallel().nnodes > 1
-                and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
-            ):
-                logger.warning(
-                    "multimem all-gather disabled because the TP group spans "
-                    "across nodes."
-                )
-                self._state = None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         state = self._state
@@ -520,6 +499,16 @@ class MultimemAllGatherer:
 
         return tensor_model_parallel_all_gather(x, dim=-1)
 
+    @staticmethod
+    def _tp_group_spans_nodes(tp_group) -> bool:
+        # Not at construction: building the model must run no collectives.
+        # Multi-node only: this all-reduce can segfault under some EP/mooncake setups.
+        from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+        return get_parallel().nnodes > 1 and not all(
+            in_the_same_node_as(tp_group.cpu_group, source_rank=0)
+        )
+
     def _build(self, x: torch.Tensor):
         if x.dim() != 2 or x.dtype != torch.bfloat16:
             return None
@@ -528,12 +517,17 @@ class MultimemAllGatherer:
             return self._UNINIT
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
             return None
-        try:
-            from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.distributed.parallel_state import get_tp_group
 
-            tp_group = get_tp_group()
-            if tp_group.world_size <= 1:
-                return None
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return None
+        if self._tp_group_spans_nodes(tp_group):
+            logger.warning(
+                "multimem all-gather disabled because the TP group spans across nodes."
+            )
+            return None
+        try:
             state = create_state(
                 group=tp_group.device_group,
                 rank_in_group=tp_group.rank_in_group,

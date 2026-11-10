@@ -88,6 +88,7 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = customized_info
         self.weight_version_events = []
+        self.prefill_weight_versions = None
 
     def finished(self):
         return self._finished
@@ -594,6 +595,61 @@ _IPC_ROUND_TRIPS = {
 }
 
 
+class TestOutputStreamerIndexerTopk(unittest.TestCase):
+    def setUp(self):
+        streamer = "sglang.srt.managers.scheduler_components.output_streamer"
+        for target, value in (
+            (
+                f"{streamer}.get_serving",
+                SimpleNamespace(stream_interval=1, weight_version="v"),
+            ),
+            (
+                f"{streamer}.get_observability",
+                SimpleNamespace(enable_request_time_stats_logging=False),
+            ),
+            # to_payload imports the capturer lazily from its owning module.
+            (
+                "sglang.srt.state_capturer.indexer_topk.get_global_indexer_capturer",
+                SimpleNamespace(num_indexer_layers=7),
+            ),
+        ):
+            patcher = patch(target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
+
+    def test_payload_carries_the_capturer_layer_count(self):
+        """Clients reshape the flat indexer_topk bytes by this layer count, so it must
+        cross either IPC codec in the batch that carries indexer_topk."""
+
+        class Streamer(SchedulerOutputStreamer):
+            def get_cached_tokens_details(self, req):
+                return None
+
+        for codec, round_trip in _IPC_ROUND_TRIPS.items():
+            with (
+                self.subTest(codec=codec),
+                patch.object(io_struct, "_USE_PICKLE_IPC", codec == "pickle"),
+            ):
+                outputs = []
+                streamer = Streamer(
+                    send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+                    tree_cache=None,
+                    server_args=SimpleNamespace(),
+                    is_generation=True,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    disaggregation_mode=DisaggregationMode.NULL,
+                    enable_hicache_storage=lambda: False,
+                )
+                req = _FakeReq("r0", array("q", [10]), finished=True)
+                req.return_indexer_topk = True
+                req.indexer_topk = torch.zeros((1, 7, 4), dtype=torch.int32)
+
+                streamer._stream_output_generation([req], False)
+
+                self.assertEqual(round_trip(outputs[0]).indexer_topk_num_layers, 7)
+
+
 class TestOutputStreamerSamplingMasks(unittest.TestCase):
     def test_rows_stream_once_and_expand_to_response_lists(self):
         """Queued rows cross either IPC codec once, in batch order, as per-token lists;
@@ -733,6 +789,55 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                             received[i][0].extend(masks)
                             received[i][1].extend(logprobs)
                 self.assertEqual(received, expected)
+
+
+class TestOutputStreamerPrefillWeightVersions(unittest.TestCase):
+    def test_payload_carries_prefill_spans_for_finished_requests(self):
+        """Prefill spans computed before the KV release ride out with the finished request."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        finished_req = _FakeReq("r1", [20], finished=True)
+        finished_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4),
+            WeightVersionSpan(version="v1", start=4, end=6),
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        accumulator.accept(req=finished_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertEqual(
+            payload.prefill_weight_versions,
+            [
+                None,
+                [
+                    WeightVersionSpan(version="v0", start=0, end=4),
+                    WeightVersionSpan(version="v1", start=4, end=6),
+                ],
+            ],
+        )
+
+    def test_an_unfinished_request_withholds_its_prefill_spans(self):
+        """Spans of a request still generating must not ship before its finishing chunk."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        streaming_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4)
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+
+    def test_payload_omits_prefill_spans_when_the_flag_is_off(self):
+        """With tracking disabled every request contributes None, so nothing goes on the wire."""
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=_FakeReq("r0", [10], finished=True))
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+        self.assertIsNotNone(payload.weight_versions)
 
 
 if __name__ == "__main__":

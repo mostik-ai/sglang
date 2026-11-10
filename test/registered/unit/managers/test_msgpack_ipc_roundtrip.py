@@ -24,7 +24,6 @@ from sglang.srt.managers.io_struct import (
     ExpertWeightPointer,
     GetInternalStateReqOutput,
     GetWeightsByNameReqOutput,
-    LoadLoRAAdapterFromTensorsReqInput,
     ParallelismInfo,
     RpcReqInput,
     SetInternalStateReq,
@@ -136,12 +135,6 @@ REGISTRY_TYPE_INSTANCES = {
         parameters={"flag": True, "n": 1, "ratio": 2.0, "name": "x", "opt": None},
     ),
     "RpcReqInput/none": RpcReqInput(method="collective_rpc", parameters=None),
-    "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput(
-        lora_name="adapter",
-        config_dict={"r": 8, "lora_alpha": 16, "target_modules": ["q_proj", "v_proj"]},
-        serialized_named_tensors=[b"tp0-bytes", b"tp1-bytes"],
-        added_tokens_config={"<extra>": 32000},
-    ),
     "DumperControlReqInput": DumperControlReqInput(method="start", body={"k": "v"}),
     "DumperControlReqOutput": DumperControlReqOutput(
         success=True, response=[{"worker": 0, "ok": True}]
@@ -185,12 +178,13 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         pointer = decoded.weight_pointer_map["experts.0.gate_proj"]
         self.assertEqual((pointer.weight_ptr, pointer.byte_size), (8, 4))
 
-    def test_check_weights_mirrors_match_pydantic_models(self):
+    def test_check_weights_mirrors_match_pydantic_models(self) -> None:
+        """Wire fields preserve checker metadata and add the merged runner role."""
         # Field-parity guard: the msgspec wire structs must not drift from the
         # pydantic source of truth in weight_checker.
         self.assertEqual(
             {f.name for f in msgspec.structs.fields(ParallelismInfo)},
-            set(PydanticParallelismInfo.model_fields),
+            set(PydanticParallelismInfo.model_fields) | {"role"},
         )
         self.assertEqual(
             {f.name for f in msgspec.structs.fields(ChecksumInfo)},
@@ -289,6 +283,28 @@ class TestWeightVersionSpansRoundTrip(CustomTestCase):
     def test_abort_req_defaults_to_no_spans(self):
         """The field is optional on the wire, so an abort without spans decodes to None."""
         self.assertIsNone(_round_trip(AbortReq(rid="r0")).weight_versions)
+        self.assertIsNone(_round_trip(AbortReq(rid="r0")).prefill_weight_versions)
+
+    def test_abort_req_carries_prefill_spans(self):
+        """Prompt-side spans survive the wire independently of the sampling spans."""
+        obj = AbortReq(
+            rid="r0",
+            prefill_weight_versions=[
+                WeightVersionSpan(version="unknown", start=0, end=2),
+                WeightVersionSpan(version="v1", start=2, end=9),
+            ],
+        )
+
+        decoded = _double_hop(obj)
+
+        self.assertIsNone(decoded.weight_versions)
+        self.assertEqual(
+            decoded.prefill_weight_versions,
+            [
+                WeightVersionSpan(version="unknown", start=0, end=2),
+                WeightVersionSpan(version="v1", start=2, end=9),
+            ],
+        )
 
 
 if __name__ == "__main__":

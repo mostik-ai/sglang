@@ -42,6 +42,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Union,
@@ -116,6 +117,12 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.output_store import (
+    OUTPUT_STORE_REF_KEY,
+    OutputStoreWriter,
+    TokenOutputCollector,
+    maybe_create_output_store,
+)
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -130,6 +137,12 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
+)
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
+from sglang.srt.multimodal.token_space_mm_process.sglang import (
+    TokenSpaceSGLangProcessor,
 )
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -167,6 +180,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
     redact_watermark_command_line,
@@ -200,7 +214,10 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
-from sglang.srt.utils.weight_versions import add_weight_versions_to_meta_info
+from sglang.srt.utils.weight_versions import (
+    add_weight_versions_to_meta_info,
+    weight_version_spans_to_json,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -243,6 +260,20 @@ def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
         )
 
 
+def _reject_unsupported_mm_token_expansion_start_len(request_obj, mm_processor):
+    """Only a token-space processor keeps an already-expanded prefix; any other
+    processor would expand that prefix's media tokens again."""
+    if (
+        isinstance(request_obj, GenerateReqInput)
+        and request_obj.mm_token_expansion_start_len
+        and not isinstance(mm_processor, TokenSpaceSGLangProcessor)
+    ):
+        raise ValueError(
+            "mm_token_expansion_start_len requires --enable-token-space-processor "
+            "and a model with a token-space processor."
+        )
+
+
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
     # The mode env is fixed at server launch; cache to keep it off the
@@ -261,6 +292,7 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_ids_logprobs",
     "output_token_sampling_mask",
     "output_token_sampling_logprobs",
+    "output_token_sampling_selected_logprobs",
 )
 
 
@@ -280,12 +312,20 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # An abort matched this rid while the request was still tokenizer-held
+    # (parked at the pause gate / model-update lock / tokenization). The
+    # scheduler never saw the rid, so the dispatch path must resolve the
+    # request as aborted instead of sending it.
+    abort_before_dispatch: bool = False
 
     # Prevent duplicate releases after completion or ownership transfer.
     lora_released: bool = False
 
     # For streaming output
     last_output_offset: int = 0
+
+    # Per-token outputs of a request that returns them via the output store.
+    token_output_collector: Optional[TokenOutputCollector] = None
 
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
@@ -331,6 +371,9 @@ class ReqState:
     output_token_sampling_logprobs: List[Union[float, List[float]]] = dataclasses.field(
         default_factory=list
     )
+    output_token_sampling_selected_logprobs: List[float] = dataclasses.field(
+        default_factory=list
+    )
 
     # Cached flat-format prompt top logprob fields; rebuilt only when more
     # prefill chunks arrive, so streaming decode chunks reuse the payload.
@@ -372,6 +415,27 @@ def _slice_streaming_output_meta_info(
         streaming_meta_info_keys.update(customized_info_keys)
     for key in meta_info.keys() & streaming_meta_info_keys:
         meta_info[key] = meta_info[key][last_output_offset:]
+
+
+def _replay_output_at(
+    *,
+    raw: Optional[List[Optional[torch.Tensor]]],
+    encoded: Optional[List[Optional[Union[str, torch.Tensor]]]],
+    i: int,
+) -> Optional[Union[str, torch.Tensor]]:
+    if raw is not None:
+        return raw[i]
+    if encoded:
+        return encoded[i]
+    return None
+
+
+def _encode_replay_output(value: Union[str, torch.Tensor]) -> str:
+    # The detokenizer pre-encodes unless the output store is enabled; the
+    # skip_tokenizer_init path bypasses the detokenizer entirely.
+    if isinstance(value, torch.Tensor):
+        return pybase64.b64encode(value.numpy().tobytes()).decode("utf-8")
+    return value
 
 
 def _build_flat_top_logprobs_fields(
@@ -466,6 +530,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # which own no server. Class-level to leave the frozen __init__ alone.
     _server_stop_hook: Optional[Callable[[], None]] = None
     _engine_state_changed_callback: Optional[Callable[[], None]] = None
+    # Set by maybe_init_output_store; None without --output-store-backend.
+    output_store: Optional[OutputStoreWriter] = None
 
     def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
         self._server_stop_hook = hook
@@ -579,6 +645,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        # Init output store
+        self.maybe_init_output_store()
+
         # Init the CUDA IPC transport for GPU-resident embedding overrides
         self.init_positional_embeds_transport()
 
@@ -586,6 +655,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # the transport's recycler thread.
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
             self.server_args, self.mm_processor
+        )
+
+    def maybe_init_output_store(self):
+        """Connect to the output store if --output-store-backend is set."""
+        self.output_store = maybe_create_output_store(
+            backend=get_exec().features.output_store_backend,
+            extra_config=get_exec().features.output_store_backend_extra_config,
+            disaggregation_mode=get_disagg().disaggregation_mode,
         )
 
     def init_model_config(self):
@@ -611,6 +688,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal and not get_disagg().language_model_only:
             import_processors("sglang.srt.multimodal.processors")
+            register_token_space_models()
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
             _processor = get_processor_wrapper()
@@ -776,6 +854,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        self._weight_update_session_open = False
+        # A staged session (adapter-only, deferred publications pending) runs
+        # under the reader lock, concurrent with generation.
+        self._weight_update_staged_session = False
+        self._weight_update_pending_version: Optional[str] = None
 
     def init_lora(self):
         # LoRA
@@ -797,6 +880,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if get_lora().lora_paths is not None:
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
+        # defer_publish registrations: zeroed identities on the backends, names
+        # unservable until end_weight_update commits their session
+        self._pending_lora_publications: Dict[str, LoRARef] = {}
 
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
@@ -1159,6 +1245,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         should_run_mm_processor = self.mm_processor is not None and (
             contains_mm_input or is_mossvl
         )
+        _reject_unsupported_mm_token_expansion_start_len(obj, self.mm_processor)
 
         if should_run_mm_processor:
             if obj.image_data is not None and not isinstance(obj.image_data, list):
@@ -1433,6 +1520,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "sampling_logprobs_mode can only be set when "
                     "return_sampling_mask=true."
                 )
+            if obj.return_outputs_via_store:
+                if self.output_store is None:
+                    raise ValueError(
+                        "The server is not configured with an output store. "
+                        "Please set `--output-store-backend`."
+                    )
+                if obj.stream:
+                    raise ValueError(
+                        "return_outputs_via_store does not support streaming yet."
+                    )
 
     def _validate_joint_schema_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -1766,10 +1863,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    def _abort_instead_of_dispatch(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> bool:
+        """Resolve a request whose rid an abort matched while it was still
+        tokenizer-held (see abort_request): the scheduler never saw the rid, so
+        it must be finished here instead of dispatched. Returns True if the
+        request was aborted."""
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if (
+            state is None
+            or not state.abort_before_dispatch
+            or is_health_check_generate_req(tokenized_obj)
+        ):
+            return False
+        self._handle_abort_req(
+            AbortReq(
+                rid=tokenized_obj.rid,
+                abort_message="Aborted by AbortReq before dispatch to scheduler",
+            )
+        )
+        dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
+        if dispatch_ready is not None:
+            dispatch_ready.set()
+        return True
+
     async def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        if self._abort_instead_of_dispatch(tokenized_obj):
+            return
         prepared_mm_items = []
         prepared_embeds = []
         dispatched = False
@@ -1816,6 +1941,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        tokenized_objs = [
+            tokenized_obj
+            for tokenized_obj in tokenized_objs
+            if not self._abort_instead_of_dispatch(tokenized_obj)
+        ]
+        if not tokenized_objs:
+            return
         prepared_mm_items = []
         prepared_embeds = []
         dispatched = False
@@ -1927,11 +2059,88 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return None
         if not (self.enable_lora and state.obj.lora_path):
             return None
+        # A failure before the LoRA acquire leaves lora_id unset: no lease to release.
+        if state.obj.lora_id is None:
+            return None
         state.lora_released = True
         task = asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
         self._lora_release_tasks.add(task)
         task.add_done_callback(self._lora_release_tasks.discard)
         return task
+
+    @staticmethod
+    def _add_sampling_mask_output(
+        *,
+        meta_info: dict,
+        state: ReqState,
+        chunk: SamplingMaskChunk,
+        output_ids: Sequence[int],
+    ) -> None:
+        support_logprobs = state.obj.sampling_logprobs_mode == "support"
+        # The sampled tokens' logprobs, one per token, always stay in meta_info;
+        # only the support-sized rows move to the output store.
+        if support_logprobs:
+            state.output_token_sampling_selected_logprobs.extend(
+                chunk.selected_logprobs(output_ids).tolist()
+            )
+            meta_info["output_token_sampling_selected_logprobs"] = (
+                state.output_token_sampling_selected_logprobs
+            )
+        collector = state.token_output_collector
+        if collector is not None:
+            collector.add_sampling_mask(chunk)
+            if not support_logprobs:
+                state.output_token_sampling_logprobs.extend(chunk.logprobs.tolist())
+                meta_info["output_token_sampling_logprobs"] = (
+                    state.output_token_sampling_logprobs
+                )
+            return
+        masks, logprobs = chunk.to_lists(support_logprobs=support_logprobs)
+        state.output_token_sampling_mask.extend(masks)
+        state.output_token_sampling_logprobs.extend(logprobs)
+        meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
+        meta_info["output_token_sampling_logprobs"] = (
+            state.output_token_sampling_logprobs
+        )
+        meta_info["output_token_sampling_mask_length"] = len(
+            state.output_token_sampling_mask
+        )
+
+    async def _store_token_outputs(
+        self, *, out: dict, state: ReqState, request: Optional[fastapi.Request]
+    ) -> None:
+        collector = state.token_output_collector
+        state.token_output_collector = None
+        if collector.is_empty():
+            return
+
+        future = self.output_store.submit_put(collector)
+        try:
+            ref = await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            # A running put keeps going after cancellation; delete what it writes.
+            self.output_store.cleanup_after(future)
+            raise
+        except Exception as e:
+            logger.error(f"Output store put failed for rid={state.obj.rid}: {e!r}")
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                detail=f"Failed to write outputs to the output store: {e}",
+            ) from e
+        if (
+            request is not None
+            and not state.obj.background
+            and await request.is_disconnected()
+        ):
+            # Nobody can read this ref, and a client retry writes a new object.
+            self.output_store.cleanup_after(future)
+            raise ValueError(
+                "Request is disconnected from the client side after its output store "
+                f"put; scheduled deletion of the stored outputs of {state.obj.rid=}"
+            )
+        meta_info = out["meta_info"]
+        meta_info[OUTPUT_STORE_REF_KEY] = ref.to_builtins()
+        meta_info.update(collector.inline_meta_info())
 
     def _wait_one_response(
         self,
@@ -2047,6 +2256,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         yield abort_out
                         break
 
+                if state.token_output_collector is not None:
+                    await self._store_token_outputs(
+                        out=out, state=state, request=request
+                    )
                 yield out
                 break
 
@@ -2238,20 +2451,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, prefix: bool = False
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
         state = None if abort_all else self.rid_to_state.get(rid)
         if not abort_all:
-            if state is not None:
+            if prefix:
+                if get_serving().tokenizer_worker_num == 1 and not any(
+                    r.startswith(rid) for r in self.rid_to_state
+                ):
+                    return
+            elif state is not None:
                 if state.abort_sent:
                     return
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
                 return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        # A matching request can still be tokenizer-held: rid_to_state is
+        # populated in _init_req_state, several awaits (pause gate,
+        # model_update_lock, tokenization) before the scheduler learns the rid
+        # in _send_one_request. The scheduler-side abort cannot match those, so
+        # flag them here; the dispatch path resolves flagged requests as
+        # aborted instead of sending them. Already-dispatched requests are
+        # unaffected (the flag is only read at dispatch).
+        for tracked_rid, tracked_state in self.rid_to_state.items():
+            if abort_all or (
+                tracked_rid.startswith(rid) if prefix else tracked_rid == rid
+            ):
+                tracked_state.abort_before_dispatch = True
+        req = AbortReq(rid=rid, abort_all=abort_all, prefix=prefix)
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:
@@ -2534,19 +2766,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
                 if output_sampling_mask is not None:
-                    masks, logprobs = output_sampling_mask[i].to_lists(
-                        support_logprobs=state.obj.sampling_logprobs_mode == "support"
-                    )
-                    state.output_token_sampling_mask.extend(masks)
-                    state.output_token_sampling_logprobs.extend(logprobs)
-                    meta_info["output_token_sampling_mask"] = (
-                        state.output_token_sampling_mask
-                    )
-                    meta_info["output_token_sampling_logprobs"] = (
-                        state.output_token_sampling_logprobs
-                    )
-                    meta_info["output_token_sampling_mask_length"] = len(
-                        state.output_token_sampling_mask
+                    self._add_sampling_mask_output(
+                        meta_info=meta_info,
+                        state=state,
+                        chunk=output_sampling_mask[i],
+                        output_ids=recv_obj.output_ids[i],
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
@@ -2565,6 +2789,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         meta_info,
                         spans,
                         num_output_tokens=recv_obj.completion_tokens[i],
+                    )
+                if recv_obj.prefill_weight_versions and (
+                    prefill_spans := recv_obj.prefill_weight_versions[i]
+                ):
+                    meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
+                        prefill_spans
                     )
                 # Add detailed cache breakdown if available
                 if (
@@ -2599,20 +2829,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 hidden_states = recv_obj.output_hidden_states[i]
                 if hidden_states is not None:
                     meta_info["hidden_states"] = hidden_states
-            if getattr(recv_obj, "routed_experts", None):
-                val = recv_obj.routed_experts[i]
-                if val is not None:
-                    # BatchStrOutput is pre-encoded by the detokenizer;
-                    # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
-                    meta_info["routed_experts"] = val
-            if getattr(recv_obj, "indexer_topk", None):
-                val = recv_obj.indexer_topk[i]
-                if val is not None:
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
-                    meta_info["indexer_topk"] = val
+            if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
+                is_str_output = isinstance(recv_obj, BatchStrOutput)
+                collector = state.token_output_collector
+                routed_experts = _replay_output_at(
+                    raw=recv_obj.routed_experts_raw if is_str_output else None,
+                    encoded=recv_obj.routed_experts,
+                    i=i,
+                )
+                if routed_experts is not None and collector is not None:
+                    collector.routed_experts = routed_experts
+                elif routed_experts is not None:
+                    meta_info["routed_experts"] = _encode_replay_output(routed_experts)
+                indexer_topk = _replay_output_at(
+                    raw=recv_obj.indexer_topk_raw if is_str_output else None,
+                    encoded=recv_obj.indexer_topk,
+                    i=i,
+                )
+                if indexer_topk is not None and collector is not None:
+                    collector.indexer_topk = indexer_topk
+                elif indexer_topk is not None:
+                    meta_info["indexer_topk"] = _encode_replay_output(indexer_topk)
+                    if recv_obj.indexer_topk_num_layers is not None:
+                        meta_info["indexer_topk_num_layers"] = (
+                            recv_obj.indexer_topk_num_layers
+                        )
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
@@ -3612,6 +3853,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.weight_versions,
                 num_output_tokens=len(state.output_ids),
             )
+        if prefill_spans := recv_obj.prefill_weight_versions:
+            meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
+                prefill_spans
+            )
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(
@@ -3760,18 +4005,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         unregistered_loras = await self.lora_registry.get_unregistered_loras(
             unique_lora_paths
         )
+        backfill_paths = obj.lora_backfill_paths or {}
         for lora_path in unregistered_loras:
             if lora_path is None:
                 continue
 
-            if lora_path not in self.lora_ref_cache:
+            if lora_path in self._pending_lora_publications:
+                # a staged session is streaming this name; a disk load now would give it two identities
                 raise ValueError(
-                    f"Got LoRA adapter that has never been loaded: {lora_path}\n"
-                    f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                    f"LoRA adapter '{lora_path}' is awaiting publication and "
+                    "cannot be served or backfilled yet."
                 )
+            if lora_path not in self.lora_ref_cache:
+                # a request-carried path lets a fresh or restarted engine serve any published version
+                if lora_path in backfill_paths:
+                    self.lora_ref_cache[lora_path] = LoRARef(
+                        lora_name=lora_path,
+                        lora_path=backfill_paths[lora_path],
+                        pinned=False,
+                    )
+                else:
+                    raise ValueError(
+                        f"Got LoRA adapter that has never been loaded: {lora_path}\n"
+                        f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                    )
 
-            logger.info(f"Reloading evicted adapter: {lora_path}")
             new_lora_ref = self.lora_ref_cache[lora_path]
+            if not new_lora_ref.reloadable:
+                raise ValueError(
+                    f"LoRA adapter '{lora_path}' was loaded over the wire "
+                    f"(lora_path={new_lora_ref.lora_path!r}) and has no disk "
+                    "artifact to reload from; it must be re-pushed by the "
+                    "trainer instead of implicitly reloaded."
+                )
+            logger.info(f"Reloading evicted adapter: {lora_path}")
             load_result = await self.load_lora_adapter(
                 LoadLoRAAdapterReqInput(
                     lora_name=new_lora_ref.lora_name,
@@ -3840,12 +4107,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            if self._uses_output_store(sub_obj):
+                state.token_output_collector = TokenOutputCollector(
+                    sampling_support_logprobs=sub_obj.sampling_logprobs_mode
+                    == "support"
+                )
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
             new_states[rid] = state
 
         self.rid_to_state.update(new_states)
+
+    def _uses_output_store(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> bool:
+        return (
+            self.output_store is not None
+            and isinstance(obj, GenerateReqInput)
+            and obj.return_outputs_via_store
+        )
 
     def _release_req_states_on_failure(self, request_states: Dict[str, ReqState]):
         """Release rid_to_state entries created for a failed handler.

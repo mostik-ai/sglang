@@ -72,7 +72,10 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    get_next_token_logits_dtype,
+)
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -738,7 +741,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if graph_shared_output is None or rows > graph_shared_output.max_rows:
             return None
         return graph_shared_output.get_logits_buffer(
-            self.model_runner.model_config.vocab_size, rows=rows
+            self.model_runner.model_config.vocab_size,
+            rows=rows,
+            dtype=get_next_token_logits_dtype(
+                self.model_runner.model_config.hf_text_config
+            ),
         )
 
     def _uses_eager_prefill_tail(self) -> bool:
@@ -2359,6 +2366,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch, **kwargs
             )
             static_num_tokens = len(static_forward_batch.input_ids)
+            # Stride of the dp-gathered buffer for this replay; surfaced through
+            # ModelRunnerOutput.graph_num_tokens.
+            self.last_replay_num_tokens = static_num_tokens
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
             # The only variants this runner records are chunked-prefix ones.

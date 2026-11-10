@@ -209,8 +209,9 @@ class TestSchedulerEndpoints(unittest.TestCase):
             ("2001:db8::1", "127.0.0.1"),
             ("0.0.0.0", "127.0.0.1"),
             ("127.0.0.1", "127.0.0.1"),
-            ("192.0.2.1", "192.0.2.1"),
-            ("scheduler.example", "scheduler.example"),
+            # The scheduler binds --scheduler-host, never the public --host.
+            ("192.0.2.1", "127.0.0.1"),
+            ("scheduler.example", "127.0.0.1"),
         ):
             for ports in (None, [23100, 23200]):
                 with self.subTest(host=host, ports=ports):
@@ -255,6 +256,31 @@ class TestSchedulerEndpoints(unittest.TestCase):
                     self.assertEqual(receiver.recv(), b"ping")
                     receiver.send(b"pong")
                     self.assertEqual(sender.recv(), b"pong")
+
+    def test_unset_scheduler_port_is_left_to_the_os(self):
+        """A port probed while parsing args and bound seconds later can be taken
+        by a concurrent launch on the same host; an unset ingress has no outside
+        callers, so each scheduler binds port 0 and reports the port it got."""
+        with patch.object(server_args_module, "is_port_available", return_value=True):
+            unset = _from_dict_without_model_resolution({"model_path": "test/model"})
+            explicit = _from_dict_without_model_resolution(
+                {"model_path": "test/model", "scheduler_port": 6000}
+            )
+        self.assertEqual(unset.scheduler_ports, [0])
+        self.assertTrue(unset.scheduler_endpoint.endswith(":0"))
+        # Remote clients dial an explicit port, so it is used as given.
+        self.assertEqual(explicit.scheduler_ports, [6000])
+
+    def test_scheduler_port_stays_fixed_when_peers_dial_it(self):
+        args = _from_dict_without_model_resolution({"model_path": "test/model"})
+        self.assertTrue(args._scheduler_port_is_ephemeral())
+        for name, value in (
+            ("disagg_role", RoleType.SERVER),
+            ("disagg_mode", True),
+            ("nnodes", 2),
+        ):
+            with self.subTest(name=name), patch.object(args, name, value):
+                self.assertFalse(args._scheduler_port_is_ephemeral())
 
 
 class TestServerArgsPathExpansion(_CudaPlatformTestCase):
@@ -4150,6 +4176,88 @@ class TestDirectGpuWeightLoading(_CudaPlatformTestCase):
                 fsdp_args._validate_direct_gpu_weight_loading()
             with self.assertRaisesRegex(ValueError, "tp-size 1"):
                 tp_args._validate_direct_gpu_weight_loading()
+
+
+class TestSchedulerEndpointBinding(unittest.TestCase):
+    """The scheduler ingress is an unauthenticated pickle-RPC endpoint; it must
+    never follow a wildcard --host (see ServerArgs.scheduler_endpoint_for)."""
+
+    def _args(self, kwargs):
+        # Endpoint formatting does not need model resolution or port allocation.
+        args = ServerArgs.__new__(ServerArgs)
+        for key, value in kwargs.items():
+            setattr(args, key, value)
+        return args
+
+    def test_wildcard_host_pinned_to_loopback(self):
+        args = self._args(
+            {"model_path": "/fake/model", "host": "0.0.0.0", "scheduler_port": 5555}
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_ipv6_wildcard_host_pinned_to_loopback(self):
+        args = self._args(
+            {"model_path": "/fake/model", "host": "::", "scheduler_port": 5555}
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_default_host_stays_loopback(self):
+        args = self._args({"model_path": "/fake/model", "scheduler_port": 5555})
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_explicit_scheduler_host_is_honored(self):
+        args = self._args(
+            {
+                "model_path": "/fake/model",
+                "host": "10.1.2.3",
+                "scheduler_host": "10.1.2.4",
+                "scheduler_port": 5555,
+            }
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://10.1.2.4:5555")
+
+    def test_explicit_ipv6_host_uses_ipv4_loopback(self):
+        args = self._args(
+            {
+                "model_path": "/fake/model",
+                "host": "::1",
+                "scheduler_port": 5555,
+            }
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_replica_ports_increment_on_loopback(self):
+        args = self._args(
+            {"model_path": "/fake/model", "host": "0.0.0.0", "scheduler_port": 5555}
+        )
+        self.assertEqual(args.scheduler_endpoint_for(1), "tcp://127.0.0.1:5556")
+
+    def test_explicit_scheduler_ports_on_loopback(self):
+        args = self._args(
+            {
+                "model_path": "/fake/model",
+                "host": "0.0.0.0",
+                "scheduler_port": 5555,
+                "dp_size": 2,
+            }
+        )
+        args.scheduler_ports = [6100, 6200]
+        self.assertEqual(args.scheduler_endpoint, "tcp://127.0.0.1:6100")
+        self.assertEqual(
+            args.scheduler_endpoints,
+            ["tcp://127.0.0.1:6100", "tcp://127.0.0.1:6200"],
+        )
+
+    def test_explicit_scheduler_ports_with_ipv6(self):
+        args = self._args(
+            {
+                "model_path": "/fake/model",
+                "host": "::1",
+                "scheduler_port": 5555,
+            }
+        )
+        args.scheduler_ports = [6100, 6200]
+        self.assertEqual(args.scheduler_endpoint_for(1), "tcp://127.0.0.1:6200")
 
 
 class TestLayerwiseResidencyLifetime(unittest.TestCase):

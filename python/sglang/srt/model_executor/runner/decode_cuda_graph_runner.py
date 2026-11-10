@@ -61,7 +61,10 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    get_next_token_logits_dtype,
+)
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
@@ -120,6 +123,9 @@ from sglang.srt.model_executor.runner_utils.shared_read_event import make_extern
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
+from sglang.srt.true_on_policy import (
+    patch_prefill_only_deterministic_inference_for_cuda_graph,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -493,7 +499,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
             next_token_logits_buffer=self.model_runner.graph_shared_output.get_logits_buffer(
-                self.model_runner.model_config.vocab_size, rows=logits_buffer_rows
+                self.model_runner.model_config.vocab_size,
+                rows=logits_buffer_rows,
+                dtype=get_next_token_logits_dtype(
+                    self.model_runner.model_config.hf_text_config
+                ),
             ),
             dtype=self.model_runner.model_config.dtype,
             num_dp_ranks=self.num_dp_ranks,
@@ -1322,26 +1332,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(get_exec().graph.enable_cudagraph_gc):
-            if not self.enable_pdmux:
-                with (
-                    graph_capture(
-                        stream=get_or_create_global_graph_capture_stream()
-                    ) as graph_capture_context,
-                    profile_context as prof,
-                ):
-                    self.stream = graph_capture_context.stream
-                    with self.backend.capture_session(self.stream):
-                        self._capture_one_stream()
-            else:
-                for i, sg in enumerate(self.stream_groups):
+        with patch_prefill_only_deterministic_inference_for_cuda_graph(
+            self.model_runner.server_args,
+            attn_backend=getattr(self.model_runner, "attn_backend", None),
+            dvr_target_verify_cuda_graph=getattr(
+                self.model_runner, "enable_dvr_target_verify_cuda_graph", False
+            ),
+        ):
+            with freeze_gc(get_exec().graph.enable_cudagraph_gc):
+                if not self.enable_pdmux:
                     with (
-                        graph_capture(stream=sg[1]) as graph_capture_context,
+                        graph_capture(
+                            stream=get_or_create_global_graph_capture_stream()
+                        ) as graph_capture_context,
                         profile_context as prof,
                     ):
                         self.stream = graph_capture_context.stream
                         with self.backend.capture_session(self.stream):
-                            self._capture_one_stream(i)
+                            self._capture_one_stream()
+                else:
+                    for i, sg in enumerate(self.stream_groups):
+                        with (
+                            graph_capture(stream=sg[1]) as graph_capture_context,
+                            profile_context as prof,
+                        ):
+                            self.stream = graph_capture_context.stream
+                            with self.backend.capture_session(self.stream):
+                                self._capture_one_stream(i)
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)

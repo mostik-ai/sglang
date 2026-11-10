@@ -456,8 +456,12 @@ class Fp8Config(QuantizationConfig):
 
                 return Mxfp4HummingMoEMethod(fp8_method, prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
-                # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
+            if self.is_fp4_experts and (
+                get_moe_runner_backend().is_flashinfer_mxfp4()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            ):
+                # flashinfer_mxfp4 also supports CUTLASS on SM90 and SM120.
+                # The routed TRT-LLM backend is validated as SM100 at model load.
                 if get_platform().is_sm90 or get_platform().is_sm120:
                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
                         Mxfp4FlashinferCutlassMoEMethod,
@@ -597,11 +601,19 @@ class Fp8LinearMethod(LinearMethodBase):
                         f"{input_size_per_partition} is not divisible by "
                         f"weight quantization block_k = {block_k}."
                     )
-            # Required by column parallel or enabling merged weights
-            if (
+            # Required by column parallel or enabling merged weights.
+            is_tp_split = (
                 tp_size > 1 and output_size // output_size_per_partition == tp_size
-            ) or len(output_partition_sizes) > 1:
-                for output_partition_size in output_partition_sizes:
+            )
+            is_merged_gemm = len(output_partition_sizes) > 1
+            if is_tp_split or is_merged_gemm:
+                sizes_to_check = output_partition_sizes
+                if not is_tp_split and is_merged_gemm:
+                    # Match validate_fp8_block_shape: merged weights may have a
+                    # ragged final logical matrix, and scale tensors are already
+                    # allocated with ceil-divided block counts.
+                    sizes_to_check = output_partition_sizes[:-1]
+                for output_partition_size in sizes_to_check:
                     if output_partition_size % block_n != 0:
                         raise ValueError(
                             f"Weight output_partition_size = "
@@ -2782,17 +2794,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ("gemm1_beta", self.moe_runner_config.gemm1_beta),
             ("gemm1_clamp_limit", clamp_limit),
         ):
-            tensor = (
-                None
-                if value is None
-                else torch.full(
-                    (num_experts,),
-                    float(value),
-                    dtype=torch.float32,
-                    device=device,
+            buffer_name = f"_flashinfer_trtllm_{name}"
+            if buffer_name in layer._buffers:
+                existing = layer._buffers[buffer_name]
+                if (existing is None) != (value is None):
+                    raise ValueError(
+                        f"{name} cannot be enabled or disabled after initialization"
+                    )
+                # CUDA graphs retain this storage across online weight updates.
+                if existing is not None:
+                    existing.fill_(float(value))
+            else:
+                tensor = (
+                    None
+                    if value is None
+                    else torch.full(
+                        (num_experts,), float(value), dtype=torch.float32, device=device
+                    )
                 )
-            )
-            setattr(layer, f"_flashinfer_trtllm_{name}", tensor)
+                # Memory-saver weight offload preserves registered buffers, not
+                # arbitrary tensor attributes. These have no checkpoint payload.
+                layer.register_buffer(buffer_name, tensor, persistent=False)
 
     def _prepare_hpc_ops_weights(self, layer: Module) -> None:
         """Precompute the scale layouts consumed by the HPC-Ops fused MoE kernels.

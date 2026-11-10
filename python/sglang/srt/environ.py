@@ -897,6 +897,9 @@ class Envs:
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
 
+    # NIXL plugin the remote-instance weight agents use
+    SGLANG_REMOTE_INSTANCE_NIXL_BACKEND = EnvStr("UCX")
+
     # ===================================================================
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
     # ===================================================================
@@ -1356,6 +1359,7 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
@@ -2167,6 +2171,7 @@ class Envs:
     # ===================================================================
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+    SGLANG_DISABLE_MULTIMEM_AG = EnvBool(False)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

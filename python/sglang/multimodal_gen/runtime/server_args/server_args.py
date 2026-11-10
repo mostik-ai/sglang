@@ -570,6 +570,7 @@ class ServerArgs(DisaggServerArgsMixin):
     webui: bool = False
     webui_port: int | None = 12312
 
+    scheduler_host: str = "127.0.0.1"
     scheduler_port: int = 5555
     # settled ingress ports, one per DP replica; None until ports are settled
     scheduler_ports: list[int] | None = None
@@ -1607,6 +1608,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"Either use a different port or disable --strict-ports."
             )
 
+    def _scheduler_port_is_ephemeral(self) -> bool:
+        # Remote clients, disagg peers and other nodes dial a port they were told;
+        # otherwise only this launch talks to the ingress and learns its bound port.
+        return (
+            not self.is_arg_explicitly_set("scheduler_port")
+            and self.disagg_role == RoleType.MONOLITHIC
+            and not self.disagg_mode
+            and self.nnodes == 1
+        )
+
     def _adjust_network_ports(self):
         # standalone roles only need an HTTP port when exposing metrics
         needs_http = self.enable_metrics or self.disagg_role in (
@@ -1633,25 +1644,33 @@ class ServerArgs(DisaggServerArgsMixin):
                     )
                 seen_ports[port] = name
                 self._require_port(port, name)
+            self.scheduler_ports = [
+                self.scheduler_port + replica for replica in range(self.dp_size or 1)
+            ]
         else:
             settled_ports: set[int] = set()
             if needs_http:
                 self.port = self.settle_port(self.port)
                 settled_ports.add(self.port)
-            initial_scheduler_port = self.scheduler_port + (
-                random.randint(0, 100) if self.scheduler_port == 5555 else 0
-            )
-            self.scheduler_port = self.settle_port(
-                initial_scheduler_port, avoid=settled_ports
-            )
-            settled_ports.add(self.scheduler_port)
-            self.scheduler_ports = [self.scheduler_port]
-            for _ in range((self.dp_size or 1) - 1):
-                port = self.settle_port(
-                    self.scheduler_ports[-1] + 1, avoid=settled_ports
+            if self._scheduler_port_is_ephemeral():
+                # Port 0 has each scheduler take a free port at bind time; probing
+                # one here first would let a concurrent launch take it in between.
+                self.scheduler_ports = [0] * (self.dp_size or 1)
+            else:
+                initial_scheduler_port = self.scheduler_port + (
+                    random.randint(0, 100) if self.scheduler_port == 5555 else 0
                 )
-                settled_ports.add(port)
-                self.scheduler_ports.append(port)
+                self.scheduler_port = self.settle_port(
+                    initial_scheduler_port, avoid=settled_ports
+                )
+                settled_ports.add(self.scheduler_port)
+                self.scheduler_ports = [self.scheduler_port]
+                for _ in range((self.dp_size or 1) - 1):
+                    port = self.settle_port(
+                        self.scheduler_ports[-1] + 1, avoid=settled_ports
+                    )
+                    settled_ports.add(port)
+                    self.scheduler_ports.append(port)
             if self.master_port is not None:
                 self.master_port = self.settle_port(
                     self.master_port, 37, avoid=settled_ports
@@ -3054,6 +3073,12 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Master port for distributed inference. If not set, a random free port will be used.",
         )
         parser.add_argument(
+            "--scheduler-host",
+            type=str,
+            default=ServerArgs.scheduler_host,
+            help="Host the scheduler binds for client requests.",
+        )
+        parser.add_argument(
             "--scheduler-port",
             type=int,
             default=ServerArgs.scheduler_port,
@@ -3378,36 +3403,16 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @property
     def scheduler_endpoint(self):
-        """
-        Internal endpoint for scheduler.
-        Wildcard, localhost, and IPv6 hosts use IPv4 loopback for internal ZMQ.
-        """
+        """Internal endpoint for scheduler."""
         return self.scheduler_endpoint_for(0)
 
     def scheduler_endpoint_for(self, replica: int) -> str:
-        """Ingress endpoint of one DP replica's driver rank.
-
-        The scheduler ingress is an unauthenticated pickle-RPC endpoint
-        (``managers/scheduler.py`` ``recv_reqs`` deserializes client bytes
-        with ``pickle.loads``), so it must never be derived from the public
-        ``--host``: binding it to ``0.0.0.0`` would expose unsafe
-        deserialization to the network (CVE-2026-3059 family). Wildcard hosts
-        are pinned to loopback; IPv6 hosts also use IPv4 loopback for internal
-        ZMQ compatibility. Explicit non-wildcard IPv4 hosts and hostnames
-        (used for intentional cross-machine deployments) are honored.
-        """
-        scheduler_host = self.host
-        if (
-            scheduler_host is None
-            or scheduler_host in ("localhost", "0.0.0.0")
-            or is_valid_ipv6_address(scheduler_host)
-        ):
-            scheduler_host = "127.0.0.1"
+        """Ingress endpoint of one DP replica's driver rank."""
         if self.scheduler_ports is not None:
             port = self.scheduler_ports[replica]
         else:
             port = self.scheduler_port + replica
-        return f"tcp://{scheduler_host}:{port}"
+        return f"tcp://{self.scheduler_host}:{port}"
 
     @property
     def scheduler_endpoints(self) -> list[str]:

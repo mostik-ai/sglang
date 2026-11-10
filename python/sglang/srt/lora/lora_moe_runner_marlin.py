@@ -24,13 +24,15 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.kernels.ops.activation import silu_and_mul
     from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
         moe_sum_reduce_triton,
     )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        gated_marlin_activation,
         get_scalar_type,
+        is_mxfp4_marlin_weights,
+        marlin_moe_use_atomic_add,
     )
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         moe_align_block_size,
@@ -74,7 +76,9 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
 
-        assert runner_config.activation == "silu", "Only SiLU activation is supported."
+        assert runner_config.is_gated, (
+            "MarlinLoraRunnerCore only supports gated experts"
+        )
         assert torch.cuda.get_device_capability(hidden_states.device)[0] >= 9, (
             "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
         )
@@ -85,15 +89,27 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         N = quant_info.w2_qweight.shape[1] * 16
         topk = topk_ids.shape[1]
         num_bits = quant_info.weight_bits
+        use_atomic_add = marlin_moe_use_atomic_add(
+            hidden_states,
+            is_mxfp4_marlin_weights(
+                num_bits,
+                quant_info.w13_scales,
+                quant_info.w2_scales,
+                quant_info.w13_qzeros,
+                quant_info.w2_qzeros,
+            ),
+        )
 
         for block_size_m in [8, 16, 32, 48, 64]:
             if M * topk / E / block_size_m < 0.9:
                 break
 
         # Under EP the dispatcher already localized topk_ids (-1 = non-local); align
-        # over the global expert count like fused_marlin_moe, not the local E.
+        # over the global expert count like fused_marlin_moe, not the local E. Read
+        # it from the config: the LoRA wrapper builds quant_info before the EP map
+        # exists, so quant_info.global_num_experts stays -1.
         align_num_experts = (
-            quant_info.global_num_experts if quant_info.expert_map is not None else E
+            runner_config.num_experts if quant_info.expert_map is not None else E
         )
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids,
@@ -151,7 +167,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             size_n=2 * N,
             size_k=K,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
         )
@@ -167,7 +183,13 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         intermediate_cache2 = torch.empty(
             (M * topk, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+        gated_marlin_activation(
+            runner_config.activation,
+            runner_config.gemm1_alpha,
+            runner_config.gemm1_clamp_limit,
+            intermediate_cache1.view(-1, 2 * N),
+            intermediate_cache2,
+        )
 
         # Stage 3: Down (Marlin)
         intermediate_cache3 = torch.empty(
@@ -201,7 +223,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             size_n=K,
             size_k=N,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
         )

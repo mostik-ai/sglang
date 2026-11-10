@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_sp
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     Function,
     MessageProcessingResult,
     Tool,
@@ -943,12 +944,16 @@ class ServingChatTestCase(CustomTestCase):
 
             self.basic_req.return_sampling_mask = True
             self.basic_req.sampling_logprobs_mode = "support"
+            self.basic_req.return_indexer_topk = True
+            self.basic_req.return_outputs_via_store = True
             self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.sampling_logprobs_mode, "support")
+            self.assertTrue(adapted.return_indexer_topk)
+            self.assertTrue(adapted.return_outputs_via_store)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
@@ -1836,6 +1841,75 @@ class ServingChatTestCase(CustomTestCase):
             "return_sampling_mask requires return_meta_info=true.",
         )
 
+    def test_validate_request_rejects_indexer_topk_without_meta_info(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_indexer_topk=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_indexer_topk requires return_meta_info=true.",
+        )
+
+    def test_validate_request_rejects_output_store_without_meta_info(self):
+        """meta_info is the only place a chat response can carry the ref; without it
+        the stored object would leak."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_outputs_via_store=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_outputs_via_store requires return_meta_info=true.",
+        )
+
+    def _run_non_streaming(self, build):
+        ret = [
+            {
+                "meta_info": {
+                    "output_store_ref": {"backend": "m", "key": "k0", "fields": []}
+                }
+            },
+            {"meta_info": {}},
+        ]
+
+        async def generate(*args, **kwargs):
+            yield ret
+
+        self.tm.generate_request = generate
+        self.tm.output_store = Mock()
+        with patch.object(self.chat, "_build_chat_response", side_effect=build):
+            return get_or_create_event_loop().run_until_complete(
+                self.chat._handle_non_streaming_request(
+                    Mock(), self.basic_req, self.fastapi_request
+                )
+            )
+
+    def test_chat_build_failure_deletes_the_stored_outputs(self):
+        """A response that fails after the tokenizer stored its outputs is never
+        sent, so nobody could read or delete the stored objects."""
+        error = self.chat.create_error_response("bad reasoning", status_code=500)
+        self.assertIs(self._run_non_streaming(lambda *a: error), error)
+        self.tm.output_store.cleanup_refs.assert_called_once_with(
+            [{"backend": "m", "key": "k0", "fields": []}]
+        )
+
+        def raise_error(*args):
+            raise RuntimeError("encoding failed")
+
+        with self.assertRaises(RuntimeError):
+            self._run_non_streaming(raise_error)
+        self.tm.output_store.cleanup_refs.assert_called_once()
+
+    def test_chat_success_keeps_the_stored_outputs(self):
+        response = Mock(spec=ChatCompletionResponse)
+        self.assertIs(self._run_non_streaming(lambda *a: response), response)
+        self.tm.output_store.cleanup_refs.assert_not_called()
+
     def test_validate_request_rejects_flat_output_top_logprobs_without_meta_info(
         self,
     ):
@@ -1907,6 +1981,7 @@ class ServingChatTestCase(CustomTestCase):
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             input_ids=[101, 102, 103],
+            mm_token_expansion_start_len=2,
             stop=["STOP"],
             return_prompt_token_ids=True,
             cache_salt="tenant-a",
@@ -1922,11 +1997,70 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertEqual(processed, req)
         self.assertEqual(adapted.input_ids, [101, 102, 103])
+        self.assertEqual(adapted.mm_token_expansion_start_len, 2)
         self.assertTrue(adapted.return_prompt_token_ids)
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
         self.assertEqual(adapted.cache_salt, "tenant-a")
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
+
+    # Two user turns with media around a text-only assistant turn; the second
+    # turn interleaves a video, an image and an audio clip.
+    _MULTI_TURN_MEDIA_MESSAGES = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "turn1.png"}},
+                {"type": "text", "text": "what is this?"},
+            ],
+        },
+        {"role": "assistant", "content": "a cat"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": "turn2.mp4"}},
+                {"type": "image_url", "image_url": {"url": "turn2.png"}},
+                {"type": "audio_url", "audio_url": {"url": "turn2.wav"}},
+                {"type": "text", "text": "and these?"},
+            ],
+        },
+    ]
+
+    def _convert_input_ids_request(self, **kwargs):
+        self.tm.tokenizer = None
+        req = ChatCompletionRequest(
+            model="x",
+            messages=self._MULTI_TURN_MEDIA_MESSAGES,
+            input_ids=[101, 102, 103],
+            **kwargs,
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            adapted, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+        conv_mock.assert_not_called()
+        self.assertEqual(adapted.input_ids, [101, 102, 103])
+        return adapted
+
+    def test_partially_expanded_input_ids_keep_every_turn_media_in_order(self):
+        adapted = self._convert_input_ids_request(mm_token_expansion_start_len=1)
+
+        self.assertEqual(adapted.mm_token_expansion_start_len, 1)
+        self.assertEqual(
+            [image.url for image in adapted.image_data], ["turn1.png", "turn2.png"]
+        )
+        self.assertEqual(adapted.video_data, ["turn2.mp4"])
+        self.assertEqual(adapted.audio_data, ["turn2.wav"])
+
+    def test_input_ids_without_start_len_still_drop_message_media(self):
+        adapted = self._convert_input_ids_request()
+
+        self.assertEqual(adapted.mm_token_expansion_start_len, 0)
+        self.assertIsNone(adapted.image_data)
+        self.assertIsNone(adapted.video_data)
+        self.assertIsNone(adapted.audio_data)
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"

@@ -816,6 +816,20 @@ class TestTokenspeedMlaAlias(CustomTestCase):
         )
 
 
+class TestTokenSpaceProcessorArgs(CustomTestCase):
+    def test_rejects_encoder_disaggregation(self):
+        for role in ("encoder_only", "language_only"):
+            with self.subTest(role=role):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_token_space_processor=True,
+                    **{role: True},
+                )
+
+                with self.assertRaisesRegex(ValueError, "encoder disaggregation"):
+                    pd_disaggregation_hook.handle_encoder_disaggregation(server_args)
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @staticmethod
     def _set_model_type(server_args, *, is_multimodal):
@@ -2102,6 +2116,33 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
                     handle_a2a_moe(self._make_args())
 
 
+class TestPeerPortArgs(CustomTestCase):
+    def test_dp_peer_does_not_check_head_ports_on_local_host(self):
+        """A local listener must not block connecting to the head's TCP endpoints."""
+        with (
+            socket.socket() as listener,
+            patch.dict(os.environ, {"SGLANG_WAIT_PORT_TIMEOUT": "1"}),
+        ):
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            args = ServerArgs(model_path="dummy")
+            args.attn_dp_size = 2
+            args.nnodes = 2
+            args.node_rank = 1
+            args.dist_init_addr = f"192.0.2.1:{port}"
+            args.nccl_port = port
+            ports = PortArgs.init_new(args)
+            self.assertTrue(ports.tokenizer_ipc_name.startswith("tcp://192.0.2.1:"))
+            self.assertTrue(
+                ports.scheduler_input_ipc_name.startswith("tcp://192.0.2.1:")
+            )
+
+            args.node_rank = 0
+            with self.assertRaisesRegex(ValueError, "dist_init_port"):
+                PortArgs.init_new(args)
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):
@@ -2685,6 +2726,32 @@ class TestHiCacheArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "hicache_io_backend"), "kernel")
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_first")
         self.assertIsNone(resolution_result(args, "decode_attention_backend"))
+
+    def test_prefill_weight_versions_rejects_hierarchical_cache(self):
+        """KV restored from a host or storage tier carries no weight version, so the two cannot combine."""
+        args = self._make_args(
+            enable_prefill_weight_versions=True,
+            enable_hierarchical_cache=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
+            handle_cache_compatibility(args)
+
+    def test_prefill_weight_versions_rejects_disaggregation(self):
+        """PD prefill workers do not stamp prompt tokens yet, so the flag is refused there."""
+        args = self._make_args(
+            enable_prefill_weight_versions=True,
+            disaggregation_mode="prefill",
+        )
+
+        with self.assertRaisesRegex(ValueError, "disaggregation"):
+            handle_cache_compatibility(args)
+
+    def test_prefill_weight_versions_alone_is_accepted(self):
+        """A plain engine may report prompt weight versions."""
+        args = self._make_args(enable_prefill_weight_versions=True)
+
+        handle_cache_compatibility(args)
 
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(

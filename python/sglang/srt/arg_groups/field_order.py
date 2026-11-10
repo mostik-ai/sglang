@@ -557,5 +557,22 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_layer_partition",
     "engram_config",
     "moe_ascend_ops_config",
+    # sglang-miles fields follow every upstream slot so upstream positions stay fixed.
+    "enable_prefill_only_deterministic_inference",
+    "true_on_policy_contract",
+    "disable_draft_cuda_graph",
+    "custom_pull_weights_pre_read_hook",
+    "enable_engine_info_bootstrap",
+    "enable_rdt_weight_sync",
+    "lora_no_cpu_backup",
+    "enable_prefill_weight_versions",
+    "output_store_backend",
+    "output_store_backend_extra_config",
+    "remote_instance_weight_loader_start_seed_via_nixl",
+    "enable_token_space_processor",
+    "token_space_preprocess_cache_trust_url",
+    "enable_token_space_preprocess_cache",
+    "token_space_preprocess_cache_dir",
+    "token_space_preprocess_cache_check_rate",
 )
 # fmt: on

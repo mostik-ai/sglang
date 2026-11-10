@@ -290,6 +290,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.server_args = server_args
         self.metrics = init_metrics(server_args, rank)
         self.pipeline: ComposedPipelineBase = None
+        self._weights_update_groups: dict[str, torch.distributed.ProcessGroup] = {}
 
         self.init_device_and_model()
         load_snapshot = None if current_platform.is_cpu() else capture_memory_snapshot()
@@ -1814,6 +1815,8 @@ def run_scheduler_process(
         pipe_writer.send(
             {
                 "status": "ready",
+                "dp_replica": scheduler.dp_replica,
+                "actual_scheduler_port": scheduler.actual_scheduler_port,
             }
         )
         scheduler.event_loop()

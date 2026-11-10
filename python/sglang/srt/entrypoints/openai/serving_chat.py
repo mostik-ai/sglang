@@ -110,6 +110,7 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.output_store import OUTPUT_STORE_REF_KEY
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -215,6 +216,21 @@ def normalize_assistant_tool_call_arguments(
             except ValueError:
                 if strict:
                     raise
+
+
+def _collect_message_media(messages):
+    """Each message's media in message order, without rendering the template."""
+    image_data, video_data, audio_data, modalities = [], [], [], []
+    for message in messages:
+        process_content_for_template_format(
+            message.model_dump(),
+            "openai",
+            image_data,
+            video_data,
+            audio_data,
+            modalities,
+        )
+    return image_data, video_data, audio_data, modalities
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -1119,6 +1135,12 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
+        if request.return_indexer_topk and not request.return_meta_info:
+            return "return_indexer_topk requires return_meta_info=true."
+
+        if request.return_outputs_via_store and not request.return_meta_info:
+            return "return_outputs_via_store requires return_meta_info=true."
+
         if self.is_minimax_m3:
             m3_error = _validate_minimax_m3_request(request)
             if m3_error:
@@ -1370,6 +1392,7 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
+            mm_token_expansion_start_len=request.mm_token_expansion_start_len,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
@@ -1393,6 +1416,8 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
+            return_indexer_topk=request.return_indexer_topk,
+            return_outputs_via_store=request.return_outputs_via_store,
             rid=request.rid,
             session_id=request.session_id,
             extra_key=request.extra_key,
@@ -1947,13 +1972,20 @@ class OpenAIServingChat(OpenAIServingBase):
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
+            image_data, video_data, audio_data, modalities = [], [], [], []
+            # A partially expanded request still sends every media item of the
+            # conversation, for the token-space processor to match to its IDs.
+            if request.mm_token_expansion_start_len:
+                image_data, video_data, audio_data, modalities = _collect_message_media(
+                    request.messages
+                )
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
-                image_data=None,
-                audio_data=None,
-                video_data=None,
-                modalities=[],
+                image_data=image_data or None,
+                audio_data=audio_data or None,
+                video_data=video_data or None,
+                modalities=modalities,
                 stop=request.stop or [],
             )
         elif self.template_manager.chat_template_name is None:
@@ -2823,13 +2855,28 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_chat_response(
-            request,
-            ret,
-            int(time.time()),
-        )
-
+        try:
+            response = self._build_chat_response(
+                request,
+                ret,
+                int(time.time()),
+            )
+        except Exception:
+            self._cleanup_stored_outputs(ret)
+            raise
+        if not isinstance(response, ChatCompletionResponse):
+            self._cleanup_stored_outputs(ret)
         return response
+
+    def _cleanup_stored_outputs(self, ret: list[dict[str, Any]]) -> None:
+        """The response is an error, so nobody can read the outputs it stored."""
+        refs = [
+            item["meta_info"][OUTPUT_STORE_REF_KEY]
+            for item in ret
+            if OUTPUT_STORE_REF_KEY in item["meta_info"]
+        ]
+        if refs:
+            self.tokenizer_manager.output_store.cleanup_refs(refs)
 
     def _build_chat_response(
         self,
@@ -3136,6 +3183,15 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process for generating a new and unique `tool_call_id`"""
         if self.tool_call_parser == "kimi_k3":
             return f"{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
+        if self.tool_call_parser == "kimi_k2_raw_id":
+            # RL training needs the model-emitted tool_call_id round-tripped verbatim,
+            # so we skip the history-based renumbering below and return whatever the
+            # detector captured. Fall back to the canonical Kimi-K2 reconstruction
+            # (without history offset) if for any reason the detector did not record
+            # a raw id — the raw id field is best-effort but the format is stable.
+            if call_item.tool_call_id:
+                return call_item.tool_call_id
+            return f"functions.{call_item.name}:{call_item.tool_index}"
         if self.tool_call_parser != "kimi_k2":
             # A simple uuid is sufficient for all models except for Kimi-K2.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"

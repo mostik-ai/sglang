@@ -68,6 +68,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
 )
+from sglang.srt.true_on_policy import should_force_bfloat16_lm_head
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -213,6 +214,35 @@ def autotune_dummy_run_mode(*, run_lm_head: bool):
         yield
     finally:
         _autotune_run_lm_head = None
+
+
+def _use_fp32_lm_head(config) -> bool:
+    return get_exec().features.enable_fp32_lm_head or getattr(
+        config, "enable_lm_head_fp32", False
+    )
+
+
+def _final_logit_softcapping(config) -> Optional[float]:
+    softcap = getattr(config, "final_logit_softcapping", None)
+    return None if softcap is not None and softcap < 0 else softcap
+
+
+def get_next_token_logits_dtype(config) -> torch.dtype:
+    """Dtype of the next-token logits LogitsProcessor(config) returns.
+
+    Graph runners allocate next_token_logits_buffer with it, so graph replay and
+    eager forward hand the sampler the same dtype.
+    """
+    # The fused cast-and-softcap writes fp32 logits even under a bf16 contract.
+    if _final_logit_softcapping(config):
+        return torch.float
+    # An FP32-output lm_head (enable_lm_head_output_fp32) takes the FP32 path first.
+    fp32_output = _use_fp32_lm_head(config) or getattr(
+        config, "enable_lm_head_output_fp32", False
+    )
+    if should_force_bfloat16_lm_head(use_fp32_lm_head=fp32_output):
+        return torch.bfloat16
+    return torch.float
 
 
 @dataclasses.dataclass
@@ -468,9 +498,8 @@ class LogitsProcessor(nn.Module):
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
-        self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
-            config, "enable_lm_head_fp32", False
-        )
+        self.use_fp32_lm_head = _use_fp32_lm_head(config)
+        self.next_token_logits_dtype = get_next_token_logits_dtype(config)
         self.use_fp32_lm_head_output = getattr(
             config, "enable_lm_head_output_fp32", False
         )
@@ -490,14 +519,7 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
-        self.final_logit_softcapping = getattr(
-            self.config, "final_logit_softcapping", None
-        )
-        if (
-            self.final_logit_softcapping is not None
-            and self.final_logit_softcapping < 0
-        ):
-            self.final_logit_softcapping = None
+        self.final_logit_softcapping = _final_logit_softcapping(self.config)
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
@@ -1157,9 +1179,10 @@ class LogitsProcessor(nn.Module):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
-            if out is not None and out.shape != (
-                hidden_states.shape[0],
-                lm_head.weight.shape[0],
+            # The bf16 true-on-policy buffer cannot take an FP32 mm output.
+            if out is not None and (
+                out.dtype != torch.float32
+                or out.shape != (hidden_states.shape[0], lm_head.weight.shape[0])
             ):
                 out = None
             use_mm_out_dtype = (
@@ -1183,17 +1206,17 @@ class LogitsProcessor(nn.Module):
                     hidden_states.to(torch.float32),
                     lm_head.weight.to(torch.float32).T,
                 )
+            elif should_force_bfloat16_lm_head(use_fp32_lm_head=self.use_fp32_lm_head):
+                logits = torch.matmul(
+                    hidden_states.to(torch.bfloat16),
+                    lm_head.weight.to(torch.bfloat16).T,
+                ).to(torch.bfloat16)
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,
                     None,  # bias
                     True,  # is_vnni
-                )
-            elif self.rl_on_policy_target is not None:
-                # Due to tie-weight, we may not be able to change lm_head's weight dtype
-                logits = torch.matmul(
-                    hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
                 logits = torch.matmul(
@@ -1358,14 +1381,21 @@ class LogitsProcessor(nn.Module):
         if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(
             logits.shape
         ):
-            assert logits_buffer.dtype == torch.float
-            if logits.is_cuda and logits.dtype in (torch.float16, torch.bfloat16):
+            assert logits_buffer.dtype == self.next_token_logits_dtype, (
+                f"next_token_logits_buffer is {logits_buffer.dtype}, "
+                f"expected {self.next_token_logits_dtype}"
+            )
+            if (
+                logits_buffer.dtype == torch.float
+                and logits.is_cuda
+                and logits.dtype in (torch.float16, torch.bfloat16)
+            ):
                 # Measured on GB300: torch's dtype-casting copy_ is ~2.8x slower.
                 return cast_to_float32_logits(logits, logits_buffer)
             logits_buffer.copy_(logits)
             logits = logits_buffer
         else:
-            logits = logits.float()
+            logits = logits.to(self.next_token_logits_dtype)
         return logits
 
     def _get_dllm_logits(

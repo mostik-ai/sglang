@@ -6,6 +6,7 @@ import sys
 import time
 from contextlib import ExitStack
 from multiprocessing.connection import wait
+from typing import Callable, Optional
 
 import uvicorn
 
@@ -134,10 +135,19 @@ def shutdown_scheduler_processes(
     _kill_alive_processes(alive, _WORKER_KILL_TIMEOUT_S)
 
 
+def _record_bound_scheduler_port(server_args: ServerArgs, ready_data: dict) -> None:
+    # A scheduler may bind a different port than requested; clients must dial that one.
+    if ready_data["actual_scheduler_port"] is not None:
+        server_args.scheduler_ports[ready_data["dp_replica"]] = ready_data[
+            "actual_scheduler_port"
+        ]
+
+
 def _start_scheduler_processes(
     server_args: ServerArgsPayload,
     ranks: list[tuple[int, int]],
     name_prefix: str,
+    on_ready: Optional[Callable[[dict], None]] = None,
 ) -> list[mp.Process]:
     """Spawn a worker group, owning its pipes and children until all ranks are ready."""
     context = mp.get_context("spawn")
@@ -187,6 +197,8 @@ def _start_scheduler_processes(
                         raise RuntimeError(
                             f"{process.name} failed to initialize: {data}"
                         )
+                    if on_ready is not None:
+                        on_ready(data)
                     reader.close()
         except BaseException:
             alive = _terminate_alive_processes(processes, _WORKER_TERMINATE_TIMEOUT_S)
@@ -222,7 +234,14 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         server_args_payload,
         [(i, rank_offset + i) for i in range(local_num_gpus)],
         "sglang-diffusionWorker-",
+        on_ready=lambda data: _record_bound_scheduler_port(server_args, data),
     )
+    if 0 in (server_args.scheduler_ports or ()):
+        shutdown_scheduler_processes(None, processes, request_shutdown=False)
+        raise RuntimeError(
+            f"Scheduler ports {server_args.scheduler_ports}: a DP replica did not "
+            "report the port it bound."
+        )
 
     logger.debug("All workers are ready")
     logger.info("[server-load] workers_ready_monotonic_ns=%d", time.monotonic_ns())
@@ -255,7 +274,10 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             logger.info("Launch FastAPI server in another process because of webui.")
             http_server_process = mp.get_context("spawn").Process(
                 target=bootstrap_http_server_process,
-                args=(server_args_payload, tuple(p.pid for p in processes)),
+                args=(
+                    ServerArgsPayload.capture(server_args),
+                    tuple(p.pid for p in processes),
+                ),
                 name="sglang-diffusion-webui",
                 daemon=True,
             )
@@ -408,7 +430,7 @@ def launch_pool_disagg_server(
         logger.info("All pool role instances ready")
 
         # Start DiffusionServer
-        frontend_endpoint = f"tcp://{host}:{server_args.scheduler_port}"
+        frontend_endpoint = server_args.scheduler_endpoint
 
         diffusion_server = DiffusionServer(
             frontend_endpoint=frontend_endpoint,
@@ -540,7 +562,7 @@ def launch_disagg_server(server_args: ServerArgs):
     denoiser_result_ep = f"tcp://{host}:{base_port + 2}"
     decoder_result_ep = f"tcp://{host}:{base_port + 3}"
 
-    frontend_endpoint = f"tcp://{host}:{base_port}"
+    frontend_endpoint = server_args.scheduler_endpoint
 
     logger.info("Starting DiffusionServer: frontend=%s", frontend_endpoint)
     for role, endpoints in (

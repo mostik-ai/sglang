@@ -1,5 +1,6 @@
 import pickle
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import DEFAULT, MagicMock, patch
@@ -25,6 +26,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BeamSearchOutput,
     ConfigureLoggingReq,
+    msgpack_decode,
+    msgpack_encode,
     unwrap_from_pickle,
     wrap_as_pickle,
 )
@@ -108,6 +111,10 @@ def _make_batch_str_output() -> BatchStrOutput:
             None,
         ],
         token_steps=[[1], [2]],
+        prefill_weight_versions=[
+            [WeightVersionSpan(version="v0", start=0, end=7)],
+            None,
+        ],
     )
 
 
@@ -279,6 +286,42 @@ class TestMultiTokenizerMixin(CustomTestCase):
             chunk.to_lists(support_logprobs=True), ([[7, 8]], [[-0.5, -1.0]])
         )
 
+    def test_batch_str_output_keeps_indexer_topk_layer_count(self):
+        """The batch-wide layer count reaches every per-worker split."""
+        output = _make_batch_str_output()
+        output.indexer_topk = ["AAAA", "BBBB"]
+        output.indexer_topk_num_layers = 7
+
+        for i in range(2):
+            self.assertEqual(
+                _handle_output_by_index(output, i).indexer_topk_num_layers, 7
+            )
+
+    def test_batch_str_output_keeps_raw_replay_tensors(self):
+        """Output-store requests read these tensors after IPC and the per-worker split."""
+        output = _make_batch_str_output()
+        output.output_ids = [array("q", [1]), array("q", [2])]
+        routed = torch.tensor([[[3, 4]]], dtype=torch.int32)
+        indexer = torch.zeros((1, 2, 3), dtype=torch.int32)
+        output.routed_experts_raw = [routed, None]
+        output.indexer_topk_raw = [None, indexer]
+
+        for codec, round_trip in {
+            "pickle": lambda x: pickle.loads(pickle.dumps(x)),
+            "msgpack": lambda x: msgpack_decode(msgpack_encode(x)),
+        }.items():
+            with self.subTest(codec=codec):
+                received = round_trip(output)
+                first = _handle_output_by_index(received, 0)
+                second = _handle_output_by_index(received, 1)
+                self.assertTrue(torch.equal(first.routed_experts_raw[0], routed))
+                self.assertEqual(first.indexer_topk_raw, [None])
+                self.assertEqual(second.routed_experts_raw, [None])
+                self.assertTrue(torch.equal(second.indexer_topk_raw[0], indexer))
+                grouped = _handle_output_by_indices(received, [1, 0])
+                self.assertEqual(grouped.routed_experts_raw[0], None)
+                self.assertTrue(torch.equal(grouped.routed_experts_raw[1], routed))
+
     def test_batch_str_output_without_weight_versions_stays_none(self):
         """An output from an older server without the field splits into None."""
         output = _make_batch_str_output()
@@ -427,6 +470,25 @@ class TestMultiTokenizerMixin(CustomTestCase):
             [(target, obj.rids) for target, obj in sent],
             [("detok-a", ["embedding-rid-0"]), ("detok-a", ["embedding-rid-1"])],
         )
+
+    def test_batch_str_output_keeps_prefill_weight_versions_nested_per_request(self):
+        """Prefill spans split per request the same way the sampling spans do."""
+        output = _make_batch_str_output()
+
+        self.assertEqual(
+            _handle_output_by_index(output, 0).prefill_weight_versions,
+            [[WeightVersionSpan(version="v0", start=0, end=7)]],
+        )
+        self.assertEqual(
+            _handle_output_by_index(output, 1).prefill_weight_versions, [None]
+        )
+
+    def test_batch_str_output_without_prefill_weight_versions_stays_none(self):
+        """An output produced without the flag splits into None."""
+        output = _make_batch_str_output()
+        output.prefill_weight_versions = None
+
+        self.assertIsNone(_handle_output_by_index(output, 0).prefill_weight_versions)
 
     def test_router_keys_on_rid_without_tokenizer_worker_ipcs(self):
         output = _make_batch_str_output()

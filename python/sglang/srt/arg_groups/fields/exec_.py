@@ -182,6 +182,10 @@ class ExecFeatures(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    enable_prefill_weight_versions: A[
+        bool,
+        "Enable returning the weight version that computed each prompt token's KV cache with responses, as meta_info['prefill_weight_versions'].",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -189,6 +193,20 @@ class ExecFeatures(msgspec.Struct):
         "Use the same value on disaggregated prefill and decode nodes; clients "
         "should set top_k below the limit to leave headroom for cutoff ties.",
     ] = 4096
+    output_store_backend: A[
+        str,
+        "Storage backend (a radix_transfer_plugins backend name) for the routed "
+        "experts, indexer top-k, and sampling masks of requests that set "
+        "return_outputs_via_store; their responses carry meta_info.output_store_ref "
+        "instead of the arrays. 'none' disables it.",
+    ] = "none"
+    output_store_backend_extra_config: A[
+        Optional[str],
+        "JSON object with the --output-store-backend config. For mooncake: "
+        "master_server_address, local_hostname, local_buffer_size, key_prefix, and "
+        "optionally protocol, metadata_server, device_name, replica_num. "
+        "MOONCAKE_* env vars are not read.",
+    ] = None
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -671,6 +689,9 @@ class ExecGraph(msgspec.Struct):
         "Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
     ] = False
     disable_cuda_graph: A[bool, Arg(no_cli=True)] = False
+    disable_draft_cuda_graph: A[
+        bool, "Disable cuda graph for draft model in speculative decoding."
+    ] = False
     disable_cuda_graph_padding: A[
         bool,
         "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
@@ -1175,6 +1196,15 @@ class ExecDeterministic(msgspec.Struct):
     enable_deterministic_inference: A[
         bool, "Enable deterministic inference mode with batch invariant ops."
     ] = False
+    enable_prefill_only_deterministic_inference: A[
+        bool,
+        "Enable prefill-only deterministic inference mode with batch invariant ops.",
+    ] = False
+    true_on_policy_contract: A[
+        Optional[str],
+        "Internal true-on-policy parity contract selected by the launcher. "
+        "Normal users should prefer the Miles true_on_policy switch.",
+    ] = None
     rl_on_policy_target: A[
         Optional[str],
         Arg(

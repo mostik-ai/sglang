@@ -169,6 +169,13 @@ def get_hidden_dim(
         )
 
 
+def shared_experts_count(config: AutoConfig) -> Optional[int]:
+    # DeepSeek-style configs say n_shared_experts, Kimi K3 says num_shared_experts
+    return getattr(config, "n_shared_experts", None) or getattr(
+        config, "num_shared_experts", None
+    )
+
+
 def get_default_hidden_dim(
     module_name: str,
     config: AutoConfig,
@@ -204,7 +211,7 @@ def get_default_hidden_dim(
         moe_freq = getattr(config, "moe_layer_freq", 1)
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
             moe_inter = getattr(config, "moe_intermediate_size", None)
-            n_shared = getattr(config, "n_shared_experts", None)
+            n_shared = shared_experts_count(config)
             if moe_inter is not None and n_shared is not None:
                 inter = moe_inter * n_shared
         return config.hidden_size, inter * 2
@@ -214,7 +221,7 @@ def get_default_hidden_dim(
         moe_freq = getattr(config, "moe_layer_freq", 1)
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
             moe_inter = getattr(config, "moe_intermediate_size", None)
-            n_shared = getattr(config, "n_shared_experts", None)
+            n_shared = shared_experts_count(config)
             if moe_inter is not None and n_shared is not None:
                 inter = moe_inter * n_shared
         return inter, config.hidden_size
@@ -256,12 +263,19 @@ def get_default_hidden_dim(
         moe_inter = (
             getattr(config, "moe_intermediate_size", None) or config.intermediate_size
         )
-        return config.hidden_size, moe_inter * 2
+        # Latent MoE (Kimi K3) routes a compressed activation into the experts.
+        moe_hidden = (
+            getattr(config, "routed_expert_hidden_size", None) or config.hidden_size
+        )
+        return moe_hidden, moe_inter * 2
     elif module_name == "down_proj_moe":
         moe_inter = (
             getattr(config, "moe_intermediate_size", None) or config.intermediate_size
         )
-        return moe_inter, config.hidden_size
+        moe_hidden = (
+            getattr(config, "routed_expert_hidden_size", None) or config.hidden_size
+        )
+        return moe_inter, moe_hidden
     elif module_name == "embed_tokens":
         # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
         # if contain extra tokens will be added; otherwise is 0.
@@ -274,8 +288,24 @@ def get_default_hidden_dim(
         raise NotImplementedError("get_hidden_dim not implemented for " + module_name)
 
 
+# Fused LoRA modules loaded member by member: each adapter projection fills its own slot of
+# the fused buffer, sliced by the wrapper of the fused layer; untrained members stay zero.
+LORA_FUSED_MEMBERS = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "fused_qkv_a_proj_with_mqa": ("q_a_proj", "kv_a_proj_with_mqa"),
+    "qkvr": ("wq_du", "wk_dv", "wv_dv", "wr_du"),
+}
+LORA_FUSED_MEMBER_SLOTS = {
+    member: (fused, slot)
+    for fused, members in LORA_FUSED_MEMBERS.items()
+    for slot, member in enumerate(members)
+}
+
+
 def get_normalized_target_modules(
     target_modules: Union[str, Iterable[str]],
+    base_model: Optional[torch.nn.Module] = None,
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
@@ -296,11 +326,14 @@ def get_normalized_target_modules(
         return {"all"}
 
     params_mapping = {
-        "q_proj": "qkv_proj",
-        "k_proj": "qkv_proj",
-        "v_proj": "qkv_proj",
-        "gate_proj": "gate_up_proj",
-        "up_proj": "gate_up_proj",
+        **{member: fused for member, (fused, _) in LORA_FUSED_MEMBER_SLOTS.items()},
+        "in_proj_q": "in_proj_qkvz",
+        "in_proj_k": "in_proj_qkvz",
+        "in_proj_v": "in_proj_qkvz",
+        "in_proj_qkv": "in_proj_qkvz",
+        "in_proj_z": "in_proj_qkvz",
+        "in_proj_b": "in_proj_ba",
+        "in_proj_a": "in_proj_ba",
         "out_proj": "out_proj",
         "embed_tokens": "embed_tokens",
         "vocab_emb": "embed_tokens",
@@ -309,8 +342,6 @@ def get_normalized_target_modules(
         "lm_head": "lm_head",
         "output": "lm_head",
         "unembed_tokens": "lm_head",
-        "q_a_proj": "fused_qkv_a_proj_with_mqa",
-        "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
         # DSA indexer projections are qualified with their parent module name
         # because the bare leaf names collide with unrelated modules in other
         # models (e.g. DeepSeek-V4 attention `wq_b`, Pixtral vision `wk`).
@@ -321,7 +352,21 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
-        base_name = name.split(".")[-1]
+        # Models may fuse adapter projections differently from the common HF layout.
+        if base_model is not None and hasattr(
+            base_model, "get_lora_target_module_name"
+        ):
+            name = base_model.get_lora_target_module_name(name)
+        parent, _, base_name = name.rpartition(".")
+        # a bare DSA leaf means the indexer's; under another parent it is that
+        # parent's own projection (DeepSeek-V4's attn.wq_b)
+        if (
+            f"indexer.{base_name}" in DSA_INDEXER_LORA_NAMES
+            and parent
+            and not parent.endswith("indexer")
+        ):
+            result.add(base_name)
+            continue
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
     return result
@@ -337,13 +382,12 @@ def get_stacked_multiply(
     if base_model is not None and hasattr(base_model, "get_stacked_multiply"):
         return base_model.get_stacked_multiply(module_name)
     stacked_rank = {
-        "qkv_proj": 3,
+        **{fused: len(members) for fused, members in LORA_FUSED_MEMBERS.items()},
         "in_proj_qkvz": 4,  # GDN packed input projection
-        "gate_up_proj": 2,
+        "in_proj_ba": 2,  # GDN packed b/a input projection
         "gate_up_proj_moe": 2,
         "gate_up_proj_shared_moe": 2,
         "in_proj": 2,
-        "fused_qkv_a_proj_with_mqa": 2,
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
 
@@ -378,6 +422,7 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
     "down_proj_moe",
     "down_proj_shared_moe",
     "wo_ud",
+    "wo_b",
 ]
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
@@ -386,6 +431,10 @@ REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
     "fc2_latent_proj",
+    "f_a_proj",
+    "g_a_proj",
+    "wq_a",
+    "wkv",
     *DSA_INDEXER_LORA_NAMES,
 ]
 # Attention-projection LoRA modules shard on the attention-TP group, which
@@ -404,6 +453,12 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "wo_ud",
         "in_proj",
         "in_proj_qkvz",
+        "b_proj",
+        "f_b_proj",
+        "g_b_proj",
+        "wq_b",
+        "wo_a",
+        "wo_b",
     }
 )
 
@@ -418,6 +473,12 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
+        "b_proj",
+        "f_a_proj",
+        "f_b_proj",
+        "g_a_proj",
+        "g_b_proj",
         "up_proj",
         "gate_up_proj",
         "down_proj",
@@ -428,6 +489,11 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "fused_qkv_a_proj_with_mqa",
         "q_b_proj",
         "kv_b_proj",
+        "wq_a",
+        "wq_b",
+        "wkv",
+        "wo_a",
+        "wo_b",
     }
     | DSA_INDEXER_LORA_NAMES
 )
@@ -474,7 +540,7 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
             else:
                 raw_names.add(leaf_name)
 
-    normalized = get_normalized_target_modules(raw_names)
+    normalized = get_normalized_target_modules(raw_names, base_model=model)
     result = normalized & _KNOWN_LORA_TARGET_MODULES
 
     # Allow models to declare additional LoRA-compatible modules that

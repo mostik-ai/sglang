@@ -957,6 +957,8 @@ class ChatCompletionRequest(PDRoutingFields):
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
+    return_indexer_topk: bool = False
+    return_outputs_via_store: bool = False
     return_cached_tokens_details: bool = False
     return_spec_tokens_details: bool = False
     return_prompt_token_ids: bool = False
@@ -1045,6 +1047,8 @@ class ChatCompletionRequest(PDRoutingFields):
     # tokenization entirely.  Messages are still used to derive stop tokens
     # and tool_call_constraint.
     input_ids: Optional[List[int]] = None
+    # See GenerateReqInput.mm_token_expansion_start_len.
+    mm_token_expansion_start_len: int = 0
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -1090,6 +1094,14 @@ class ChatCompletionRequest(PDRoutingFields):
         if isinstance(value, bool):
             raise ValueError("reasoning_effort must not be a boolean")
         return value
+
+    @model_validator(mode="after")
+    def validate_mm_token_expansion_start_len(self):
+        if self.mm_token_expansion_start_len and not self.input_ids:
+            raise ValueError(
+                "input_ids must be non-empty when mm_token_expansion_start_len is set."
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod

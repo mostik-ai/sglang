@@ -88,6 +88,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.layers import unwrap_lora_layer
+from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -131,6 +132,7 @@ def load_mimo_v2_qkv_proj_weight(
     deferred_scale_inv: Optional[Dict[str, torch.Tensor]] = None,
     *,
     qkv_proj: QKVParallelLinear,
+    config=None,
 ):
     qkv_proj = unwrap_lora_layer(qkv_proj)
     tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
@@ -175,33 +177,70 @@ def load_mimo_v2_qkv_proj_weight(
         default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
     else:
         shards_per_rank = ckpt_tp // tp_size
-        shards = loaded_weight.chunk(ckpt_tp, dim=0)
-        merged = torch.cat(
-            shards[tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank],
-            dim=0,
-        )
+        shards = loaded_weight.chunk(ckpt_tp, dim=0)[
+            tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank
+        ]
+        if loaded_weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            # Block-FP8 codes keep the checkpoint shard order;
+            # _resolve_deferred_qkv_scale_inv regroups them with their scales.
+            merged = torch.cat(shards, dim=0)
+        else:
+            qkv_sizes = (
+                _get_ckpt_qkv_shard_sizes(
+                    config=config, layer_name=name, ckpt_tp=ckpt_tp
+                )
+                if config is not None
+                else None
+            )
+            if qkv_sizes is None:
+                raise ValueError(
+                    f"qkv_proj weight {name}: attention TP {tp_size} below the "
+                    f"checkpoint's {ckpt_tp} kv-head shards needs the model config "
+                    f"to regroup q|k|v"
+                )
+            q_per_shard, k_per_shard, v_per_shard = qkv_sizes
+            merged = _deinterleave_qkv_shards(
+                shards,
+                q_per_shard=q_per_shard,
+                k_per_shard=k_per_shard,
+                v_per_shard=v_per_shard,
+            )
         default_weight_loader(param, merged)
 
 
-def _get_ckpt_qkv_shard_sizes(config, layer_name, ckpt_tp):
-    m = re.search(r"layers\.(\d+)\.", layer_name)
-    if m is None:
-        return None
-    layer_id = int(m.group(1))
+def _swa_attention_dims(config):
+    hd = config.swa_head_dim
+    return (
+        config.swa_num_attention_heads,
+        config.swa_num_key_value_heads,
+        hd,
+        getattr(config, "swa_v_head_dim", hd),
+    )
 
+
+def _attention_dims(config, layer_id):
+    """(num_heads, num_kv_heads, head_dim, v_head_dim) of a decoder layer."""
     pattern = getattr(config, "hybrid_layer_pattern", None)
-    is_swa = pattern is not None and pattern[layer_id] == 1
+    if pattern is not None and pattern[layer_id] == 1:
+        return _swa_attention_dims(config)
+    hd = config.head_dim
+    return (
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        hd,
+        getattr(config, "v_head_dim", hd),
+    )
 
-    if is_swa:
-        nh = config.swa_num_attention_heads
-        nkv = config.swa_num_key_value_heads
-        hd = config.swa_head_dim
-        vhd = getattr(config, "swa_v_head_dim", hd)
+
+def _get_ckpt_qkv_shard_sizes(config, layer_name, ckpt_tp):
+    if ".mtp_block." in layer_name:
+        # MiMoV2MTPLayer always builds sliding-window attention.
+        nh, nkv, hd, vhd = _swa_attention_dims(config)
     else:
-        nh = config.num_attention_heads
-        nkv = config.num_key_value_heads
-        hd = config.head_dim
-        vhd = getattr(config, "v_head_dim", hd)
+        m = re.search(r"layers\.(\d+)\.", layer_name)
+        if m is None:
+            return None
+        nh, nkv, hd, vhd = _attention_dims(config, int(m.group(1)))
 
     q_per_shard = (nh // ckpt_tp) * hd
     k_per_shard = max(1, nkv // ckpt_tp) * hd
@@ -1332,6 +1371,25 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
+    # The audio encoders also have `layers.<i>.*_proj` linears; LoRA adapts only
+    # the language model.
+    _lora_pattern = re.compile(
+        r"^model\.layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)"
+        r"|mlp\.(?:gate_up_proj|down_proj|experts))$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern.match(module_name))
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        # Sliding-window and full layers differ in KV heads; V heads are narrower.
+        if module_name not in ("qkv_proj", "o_proj"):
+            return get_default_hidden_dim(module_name, self.config, layer_idx)
+        nh, nkv, hd, vhd = _attention_dims(self.config, layer_idx)
+        if module_name == "qkv_proj":
+            return self.config.hidden_size, (nh + nkv) * hd + nkv * vhd
+        return nh * vhd, self.config.hidden_size
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.model is not None, (
             "get_input_embedding() is not available in encoder_only mode"
@@ -1682,6 +1740,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         expected_fused_tp_size,
                         deferred_scale_inv=deferred_qkv_scale_inv,
                         qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
+                        config=self.config,
                     )
                 continue
 

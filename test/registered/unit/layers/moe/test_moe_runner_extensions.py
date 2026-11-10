@@ -201,6 +201,8 @@ def test_lora_uses_quant_method_contract_for_registered_backend(
     base_layer.should_fuse_routed_scaling_factor_in_topk = False
     base_layer.moe_tp_size = 1
     base_layer.moe_tp_rank = 0
+    base_layer.moe_ep_size = 1
+    base_layer.moe_ep_rank = 0
     base_layer.intermediate_size_per_partition = 8
     base_layer.runner = SimpleNamespace(runner_backend=backend)
     lora_backend = SimpleNamespace(name="triton", is_moe_lora=False)
@@ -328,9 +330,10 @@ def test_trtllm_quant_method_defines_runner_after_create_moe_runner() -> None:
     method = Mxfp4FlashinferTrtllmMoEMethod.__new__(Mxfp4FlashinferTrtllmMoEMethod)
     assert not hasattr(method, "runner")
 
-    method.create_moe_runner(
-        SimpleNamespace(num_local_experts=2), MoeRunnerConfig(swiglu_limit=None)
-    )
+    # The clamp limit is registered on the layer as a buffer.
+    layer = torch.nn.Module()
+    layer.num_local_experts = 2
+    method.create_moe_runner(layer, MoeRunnerConfig(swiglu_limit=None))
 
     assert method.runner is None
 

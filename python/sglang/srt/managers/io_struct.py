@@ -189,6 +189,8 @@ class GenerateReqInput:
         Optional[Union[List[List[int]], List[int]]],
         PlainValidator(validate_optional_list_i64_1d_2d),
     ] = None
+    # Start multimodal token expansion here in supplied input_ids; preserve the prefix.
+    mm_token_expansion_start_len: Union[List[int], int] = 0
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -238,7 +240,8 @@ class GenerateReqInput:
     # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Return either the selected token's behavior logprob or behavior logprobs for
-    # the full sampling support. When omitted, selected mode is used if
+    # the full sampling support; support mode also returns each sampled token's logprob
+    # in output_token_sampling_selected_logprobs. When omitted, selected mode is used if
     # return_sampling_mask is enabled.
     sampling_logprobs_mode: Optional[
         Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]
@@ -267,6 +270,9 @@ class GenerateReqInput:
     # 0 = full sequence.
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
+    # Return routed experts, indexer top-k, and sampling mask via --output-store-backend
+    # as meta_info.output_store_ref; one prompt, n=1, no streaming or beam search.
+    return_outputs_via_store: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -277,6 +283,8 @@ class GenerateReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # {lora_name: disk path}: backfill source when this engine does not hold the adapter
+    lora_backfill_paths: Optional[Dict[str, str]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -432,7 +440,22 @@ class GenerateReqInput:
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
+        # Checked before parallel sampling turns a single request into a batch.
+        if self.is_single and isinstance(self.mm_token_expansion_start_len, list):
+            raise ValueError(
+                "mm_token_expansion_start_len should be an integer for a single "
+                "request."
+            )
         self._handle_parallel_sampling()
+        # TODO(guapisolo): support batch, n>1 (deleting the others' stored objects
+        # when a sub-request fails), and beam search; RL sends one prompt per request.
+        if self.return_outputs_via_store and (
+            not self.is_single or self._sampling_params_beam_width() > 1
+        ):
+            raise ValueError(
+                "return_outputs_via_store supports one prompt with n=1 "
+                "and no beam search."
+            )
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -452,6 +475,14 @@ class GenerateReqInput:
         ):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
+            )
+        start_lens = self.mm_token_expansion_start_len
+        if not self.input_ids and any(
+            start_lens if isinstance(start_lens, list) else [start_lens]
+        ):
+            raise ValueError(
+                "input_ids must be non-empty when mm_token_expansion_start_len "
+                "is positive."
             )
         if (
             self.return_flat_raw_top_logprobs
@@ -606,6 +637,7 @@ class GenerateReqInput:
         self._normalize_sampling_params(num)
         self._normalize_watermark(num)
         self._normalize_logprob_params(num)
+        self._normalize_mm_token_expansion_start_len(num)
         self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
@@ -820,6 +852,22 @@ class GenerateReqInput:
                 "Cannot use list token_ids_logprob with parallel_sample_num > 1"
             )
 
+    def _normalize_mm_token_expansion_start_len(self, num):
+        """Normalize mm_token_expansion_start_len for batch processing."""
+        if not isinstance(self.mm_token_expansion_start_len, list):
+            self.mm_token_expansion_start_len = [
+                self.mm_token_expansion_start_len
+            ] * num
+        elif len(self.mm_token_expansion_start_len) != self.batch_size:
+            raise ValueError(
+                "The length of mm_token_expansion_start_len should be equal to the "
+                "batch size."
+            )
+        else:
+            self.mm_token_expansion_start_len = (
+                self.mm_token_expansion_start_len * self.parallel_sample_num
+            )
+
     def _normalize_return_hidden_states(self, num):
         """Normalize and validate per-request hidden-state return modes."""
         if isinstance(self.return_hidden_states, list):
@@ -967,6 +1015,7 @@ class GenerateReqInput:
             session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            mm_token_expansion_start_len=self.mm_token_expansion_start_len[i],
             input_embeds=(
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
@@ -1001,6 +1050,7 @@ class GenerateReqInput:
             return_routed_experts=self.return_routed_experts,
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
+            return_outputs_via_store=self.return_outputs_via_store,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -1243,6 +1293,8 @@ class EmbeddingReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # {lora_name: disk path}: backfill source when this engine does not hold the adapter
+    lora_backfill_paths: Optional[Dict[str, str]] = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     positional_embed_overrides: Any = None
@@ -1665,8 +1717,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Per-request routed experts (input + output tokens), shape
     # (token, layer, top_k). DetokenizerManager encodes to base64 into
-    # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
-    # straight to TokenizerManager, which encodes on demand.
+    # BatchStrOutput unless --output-store-backend is set (see routed_experts_raw);
+    # on the skip_tokenizer_init path the scheduler sends this straight to
+    # TokenizerManager, which encodes on demand.
     routed_experts: Optional[List[Optional[torch.Tensor]]]
 
     indexer_topk: Optional[List[Optional[torch.Tensor]]]
@@ -1685,6 +1738,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+    prefill_weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1700,6 +1754,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
 
+    # Number of indexer layers, set when indexer_topk is non-empty. The
+    # rollout-indexer-replay consumer needs the layer count to reshape the
+    # flattened per-token topk back into (token, layer, topk).
+    indexer_topk_num_layers: Optional[int] = None
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None
@@ -1759,7 +1817,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_hidden_states: OutputHiddenStates
 
     # Per-request routed experts, base64-encoded by DetokenizerManager off the
-    # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
+    # tokenizer hot path; None with --output-store-backend (see routed_experts_raw).
+    # Underlying tensor shape is (token, layer, top_k);
     # see BatchTokenIDOutput.routed_experts.
     routed_experts: Optional[List[Optional[str]]]
 
@@ -1779,6 +1838,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+    prefill_weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1794,6 +1854,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
 
+    # Number of indexer layers, set when indexer_topk is non-empty (see
+    # BatchTokenIDOutput.indexer_topk_num_layers).
+    indexer_topk_num_layers: Optional[int] = None
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None
@@ -1814,6 +1877,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Unencoded routed_experts / indexer_topk, sent instead of the base64 fields when
+    # --output-store-backend is set; TokenizerManager encodes them per request.
+    routed_experts_raw: Optional[List[Optional[torch.Tensor]]] = None
+    indexer_topk_raw: Optional[List[Optional[torch.Tensor]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
@@ -1997,6 +2065,22 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     message: str
     # Number of paused requests during weight sync.
     num_paused_requests: int = 0
+
+
+class PullWeightsReqInput(BaseReq, kw_only=True):
+    # Host-local checkpoint dir the pulled weights land in; seeded from the
+    # server's model path when the published stream has no full version.
+    local_checkpoint_dir: str
+    # Shared dir the publisher writes weight_v{N:06d}/ version dirs under; each
+    # version is a full HF checkpoint or a delta against the previous version.
+    source_dir: str
+    # The version to bring the local checkpoint up to.
+    target_version: int
+
+
+class PullWeightsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
 
 
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
@@ -2198,6 +2282,10 @@ class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     """Open a weight-update session: restore in-place-packed weights so new ones can load."""
 
     selector: Literal["target", "draft", "all"] = "all"
+    # Session scope: False = no base bytes will land this session (adapter-only
+    # sync), so the quant unpack/repack round-trip is skipped and a base-named
+    # tensor arriving in-session is an error.
+    sync_base: bool = True
 
 
 class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2206,7 +2294,15 @@ class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
 
 
 class EndWeightUpdateReqInput(BaseReq, kw_only=True):
-    """Close the weight-update session opened by BeginWeightUpdateReqInput."""
+    """Close the weight-update session opened by BeginWeightUpdateReqInput:
+    re-finalize base weights (sync_base sessions only) and apply the streamed
+    LoRA stash accumulated by update_weights_from_* during the session."""
+
+    # {lora_name: {hf_key: sha256}}; when set, each stashed adapter is verified
+    # (set equality + per-tensor checksum) before it is applied.
+    expected_lora_checksums: Optional[Dict[str, Dict[str, str]]] = None
+    # discard the streamed LoRA stash and deferred publications; in-place base writes are not rolled back
+    abort: bool = False
 
 
 class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2221,6 +2317,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
     skip_tensor_list: Optional[List[str]] = None
     # which runners the op applies to
     selector: Literal["target", "draft", "all"] = "all"
+    names: Optional[List[str]] = None
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
@@ -2289,6 +2386,14 @@ class AbortReq(BaseReq, kw_only=True):
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
     weight_versions: Optional[WeightVersionSpans] = None
+    # Treat ``rid`` as a namespace prefix. Note this only relaxes the
+    # tokenizer-side gate (which otherwise requires an exact live rid, with a
+    # single tokenizer worker): once the request reaches the scheduler,
+    # matching is prefix-based (``rid.startswith``) regardless of this flag,
+    # because batch requests derive child rids as ``f"{rid}_{i}"`` and an
+    # abort for the parent rid must cover them.
+    prefix: bool = False
+    prefill_weight_versions: Optional[WeightVersionSpans] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
@@ -2522,6 +2627,11 @@ class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):
     pinned: bool = False
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
+    # Replace a same-name adapter in place (same lora_id, served slot rewritten)
+    # instead of rejecting the duplicate name; a fresh name loads as usual.
+    # The caller coordinates generation and KV/prefix-cache invalidation around
+    # the swap; same-name path updates currently require PP=1.
+    upsert: bool = False
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
@@ -2545,27 +2655,35 @@ class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):
         )
 
 
-class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
+class RegisterLoRAAdapterReqInput(BaseReq, kw_only=True):
+    """Create-or-refresh an adapter's identity and config (control plane).
+
+    Weights are untouched by the caller: a new adapter starts zeroed, and
+    re-registering an existing name re-zeroes it — a slot's new tenant must
+    not serve its predecessor's weights. The weight bytes arrive later as
+    ``{lora_name}:{hf_key}``-prefixed tensors in the ordinary
+    update_weights_from_* stream and are applied at end_weight_update."""
+
     lora_name: str
-    # The PEFT adapter_config.json, already JSON — a tighter type would only add
-    # decode strictness with no benefit.
+    # The PEFT adapter_config.json fields (r, lora_alpha, target_modules, ...).
     config_dict: Dict[str, Any]
-    # One serialized copy of the adapter tensors per TP rank; each rank
-    # deserializes only its own copy. Same normalization conventions as
-    # UpdateWeightsFromTensorReqInput.serialized_named_tensors.
-    serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
+    # Unpinned: the pool refills a registered adapter lazily from its CPU copy,
+    # and pinning every slot would trip the anti-starvation check.
     pinned: bool = False
-    added_tokens_config: Optional[Dict[str, int]] = None
     lora_id: Optional[str] = None
-    load_format: Optional[str] = None
-    expected_checksums: Optional[Dict[str, str]] = None
+    # Disk artifact holding the same adapter (PEFT dir). With a path the
+    # adapter is reloadable: it may be LRU-evicted and refilled from disk.
+    lora_path: Optional[str] = None
+    # keep the name unservable until end_weight_update commits its session; fresh names only
+    defer_publish: bool = False
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
             lora_id=self.lora_id,
             lora_name=self.lora_name,
-            lora_path="__tensor__",
+            lora_path=self.lora_path or "__stream__",
             pinned=self.pinned,
+            reloadable=self.lora_path is not None,
         )
 
 
@@ -2573,11 +2691,13 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
+    # acks a defer_publish registration; the trainer fails closed without it
+    pending: bool = False
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
-    LoadLoRAAdapterFromTensorsReqOutput
-) = LoRAUpdateOutput
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = RegisterLoRAAdapterReqOutput = (
+    LoRAUpdateOutput
+)
 
 
 class BlockReqType(Enum):

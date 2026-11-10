@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    is_scheduler_io_rank,
     publish,
     spawn_world_rank,
 )
@@ -74,6 +75,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation import role_switch
@@ -158,8 +160,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
-    LoadLoRAAdapterFromTensorsReqInput,
-    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
@@ -167,6 +167,9 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    PullWeightsReqInput,
+    RegisterLoRAAdapterReqInput,
+    RegisterLoRAAdapterReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -304,9 +307,13 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -736,6 +743,8 @@ class Scheduler(
 
         self.init_load_inquirer()
 
+        self.init_kv_weight_version_tracker()
+
         self.init_output_streamer()
 
         self.init_batch_result_processor()
@@ -821,11 +830,7 @@ class Scheduler(
         self.metrics_collector = self.metrics_collector_context.collector
 
     def init_ipc_channels(self, port_args: PortArgs):
-        is_rank_zero = (
-            get_parallel().pp_rank == 0
-            and get_parallel().attn_tp_rank == 0
-            and get_parallel().attn_cp_rank == 0
-        )
+        is_rank_zero = is_scheduler_io_rank()
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
@@ -932,6 +937,7 @@ class Scheduler(
         ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
+                register_token_space_models()
                 self._mm_processor = get_mm_processor(
                     self.model_config.hf_config,
                     server_args,
@@ -1117,6 +1123,11 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
             self.draft_worker.init_hicache_draft_plan()
+            # only now: allocating the draft's pools binds the target's embed and head into it
+            for role, runner in self.draft_worker.weight_update_runners():
+                runner.remote_instance_weight_transporter.maybe_register_and_publish_weight_info(
+                    role=role
+                )
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -1908,6 +1919,10 @@ class Scheduler(
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
                 ),
+                (
+                    PullWeightsReqInput,
+                    self.weight_updater.pull_weights,
+                ),
                 (SlowDownReqInput, self.slow_down),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
@@ -1922,10 +1937,7 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
-                (
-                    LoadLoRAAdapterFromTensorsReqInput,
-                    self.load_lora_adapter_from_tensors,
-                ),
+                (RegisterLoRAAdapterReqInput, self.register_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
@@ -2649,12 +2661,21 @@ class Scheduler(
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
         )
 
+    def init_kv_weight_version_tracker(self) -> None:
+        self.kv_weight_version_tracker = KvWeightVersionTracker.maybe_create(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            allocator=self.token_to_kv_pool_allocator,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
     def init_output_streamer(self) -> None:
         self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             tree_cache=self.tree_cache,
             server_args=self.server_args,
             is_generation=self.is_generation,
+            is_multimodal_gen=getattr(self.model_config, "is_multimodal_gen", False),
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: (
@@ -2747,6 +2768,7 @@ class Scheduler(
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             req_to_token_pool=self.req_to_token_pool,
+            kv_weight_version_tracker=self.kv_weight_version_tracker,
             decode_offload_manager=self.decode_offload_manager,
             metrics_collector=self.metrics_collector,
             metrics_reporter=self.metrics_reporter,
@@ -5612,6 +5634,9 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+        if GPU_MEMORY_TYPE_KV_CACHE in self.weight_updater.offload_tags:
+            logger.info("Cache flush skipped: KV cache memory is released.")
+            return True
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
@@ -6159,24 +6184,26 @@ class Scheduler(
             )
         return result
 
-    def load_lora_adapter_from_tensors(
-        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
-    ) -> LoadLoRAAdapterFromTensorsReqOutput:
-        """In-place loading a new lora adapter from serialized tensors."""
-
-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
-        if result.success:
-            self.kv_event_lora_names.register(
-                lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
-            )
-        return result
-
     def unload_lora_adapter(
         self, recv_req: UnloadLoRAAdapterReqInput
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
+        self.weight_updater.forget_lora_adapter(recv_req.lora_name)
+        return result
+
+    def register_lora_adapter(
+        self, recv_req: RegisterLoRAAdapterReqInput
+    ) -> RegisterLoRAAdapterReqOutput:
+        """Create-or-refresh a LoRA adapter's identity and config (weights zeroed)."""
+
+        result = self.tp_worker.register_lora_adapter(recv_req)
+        if result.success:
+            self.kv_event_lora_names.register(
+                lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
+            )
+        self.weight_updater.forget_lora_adapter(recv_req.lora_name)
         return result
 
     def init_weights_send_group_for_remote_instance(
@@ -6504,4 +6531,5 @@ def _make_abort_req(
             current_version=get_serving().weight_version,
             num_output_tokens=len(req.output_ids),
         ),
+        prefill_weight_versions=req.prefill_weight_versions,
     )

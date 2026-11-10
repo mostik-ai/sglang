@@ -1929,7 +1929,7 @@ def _mask_topk_ids_padded_region(
         mask_topk_ids(topk_ids, num_token_non_padded)
     elif _is_npu:
         return
-    elif _can_fuse_padded_region(topk_ids):
+    elif not topk_ids.is_cpu and _can_fuse_padded_region(topk_ids):
         _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
@@ -2527,19 +2527,29 @@ def capture_routed_experts_if_allowed(
     topk_config: TopKConfig,
     layer_id: Optional[int],
     topk_ids: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> None:
     """Single capture site for every backend, gated by the per-config opt-out.
 
     Routing all backends through here keeps the draft-side opt-out from being
     bypassed by an inlined capturer call.
+
+    Capture runs ahead of every padded-region mask in ``_post_process_topk_ids``
+    (and ROCm's masks to 0, a valid expert id), so mask a copy here: replay skips
+    -1 rows but reads a padded one as a real selection.
     """
     if not topk_config.allow_routed_experts_capture:
         return
-    if (cap := get_global_experts_capturer()) is not None:
-        cap.capture(
-            layer_id=layer_id,
-            topk_indices=topk_ids,
-        )
+    cap = get_global_experts_capturer()
+    if cap is None:
+        return
+    if num_token_non_padded is not None:
+        topk_ids = topk_ids.clone()
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    cap.capture(
+        layer_id=layer_id,
+        topk_indices=topk_ids,
+    )
 
 
 def _post_process_topk_ids(
@@ -2568,7 +2578,9 @@ def _post_process_topk_ids(
     routed_topk_ids = (
         topk_ids[:, :-num_shared_topk_slots] if _gate_appended else topk_ids
     )
-    capture_routed_experts_if_allowed(topk_config, layer_id, routed_topk_ids)
+    capture_routed_experts_if_allowed(
+        topk_config, layer_id, routed_topk_ids, num_token_non_padded
+    )
     recorder_topk_ids = None
     _aiter_append = (
         num_shared_topk_slots > 0
