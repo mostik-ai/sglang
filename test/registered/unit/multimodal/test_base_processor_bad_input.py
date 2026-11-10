@@ -155,5 +155,24 @@ class TestPlaceholderMismatchIsClientError(CustomTestCase):
                 )
 
 
+class TestTokenIdPromptKeepsItsIds(CustomTestCase):
+    def test_legacy_loader_returns_the_client_ids(self):
+        """A token-id prompt keeps its ids through the legacy loader, so the
+        SGLANG_MM_AVOID_RETOKENIZE path can rebuild them instead of re-tokenizing."""
+        processor = object.__new__(_LoaderStub)
+        processor._tokenizer = MagicMock(decode=lambda ids: "a <img> b")
+        tokens = MultimodalSpecialTokens(image_token="<img>").build(None)
+        ids = [5, 9, 7]
+        with ThreadPoolExecutor(max_workers=1) as processor.io_executor:
+            output = asyncio.run(
+                processor.legacy_load_mm_data(
+                    prompt=ids,
+                    multimodal_tokens=tokens,
+                    image_data=[Image.new("RGB", (8, 8))],
+                )
+            )
+        self.assertEqual(output.input_ids, ids)
+
+
 if __name__ == "__main__":
     unittest.main()

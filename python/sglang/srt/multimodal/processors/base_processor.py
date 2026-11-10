@@ -1043,6 +1043,10 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
+            if input_ids is None:
+                # Keep the client's ids, as load_mm_data does; without them the
+                # SGLANG_MM_AVOID_RETOKENIZE path never runs.
+                input_ids = prompt
             prompt = self._tokenizer.decode(prompt)
         else:
             prompt = prompt
