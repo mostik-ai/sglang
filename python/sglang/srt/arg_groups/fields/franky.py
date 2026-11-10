@@ -38,3 +38,14 @@ class Franky(msgspec.Struct):
         "prefill engine serves the relay to its decode on it; a ricky PD decode "
         "engine finds that relay on it. Default is 8996.",
     ] = 8996
+    franky_chain_hold_seconds: A[
+        float,
+        "How long a sandy or ricky engine keeps a chain's cached prefix locked "
+        "after one of its blocks, waiting for the next block. Sandy's must outlast "
+        "a block's decode on ricky. Default is 60.",
+    ] = 60.0
+    franky_chain_hold_ratio: A[
+        float,
+        "Share of the KV pool that chain holds may lock; past it the oldest holds "
+        "are released. Default is 0.25.",
+    ] = 0.25

@@ -10,12 +10,15 @@ from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
+from sglang.srt.franky.chains.holds import FrankyChainHolds
+from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.franky.schedulers.parked_chunks import FrankyParkedChunks
 from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder, taps_landed
 from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.franky.transfer.messages import FrankyRoomClosed, FrankyTapsReady
 from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
 from sglang.srt.franky.transfer.receive_queue import FrankyReceiveQueue
+from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -29,7 +32,6 @@ from sglang.srt.runtime_context import (
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.schedule_policy import PrefillAdder
 
@@ -47,6 +49,8 @@ class RickyScheduler(Scheduler):
             [
                 (FrankyTapsReady, self._handle_taps_ready),
                 (FrankyRoomClosed, self._handle_room_closed),
+                (FrankyHoldExpired, self._handle_hold_expired),
+                (FrankyEndChainReq, self._handle_end_chain),
             ]
         )
 
@@ -62,7 +66,15 @@ class RickyScheduler(Scheduler):
         requests with their taken pages, and the chunked requests waiting for taps.
         """
         parallel = get_parallel()
+        franky = get_franky()
         tap_cache = self.tp_worker.model_runner.franky_parts.tap_cache
+        self.franky_chain_holds = FrankyChainHolds(
+            tree_cache=self.tree_cache,
+            max_held_tokens=int(
+                franky.franky_chain_hold_ratio * self.max_total_num_tokens
+            ),
+            hold_seconds=franky.franky_chain_hold_seconds,
+        )
         self.franky_tap_manager = FrankyTapManager.from_tap_cache(
             tap_cache=tap_cache,
             side=DisaggregationMode.DECODE,
@@ -86,6 +98,7 @@ class RickyScheduler(Scheduler):
                     else None
                 ),
             ),
+            chain_holds=self.franky_chain_holds,
             page_size=self.page_size,
             reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
             release_timeout_seconds=(
@@ -139,7 +152,9 @@ class RickyScheduler(Scheduler):
     @override
     def _poll_timeout_aborts(self) -> List:
         return (
-            super()._poll_timeout_aborts() + self.franky_receive_queue.ready_messages()
+            super()._poll_timeout_aborts()
+            + self.franky_receive_queue.ready_messages()
+            + self.franky_chain_holds.expired_messages()
         )
 
     @override
@@ -207,6 +222,13 @@ class RickyScheduler(Scheduler):
 
     def _handle_room_closed(self, message: FrankyRoomClosed) -> None:
         self.franky_receive_queue.on_room_closed(message=message)
+
+    def _handle_hold_expired(self, message: FrankyHoldExpired) -> None:
+        self.franky_chain_holds.on_hold_expired(message=message)
+
+    def _handle_end_chain(self, recv_req: FrankyEndChainReq) -> None:
+        self.abort_request(AbortReq(rid=recv_req.chain_id))
+        self.franky_chain_holds.release(chain_id=recv_req.chain_id)
 
     def _fail_franky_request(self, req: Req, reason: str) -> None:
         finished_reason = FINISH_ABORT(

@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 
 if TYPE_CHECKING:
     from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+    from sglang.srt.franky.chains.holds import FrankyChainHolds
     from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
     from sglang.srt.franky.transfer.senders.sender import FrankyTapSender
     from sglang.srt.managers.io_struct import AbortReq
@@ -51,6 +52,7 @@ class FrankySendQueue:
     catch up. A request whose prefill ended stays here, holding its KV and taps,
     as PD prefill holds one until its transfer ends. Its release goes through
     the request stream, so every rank of the DP rank releases it at one step.
+    A released block of a chain leaves its prompt held for the chain's next block.
     """
 
     def __init__(
@@ -61,6 +63,7 @@ class FrankySendQueue:
         tree_cache: BasePrefixCache,
         output_streamer: SchedulerOutputStreamer,
         rank_reports: FrankyRankReports,
+        chain_holds: FrankyChainHolds,
         page_size: int,
         open_room: Callable[[Req], FrankyTapSender],
     ) -> None:
@@ -69,6 +72,7 @@ class FrankySendQueue:
         self._tree_cache = tree_cache
         self._output_streamer = output_streamer
         self._rank_reports = rank_reports
+        self._chain_holds = chain_holds
         self._page_size = page_size
         self._open_room = open_room
         self._sends: dict[str, _Send] = {}
@@ -138,6 +142,8 @@ class FrankySendQueue:
                 f"Franky taps of request {req.rid} were not sent.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+        else:
+            self._hold_for_the_next_block(req)
         self._output_streamer.stream_output([req], False)
         send.sender.close()
 
@@ -181,6 +187,16 @@ class FrankySendQueue:
         )
         send.landed_end = end
         self._hand_over(send)
+
+    def _hold_for_the_next_block(self, req: Req) -> None:
+        chain = req.franky_chain
+        if chain is None or chain.last_block:
+            return
+        self._chain_holds.hold(
+            chain_id=chain.id,
+            node=req.last_node,
+            num_tokens=len(req.origin_input_ids),
+        )
 
     def _hand_over(self, send: _Send) -> None:
         while send.copying and send.copying[0].ready():

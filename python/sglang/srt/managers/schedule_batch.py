@@ -155,6 +155,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.franky.cache.tap_cache import FrankyReqState
+    from sglang.srt.franky.chains.chain import FrankyChain
     from sglang.srt.franky.transfer.messages import FrankyRoom
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -1067,6 +1068,7 @@ class Req(ReqDllmMixin):
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         franky_room: Optional[FrankyRoom] = None,
+        franky_chain: Optional[FrankyChain] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1416,6 +1418,7 @@ class Req(ReqDllmMixin):
         self.disagg_kv_sender: Optional[BaseKVSender] = None
         self.franky: Optional[FrankyReqState] = None
         self.franky_room: Optional[FrankyRoom] = franky_room
+        self.franky_chain: Optional[FrankyChain] = franky_chain
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank

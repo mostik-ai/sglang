@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from typing_extensions import override
 
 from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, is_aborted
+from sglang.srt.franky.chains.holds import FrankyChainHolds
+from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.franky.schedulers.sandy_batch_result_processor import (
     SandyBatchResultProcessor,
 )
@@ -17,6 +19,7 @@ from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
 from sglang.srt.franky.transfer.send_queue import FrankySendQueue
 from sglang.srt.franky.transfer.senders.no_room import FrankyNoRoomSender
 from sglang.srt.franky.transfer.senders.room import FrankyRoomSender
+from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_device, get_franky, get_parallel, get_serving
 from sglang.srt.utils.common import ceil_div
@@ -24,27 +27,33 @@ from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
     from sglang.srt.franky.transfer.senders.sender import FrankyTapSender
-    from sglang.srt.managers.io_struct import AbortReq, TokenizedGenerateReqInput
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
 class SandyScheduler(Scheduler):
     """The Sandy engine regime: prefill on input tokens, send taps, never decode.
     It runs the normal event loops; a request ends at its prefill and answers
-    with no tokens once its taps are sent.
+    with no tokens once its taps are sent. When no waiting request can start,
+    the oldest chain hold goes.
     """
 
     @override
     def init_request_dispatcher(self) -> None:
         super().init_request_dispatcher()
         self._request_dispatcher += TypeBasedDispatcher(
-            [(FrankySendDone, self._handle_send_done)]
+            [
+                (FrankySendDone, self._handle_send_done),
+                (FrankyHoldExpired, self._handle_hold_expired),
+                (FrankyEndChainReq, self._handle_end_chain),
+            ]
         )
 
     @override
     def init_batch_result_processor(self) -> None:
         super().init_batch_result_processor()
         self.init_franky_sending()
+        self.init_franky_chain_holds()
         self.init_franky_send_queue()
         self.batch_result_processor = SandyBatchResultProcessor.extend(
             self.batch_result_processor, franky_send_queue=self.franky_send_queue
@@ -72,6 +81,16 @@ class SandyScheduler(Scheduler):
             gpu_id=get_device().gpu_id,
         )
 
+    def init_franky_chain_holds(self) -> None:
+        franky = get_franky()
+        self.franky_chain_holds = FrankyChainHolds(
+            tree_cache=self.tree_cache,
+            max_held_tokens=int(
+                franky.franky_chain_hold_ratio * self.max_total_num_tokens
+            ),
+            hold_seconds=franky.franky_chain_hold_seconds,
+        )
+
     def init_franky_send_queue(self) -> None:
         pp_size, pp_rank = get_parallel().pp_size, get_parallel().pp_rank
         self.franky_send_queue = FrankySendQueue(
@@ -88,6 +107,7 @@ class SandyScheduler(Scheduler):
                     else None
                 ),
             ),
+            chain_holds=self.franky_chain_holds,
             page_size=self.page_size,
             open_room=self._open_franky_room,
         )
@@ -130,7 +150,22 @@ class SandyScheduler(Scheduler):
 
     @override
     def _poll_timeout_aborts(self) -> List:
-        return super()._poll_timeout_aborts() + self.franky_send_queue.ready_messages()
+        return (
+            super()._poll_timeout_aborts()
+            + self.franky_send_queue.ready_messages()
+            + self.franky_chain_holds.expired_messages()
+        )
+
+    @override
+    def _get_new_batch_prefill_raw(
+        self, prefill_delayer_single_pass, running_batch: ScheduleBatch
+    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        new_batch, running_batch = super()._get_new_batch_prefill_raw(
+            prefill_delayer_single_pass, running_batch
+        )
+        if new_batch is None and self._waits_without_running(running_batch):
+            self.franky_chain_holds.release_oldest()
+        return new_batch, running_batch
 
     @override
     def abort_request(self, recv_req: AbortReq) -> None:
@@ -151,6 +186,20 @@ class SandyScheduler(Scheduler):
 
     def _handle_send_done(self, message: FrankySendDone) -> None:
         self.franky_send_queue.on_send_done(message=message)
+
+    def _handle_hold_expired(self, message: FrankyHoldExpired) -> None:
+        self.franky_chain_holds.on_hold_expired(message=message)
+
+    def _handle_end_chain(self, recv_req: FrankyEndChainReq) -> None:
+        self.abort_request(AbortReq(rid=recv_req.chain_id))
+        self.franky_chain_holds.release(chain_id=recv_req.chain_id)
+
+    def _waits_without_running(self, running_batch: ScheduleBatch) -> bool:
+        return (
+            len(self.waiting_queue) > 0
+            and self.chunked_req is None
+            and running_batch.is_empty()
+        )
 
     def _open_franky_room(self, req: Req) -> FrankyTapSender:
         if req.franky_room is None:
