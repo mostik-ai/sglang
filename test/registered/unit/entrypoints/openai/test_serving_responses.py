@@ -1928,7 +1928,11 @@ class EnginePassthroughTestCase(CustomTestCase):
                 bootstrap_room=42,
                 routed_dp_rank=1,
                 disagg_prefill_dp_rank=0,
-                franky_room={"bootstrap_host": "sandy.internal", "bootstrap_port": 8996, "room": 77},
+                franky_room={
+                    "bootstrap_host": "sandy.internal",
+                    "bootstrap_port": 8996,
+                    "room": 77,
+                },
                 store=False,
             ),
             raw_request=raw_request,
@@ -1940,7 +1944,10 @@ class EnginePassthroughTestCase(CustomTestCase):
         self.assertEqual(adapted_request.bootstrap_room, 42)
         self.assertEqual(adapted_request.routed_dp_rank, 2)
         self.assertEqual(adapted_request.disagg_prefill_dp_rank, 0)
-        self.assertEqual(adapted_request.franky_room, {"bootstrap_host": "sandy.internal", "bootstrap_port": 8996, "room": 77})
+        self.assertEqual(
+            adapted_request.franky_room,
+            {"bootstrap_host": "sandy.internal", "bootstrap_port": 8996, "room": 77},
+        )
 
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
         serving = make_serving()
