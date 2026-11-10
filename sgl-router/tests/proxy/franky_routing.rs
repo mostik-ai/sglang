@@ -454,7 +454,7 @@ async fn blocks_run_until_ricky_stops_and_answer_once() {
         assert_eq!(request["rid"], json!(format!("{chain}-{}", block + 1)));
         assert_eq!(
             request["franky_chain"],
-            json!({"id": chain, "last_block": false})
+            json!({"id": chain, "block": block + 1, "last_block": false})
         );
         assert_eq!(request["sampling_params"]["max_new_tokens"], 4);
     }

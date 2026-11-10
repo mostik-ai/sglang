@@ -3,15 +3,13 @@
 
 use serde_json::{Map, Value};
 
-/// `meta_info` fields with one entry per output token.
-const TOKEN_FIELDS: [&str; 5] = [
+const PER_TOKEN_FIELDS: [&str; 5] = [
     "output_token_logprobs",
     "output_top_logprobs",
     "output_token_ids_logprobs",
     "output_token_sampling_mask",
     "output_token_sampling_logprobs",
 ];
-/// `meta_info` fields about the prompt, which is the first block's prompt.
 const PROMPT_FIELDS: [&str; 6] = [
     "prompt_tokens",
     "cached_tokens",
@@ -20,10 +18,7 @@ const PROMPT_FIELDS: [&str; 6] = [
     "input_top_logprobs",
     "input_token_ids_logprobs",
 ];
-/// `meta_info` counts that add up over the blocks.
-const COUNTS: [&str; 2] = ["completion_tokens", "reasoning_tokens"];
-/// `meta_info` fields that tell how the current block went on its engine; the
-/// timings come with the engine's `--enable-metrics`.
+const SUMMED_COUNTS: [&str; 2] = ["completion_tokens", "reasoning_tokens"];
 const BLOCK_REPORT_FIELDS: [&str; 7] = [
     "prompt_tokens",
     "cached_tokens",
@@ -34,20 +29,20 @@ const BLOCK_REPORT_FIELDS: [&str; 7] = [
     "request_finished_ts",
 ];
 
-/// Output of one or more blocks: text, token ids, per-token fields and counts.
 #[derive(Default)]
 struct Generated {
     text: String,
     output_ids: Vec<Value>,
     token_fields: Map<String, Value>,
-    counts: [u64; COUNTS.len()],
+    counts: [u64; SUMMED_COUNTS.len()],
 }
 
 impl Generated {
     fn of_frame(frame: &Value) -> Self {
         let mut generated = Self::default();
         generated.extend_by_frame(frame);
-        generated.counts = COUNTS.map(|count| frame["meta_info"][count].as_u64().unwrap_or(0));
+        generated.counts =
+            SUMMED_COUNTS.map(|count| frame["meta_info"][count].as_u64().unwrap_or(0));
         generated
     }
 
@@ -58,7 +53,7 @@ impl Generated {
         if let Some(ids) = frame["output_ids"].as_array() {
             self.output_ids.extend(ids.iter().cloned());
         }
-        for field in TOKEN_FIELDS {
+        for field in PER_TOKEN_FIELDS {
             if let Some(values) = frame["meta_info"][field].as_array() {
                 append(&mut self.token_fields, field, values);
             }
@@ -111,14 +106,11 @@ fn append(fields: &mut Map<String, Value>, field: &str, values: &[Value]) {
     }
 }
 
-/// A chain's output so far, which every later frame continues: each block's
-/// `/generate` frames become frames of one request that names `id`, with the
-/// first block's prompt and no finish reason until the chain ends.
+/// A chain's output so far: each block's `/generate` frames become frames of one
+/// request that names `id`, with the first block's prompt and one finish reason.
 pub(super) struct ChainOutput {
     id: String,
-    /// The engine streams deltas (`--incremental-streaming-output`), not the
-    /// block's whole output so far.
-    incremental: bool,
+    incremental_streaming_output: bool,
     finished: Generated,
     current: Generated,
     prompt_meta: Option<Map<String, Value>>,
@@ -128,10 +120,10 @@ pub(super) struct ChainOutput {
 }
 
 impl ChainOutput {
-    pub(super) fn new(id: String, incremental: bool) -> Self {
+    pub(super) fn new(id: String, incremental_streaming_output: bool) -> Self {
         Self {
             id,
-            incremental,
+            incremental_streaming_output,
             finished: Generated::default(),
             current: Generated::default(),
             prompt_meta: None,
@@ -146,11 +138,46 @@ impl ChainOutput {
         self.finish_reason = Value::Null;
     }
 
-    /// The chain's frame for `frame`, a `/generate` frame of the current block;
-    /// a unary response is one frame of the whole block.
-    pub(super) fn chain_frame(&mut self, mut frame: Value, unary: bool) -> Value {
-        let incremental = self.incremental && !unary;
-        self.record(&frame, incremental);
+    /// The chain's frame for the unary response of the current block.
+    pub(super) fn whole_block_frame(&mut self, frame: Value) -> Value {
+        self.chain_frame(frame, false)
+    }
+
+    /// The chain's frame for one streamed frame of the current block.
+    pub(super) fn streamed_frame(&mut self, frame: Value) -> Value {
+        self.chain_frame(frame, self.incremental_streaming_output)
+    }
+
+    /// Whether the current block ended at its own token limit, so the chain
+    /// goes on with another block.
+    pub(super) fn block_cut(&self) -> bool {
+        !self.last_block && self.finish_reason["type"] == "length"
+    }
+
+    /// Whether the current block is the chain's last one: no engine holds the
+    /// chain's prefix after it.
+    pub(super) fn on_last_block(&self) -> bool {
+        self.last_block
+    }
+
+    pub(super) fn finish_block(&mut self) {
+        let current = std::mem::take(&mut self.current);
+        self.finished.extend(current);
+    }
+
+    /// How the current block went on its engine, as its last frame said; timings
+    /// need the engine's `--enable-metrics`.
+    pub(super) fn block_report(&self) -> &Map<String, Value> {
+        &self.block_report
+    }
+
+    /// The token ids every finished block generated, in order.
+    pub(super) fn generated_ids(&self) -> &[Value] {
+        &self.finished.output_ids
+    }
+
+    fn chain_frame(&mut self, mut frame: Value, is_delta: bool) -> Value {
+        self.record(&frame, is_delta);
         let Value::Object(fields) = &mut frame else {
             return frame;
         };
@@ -158,10 +185,10 @@ impl ChainOutput {
             Some(Value::Object(meta)) => meta,
             _ => Map::new(),
         };
-        if !incremental {
+        if !is_delta {
             self.finished.prepend_to(fields, &mut meta);
         }
-        for (count, finished) in COUNTS.iter().zip(self.finished.counts) {
+        for (count, finished) in SUMMED_COUNTS.iter().zip(self.finished.counts) {
             if let Some(value) = meta.get(*count).and_then(Value::as_u64) {
                 meta.insert((*count).into(), (value + finished).into());
             }
@@ -182,36 +209,7 @@ impl ChainOutput {
         frame
     }
 
-    /// Whether the current block ended at its own token limit, so the chain
-    /// goes on with another block.
-    pub(super) fn block_cut(&self) -> bool {
-        !self.last_block && self.finish_reason["type"] == "length"
-    }
-
-    /// Whether the current block is the chain's last one: no engine holds the
-    /// chain's prefix after it.
-    pub(super) fn on_last_block(&self) -> bool {
-        self.last_block
-    }
-
-    pub(super) fn finish_block(&mut self) {
-        let current = std::mem::take(&mut self.current);
-        self.finished.extend(current);
-    }
-
-    /// How the current block went on its engine, as its last frame said: its
-    /// `cached_tokens` show what the chain's hold kept, its timings where the
-    /// block waited.
-    pub(super) fn block_report(&self) -> &Map<String, Value> {
-        &self.block_report
-    }
-
-    /// The token ids every finished block generated, in order.
-    pub(super) fn generated_ids(&self) -> &[Value] {
-        &self.finished.output_ids
-    }
-
-    fn record(&mut self, frame: &Value, incremental: bool) {
+    fn record(&mut self, frame: &Value, is_delta: bool) {
         let meta = &frame["meta_info"];
         self.block_report = fields_of(meta, &BLOCK_REPORT_FIELDS);
         if self.prompt_meta.is_none() {
@@ -220,9 +218,9 @@ impl ChainOutput {
         if !meta["finish_reason"].is_null() {
             self.finish_reason = meta["finish_reason"].clone();
         }
-        if incremental {
+        if is_delta {
             self.current.extend_by_frame(frame);
-            self.current.counts = COUNTS.map(|count| meta[count].as_u64().unwrap_or(0));
+            self.current.counts = SUMMED_COUNTS.map(|count| meta[count].as_u64().unwrap_or(0));
         } else {
             self.current = Generated::of_frame(frame);
         }
@@ -256,7 +254,7 @@ mod tests {
     fn a_later_cumulative_frame_continues_the_finished_blocks() {
         let mut output = ChainOutput::new("chain".into(), false);
         output.start_block(false);
-        let first = output.chain_frame(frame("ab", &[1, 2], 2, length(2)), false);
+        let first = output.streamed_frame(frame("ab", &[1, 2], 2, length(2)));
         assert!(output.block_cut());
         assert_eq!(first["meta_info"]["finish_reason"], Value::Null);
         output.finish_block();
@@ -264,7 +262,7 @@ mod tests {
         output.start_block(true);
         let mut later = frame("c", &[3], 1, Value::Null);
         later["meta_info"]["prompt_tokens"] = json!(11);
-        let later = output.chain_frame(later, false);
+        let later = output.streamed_frame(later);
 
         assert_eq!(later["text"], "abc");
         assert_eq!(later["output_ids"], json!([1, 2, 3]));
@@ -285,12 +283,12 @@ mod tests {
     fn incremental_frames_stay_deltas_and_their_counts_add_up() {
         let mut output = ChainOutput::new("chain".into(), true);
         output.start_block(false);
-        output.chain_frame(frame("a", &[1], 1, Value::Null), false);
-        output.chain_frame(frame("b", &[2], 2, length(2)), false);
+        output.streamed_frame(frame("a", &[1], 1, Value::Null));
+        output.streamed_frame(frame("b", &[2], 2, length(2)));
         output.finish_block();
 
         output.start_block(false);
-        let delta = output.chain_frame(frame("c", &[3], 1, Value::Null), false);
+        let delta = output.streamed_frame(frame("c", &[3], 1, Value::Null));
 
         assert_eq!(delta["text"], "c");
         assert_eq!(delta["output_ids"], json!([3]));
@@ -303,12 +301,12 @@ mod tests {
         let stop = json!({"type": "stop", "matched": 7});
         let mut output = ChainOutput::new("chain".into(), false);
         output.start_block(false);
-        let stopped = output.chain_frame(frame("a", &[7], 1, stop.clone()), false);
+        let stopped = output.streamed_frame(frame("a", &[7], 1, stop.clone()));
         assert!(!output.block_cut());
         assert_eq!(stopped["meta_info"]["finish_reason"], stop);
 
         output.start_block(true);
-        let last = output.chain_frame(frame("b", &[2], 1, length(1)), false);
+        let last = output.streamed_frame(frame("b", &[2], 1, length(1)));
         assert!(!output.block_cut());
         assert_eq!(last["meta_info"]["finish_reason"], length(1));
     }
@@ -317,11 +315,11 @@ mod tests {
     fn a_unary_block_is_one_whole_frame_even_with_incremental_streams() {
         let mut output = ChainOutput::new("chain".into(), true);
         output.start_block(false);
-        output.chain_frame(frame("ab", &[1, 2], 2, length(2)), true);
+        output.whole_block_frame(frame("ab", &[1, 2], 2, length(2)));
         output.finish_block();
         output.start_block(true);
 
-        let whole = output.chain_frame(frame("c", &[3], 1, length(1)), true);
+        let whole = output.whole_block_frame(frame("c", &[3], 1, length(1)));
 
         assert_eq!(whole["text"], "abc");
         assert_eq!(whole["output_ids"], json!([1, 2, 3]));

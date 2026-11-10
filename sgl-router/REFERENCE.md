@@ -426,8 +426,9 @@ in the next block:
 
 - Block `k` sends the prompt and every token of blocks `1..k-1` as `input_ids`
   to the Sandy and the Ricky that answered block 1 (a failed attempt retries as
-  usual). Its rid is `{chain}-{k}`, and `franky_chain` carries the chain id and
-  whether this is the last block the total `max_new_tokens` allows.
+  usual). Its rid is `{chain}-{k}`, and `franky_chain` carries the chain id, the
+  block number `k`, and whether this is the last block the total
+  `max_new_tokens` allows.
 - The chain goes on while Ricky's block ends at the block's token limit. The
   client gets one response: frames continue across blocks, `meta_info` keeps
   the first block's prompt fields and adds up the counts, and the chain's id
@@ -443,12 +444,11 @@ in the next block:
 - A stop string across two blocks is not matched; each block checks its own
   output.
 - Between two blocks a chain waits for Sandy to prefill the last block's tokens
-  and send their taps, and for Ricky to prefill them again. On busy engines that
-  wait is mostly scheduling. Sandy sends a prefill batch's taps only after its
-  next forward unless it runs `--disable-overlap-schedule`, and a smaller
-  `--chunked-prefill-size` shortens the batch a block waits behind.
-  `--schedule-policy lpm` on both engines serves a chain's next block, whose
-  cached prefix is the longest, before new prompts.
+  and send their taps, and for Ricky to prefill them again. Both engines take a
+  chain's next block before new prompts, Sandy runs without overlap scheduling
+  so a batch's taps leave right after its forward, and while chains hold cache
+  an engine's prefill batches take at most `--franky-chain-chunked-prefill-size`
+  tokens (2048 by default).
 
 ## Chat rendering
 

@@ -23,10 +23,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-/// Sampling fields whose decoding state a new block would restart.
-const CONSTRAINED_DECODING: [&str; 4] = ["json_schema", "regex", "ebnf", "structural_tag"];
-/// Request fields whose outputs the chain cannot join across blocks.
-const UNJOINED_FIELDS: [&str; 4] = [
+const CONSTRAINED_DECODING_FIELDS: [&str; 4] = ["json_schema", "regex", "ebnf", "structural_tag"];
+const FIELDS_BLOCKS_CANNOT_JOIN: [&str; 4] = [
     "return_hidden_states",
     "return_routed_experts",
     "return_flat_raw_top_logprobs",
@@ -37,26 +35,21 @@ const EVENT_BUFFER: usize = 64;
 
 type Events = mpsc::Sender<Result<Bytes, axum::Error>>;
 
-/// How the frames of one block ended.
-enum Pumped {
-    NextBlock,
-    Ended,
+enum FramesEnd {
+    BlockCut,
+    ChainEnded,
     Failed,
-    Gone,
+    StreamClosed,
 }
 
-/// A Franky request served as a chain of blocks (`--franky-block-size`). Each
-/// block sends the prompt and every token generated so far to the chain's one
-/// Sandy and one Ricky, which generates at most a block of tokens; its tokens
-/// then read their own taps in the next block. The engines keep the chain's
-/// cached prefix between blocks; the client gets one response.
+/// A Franky request served as a chain of blocks (`--franky-block-size`), each sending
+/// the prompt and every token generated so far to the same Sandy and Ricky.
 pub(super) struct BlockChain {
     id: String,
     model: ModelId,
     block_size: u64,
     total_limit: Option<u64>,
-    /// The request's `/generate` body without its prompt and rid.
-    template: Map<String, Value>,
+    body_without_prompt: Map<String, Value>,
     prompt_ids: Vec<Value>,
     streaming: bool,
     responder: Option<Responder>,
@@ -93,11 +86,11 @@ impl BlockChain {
         if request.fans_out {
             return Err(refused("batches or n above 1"));
         }
-        let Ok(Value::Object(mut template)) = serde_json::from_slice(&request.body) else {
+        let Ok(Value::Object(mut body)) = serde_json::from_slice(&request.body) else {
             return Err(refused("a body that is not a JSON object"));
         };
-        check_blocks_can_serve(&template)?;
-        let prompt_ids = match template.remove("input_ids") {
+        check_blocks_can_serve(&body)?;
+        let prompt_ids = match body.remove("input_ids") {
             Some(Value::Array(ids)) if ids.iter().all(Value::is_u64) => ids,
             _ => {
                 return Err(refused(
@@ -105,9 +98,9 @@ impl BlockChain {
                 ))
             }
         };
-        template.remove("text");
-        let client_rid = template.remove("rid");
-        let total_limit = template
+        body.remove("text");
+        let client_rid = body.remove("rid");
+        let total_limit = body
             .get("sampling_params")
             .and_then(|params| params.get("max_new_tokens"))
             .and_then(Value::as_u64);
@@ -116,16 +109,16 @@ impl BlockChain {
             .as_ref()
             .and_then(Value::as_str)
             .map_or_else(|| id.clone(), str::to_owned);
-        let incremental = model_openai_settings(ctx, &request.model)
+        let incremental_streaming_output = model_openai_settings(ctx, &request.model)
             .is_some_and(|settings| settings.incremental_streaming_output);
         Ok(Some(Self {
-            output: ChainOutput::new(reported_id, incremental),
+            output: ChainOutput::new(reported_id, incremental_streaming_output),
             end: ChainEnd::new(ctx.proxy.admin_client().clone(), id.clone(), headers),
             id,
             model: request.model.clone(),
             block_size: u64::from(block_size.get()),
             total_limit,
-            template,
+            body_without_prompt: body,
             prompt_ids,
             streaming: request.streaming,
             responder: request.responder.take(),
@@ -193,14 +186,14 @@ impl BlockChain {
             )
             .await?;
         if let Some(workers) = answered {
-            self.end.reach(&workers);
+            self.end.remember_engines(&workers);
             self.workers = Some(workers);
         }
         Ok(response)
     }
 
     fn block_body(&self, max_new_tokens: u64, last_block: bool) -> Value {
-        let mut body = self.template.clone();
+        let mut body = self.body_without_prompt.clone();
         let context = self.prompt_ids.iter().chain(self.output.generated_ids());
         body.insert("input_ids".into(), Value::Array(context.cloned().collect()));
         body.insert(
@@ -209,7 +202,7 @@ impl BlockChain {
         );
         body.insert(
             "franky_chain".into(),
-            json!({"id": self.id, "last_block": last_block}),
+            json!({"id": self.id, "block": self.blocks_sent, "last_block": last_block}),
         );
         let sampling = body.entry("sampling_params").or_insert_with(|| json!({}));
         sampling["max_new_tokens"] = max_new_tokens.into();
@@ -238,7 +231,7 @@ impl BlockChain {
                 .map_err(|error| ApiError::Internal(error.into()))?;
             let frame =
                 serde_json::from_slice(&bytes).map_err(|error| ApiError::Internal(error.into()))?;
-            let chain_frame = self.output.chain_frame(frame, true);
+            let chain_frame = self.output.whole_block_frame(frame);
             if !self.output.block_cut() {
                 self.ended();
                 parts.headers.remove(header::CONTENT_LENGTH);
@@ -285,17 +278,17 @@ impl BlockChain {
     ) {
         loop {
             match self.forward_frames(body, &events).await {
-                Pumped::NextBlock => {}
-                Pumped::Ended => {
+                FramesEnd::BlockCut => {}
+                FramesEnd::ChainEnded => {
                     self.ended();
                     let _ = events.send(Ok(Bytes::from_static(DONE_EVENT))).await;
                     return;
                 }
-                Pumped::Failed => {
+                FramesEnd::Failed => {
                     let _ = events.send(Ok(Bytes::from_static(DONE_EVENT))).await;
                     return;
                 }
-                Pumped::Gone => return,
+                FramesEnd::StreamClosed => return,
             }
             self.log_block();
             self.output.finish_block();
@@ -309,7 +302,9 @@ impl BlockChain {
             body = match next {
                 Ok(response) if response.status() == StatusCode::OK => response.into_body(),
                 Ok(response) => {
-                    let _ = events.send(Ok(error_event_of(response).await)).await;
+                    let _ = events
+                        .send(Ok(error_event_from_response(response).await))
+                        .await;
                     let _ = events.send(Ok(Bytes::from_static(DONE_EVENT))).await;
                     return;
                 }
@@ -322,14 +317,14 @@ impl BlockChain {
         }
     }
 
-    async fn forward_frames(&mut self, body: Body, events: &Events) -> Pumped {
+    async fn forward_frames(&mut self, body: Body, events: &Events) -> FramesEnd {
         let mut frames = std::pin::pin!(sse_data(body));
         while let Some(data) = frames.next().await {
             let data = match data {
                 Ok(data) => data,
                 Err(error) => {
                     let _ = events.send(Err(error)).await;
-                    return Pumped::Gone;
+                    return FramesEnd::StreamClosed;
                 }
             };
             if data.as_ref() == b"[DONE]" {
@@ -339,18 +334,18 @@ impl BlockChain {
                 Ok(frame) if frame.get("error").is_none() => frame,
                 _ => {
                     let _ = events.send(Ok(data_event(&data))).await;
-                    return Pumped::Failed;
+                    return FramesEnd::Failed;
                 }
             };
-            let event = data_event(self.output.chain_frame(frame, false).to_string().as_bytes());
+            let event = data_event(self.output.streamed_frame(frame).to_string().as_bytes());
             if events.send(Ok(event)).await.is_err() {
-                return Pumped::Gone;
+                return FramesEnd::StreamClosed;
             }
         }
         if self.output.block_cut() {
-            Pumped::NextBlock
+            FramesEnd::BlockCut
         } else {
-            Pumped::Ended
+            FramesEnd::ChainEnded
         }
     }
 
@@ -376,7 +371,7 @@ impl BlockChain {
 
 fn check_blocks_can_serve(body: &Map<String, Value>) -> Result<(), ApiError> {
     let sampling = body.get("sampling_params");
-    let constrained = CONSTRAINED_DECODING.iter().any(|field| {
+    let constrained = CONSTRAINED_DECODING_FIELDS.iter().any(|field| {
         sampling
             .and_then(|params| params.get(field))
             .is_some_and(is_set)
@@ -386,7 +381,7 @@ fn check_blocks_can_serve(body: &Map<String, Value>) -> Result<(), ApiError> {
             "constrained decoding, whose state each block would restart",
         ));
     }
-    match UNJOINED_FIELDS
+    match FIELDS_BLOCKS_CANNOT_JOIN
         .iter()
         .find(|field| body.get(**field).is_some_and(is_set))
     {
@@ -417,12 +412,16 @@ fn error_event(message: &str) -> Bytes {
     )
 }
 
-/// A later block's error response, as an in-stream error frame.
-async fn error_event_of(response: Response<Body>) -> Bytes {
+async fn error_event_from_response(response: Response<Body>) -> Bytes {
     let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap_or_default();
+    let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(error) => {
+            return error_event(&format!(
+                "a Franky block failed with {status}, and reading its body failed: {error}"
+            ))
+        }
+    };
     match serde_json::from_slice::<Value>(&body) {
         Ok(error) if error.get("error").is_some() => data_event(&body),
         _ => error_event(&format!(
