@@ -2,7 +2,7 @@ import contextlib
 import math
 import os
 import sys
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Iterable
 
 import torch
 import torch.distributed as dist
@@ -15,6 +15,30 @@ import triton.language as tl
 # need headroom for the per-level AST visitor overhead.
 if sys.getrecursionlimit() < 16384:
     sys.setrecursionlimit(16384)
+
+# K tile of every matmul config below; a K shard's tree has K / _MATMUL_K_BLOCK leaves.
+_MATMUL_K_BLOCK = 128
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _fixed_tree_sum_tensors(tensors: Iterable[torch.Tensor]) -> torch.Tensor:
+    """Sum in a fixed binary-tree order: (0, 1), (2, 3), ..., then (01, 23), ...
+
+    tree_all_reduce_sum reduces gathered ranks in this order, which the
+    trainer mirrors for true on-policy runs; an odd tail is carried up as is.
+    """
+    partials = list(tensors)
+    if not partials:
+        raise ValueError("at least one tensor is required")
+    while len(partials) > 1:
+        partials = [
+            partials[i] + partials[i + 1] if i + 1 < len(partials) else partials[i]
+            for i in range(0, len(partials), 2)
+        ]
+    return partials[0]
 
 
 def _matmul_launch_metadata(
@@ -388,7 +412,19 @@ def _matmul_tp_persistent_impl(
     fp32_accum: bool = False,
     use_optim_kernel: bool = False,
 ):
-    assert A.shape[-1] == B.shape[-2], "Dim doesn't match"
+    if A.dim() != 2 or B.dim() != 2:
+        raise ValueError(
+            f"expected 2D tensors, got A.dim={A.dim()} and B.dim={B.dim()}"
+        )
+    if A.shape[1] != B.shape[0]:
+        raise ValueError(
+            f"matmul dimension mismatch: A={tuple(A.shape)}, B={tuple(B.shape)}"
+        )
+    if A.shape[1] % _MATMUL_K_BLOCK:
+        # Zero K columns add exact zeros: the short last tile keeps its partial sum.
+        pad = _MATMUL_K_BLOCK - A.shape[1] % _MATMUL_K_BLOCK
+        A = torch.nn.functional.pad(A, (0, pad))
+        B = torch.nn.functional.pad(B, (0, 0, 0, pad))
 
     out_dtype = A.dtype
     acc_dtype = torch.float32 if fp32_accum else A.dtype
@@ -408,7 +444,7 @@ def _matmul_tp_persistent_impl(
         torch.bfloat16: {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_K": _MATMUL_K_BLOCK,
             "GROUP_SIZE_M": 8,
             "num_stages": 2,
             "num_warps": 8,
@@ -416,7 +452,7 @@ def _matmul_tp_persistent_impl(
         torch.float16: {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_K": _MATMUL_K_BLOCK,
             "GROUP_SIZE_M": 8,
             "num_stages": 2,
             "num_warps": 8,
@@ -424,7 +460,7 @@ def _matmul_tp_persistent_impl(
         torch.float32: {
             "BLOCK_SIZE_M": 32,
             "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_K": _MATMUL_K_BLOCK,
             "GROUP_SIZE_M": 8,
             "num_stages": 2,
             "num_warps": 8,
@@ -557,23 +593,18 @@ def matmul_tp_persistent_optim(
 
 
 def tree_all_reduce_sum(x: torch.Tensor, device_group=None) -> torch.Tensor:
-    rank = dist.get_rank(device_group)
+    if not dist.is_initialized():
+        return x.clone()
     world_size = dist.get_world_size(device_group)
 
-    if world_size & (world_size - 1) != 0:
+    if not _is_power_of_two(world_size):
         raise ValueError(
             "world_size must be a power of 2 in order to use all_reduce_sum."
         )
 
     result = [torch.zeros_like(x) for _ in range(world_size)]
     dist.all_gather(result, x, group=device_group)
-
-    for level in range(1, world_size.bit_length()):
-        for left in range(0, world_size, 1 << level):
-            right = left + (1 << (level - 1))
-            result[left] += result[right]
-
-    return result[0]
+    return _fixed_tree_sum_tensors(result)
 
 
 def tree_all_reduce_sum_optim(x: torch.Tensor, device_group=None) -> torch.Tensor:
@@ -1895,6 +1926,36 @@ def moe_sum_tree_reduce_v2(
     return output
 
 
+def _validate_moe_tree_reduce_inputs(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    curr_topk_ids: torch.Tensor,
+    E: int,
+) -> None:
+    if input.dim() != 3:
+        raise ValueError(
+            f"input must have shape [tokens, topk, hidden], got {tuple(input.shape)}"
+        )
+    if curr_topk_ids.dim() != 2:
+        raise ValueError(
+            "curr_topk_ids must have shape [tokens, topk], "
+            f"got {tuple(curr_topk_ids.shape)}"
+        )
+    if not _is_power_of_two(E):
+        raise ValueError(f"E must be a power of two, got {E}")
+    token_num, topk, hidden_size = input.shape
+    if curr_topk_ids.shape != (token_num, topk):
+        raise ValueError(
+            "curr_topk_ids shape must match input token/topk dimensions: "
+            f"ids={tuple(curr_topk_ids.shape)}, input={tuple(input.shape)}"
+        )
+    if output.shape != (token_num, hidden_size):
+        raise ValueError(
+            f"output must have shape {(token_num, hidden_size)}, "
+            f"got {tuple(output.shape)}"
+        )
+
+
 def moe_sum_tree_reduce(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -1902,6 +1963,7 @@ def moe_sum_tree_reduce(
     routed_scaling_factor: float,
     E: int,
 ):
+    _validate_moe_tree_reduce_inputs(input, output, curr_topk_ids, E)
     curr_topk_ids = curr_topk_ids.to(torch.int32)
     if os.environ.get("SGLANG_MOE_TREE_REDUCE_USE_V2", "0") == "1":
         return moe_sum_tree_reduce_v2(
