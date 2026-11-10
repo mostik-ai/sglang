@@ -418,6 +418,29 @@ sgl-router --model-id ricky --chat-routing reorg --policy cache_aware \
   EndpointSlices in plain or PD mode; next to `--selector`, that selector must
   use equality terms too.
 
+### Blocks
+
+With `--franky-block-size N`, the router runs each Franky request as a chain of
+blocks of at most `N` generated tokens, so a block's tokens read their own taps
+in the next block:
+
+- Block `k` sends the prompt and every token of blocks `1..k-1` as `input_ids`
+  to the Sandy and the Ricky that answered block 1 (a failed attempt retries as
+  usual). Its rid is `{chain}-{k}`, and `franky_chain` carries the chain id and
+  whether this is the last block the total `max_new_tokens` allows.
+- The chain goes on while Ricky's block ends at the block's token limit. The
+  client gets one response: frames continue across blocks, `meta_info` keeps
+  the first block's prompt fields and adds up the counts, and the chain's id
+  replaces each block's.
+- Between blocks each engine holds the chain's cached prefix. Unless the chain
+  ended with its last block, the router posts `/franky/end_chain` to its engines
+  when it ends: after a stop, an error, or a client that left.
+- Blocks need token ids (`input_ids`, or text or chat the router renders) and
+  one sequence. Batches, `n` above 1, constrained decoding, hidden states,
+  routed experts and sessions are refused with `400`.
+- A stop string across two blocks is not matched; each block checks its own
+  output.
+
 ## Chat rendering
 
 The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's
