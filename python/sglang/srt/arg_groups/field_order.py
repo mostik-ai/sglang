@@ -556,5 +556,7 @@ POSITIONAL_FIELD_ORDER = (
     "franky_config",
     "franky_weights",
     "franky_bootstrap_port",
+    "franky_chain_hold_seconds",
+    "franky_chain_hold_ratio",
 )
 # fmt: on

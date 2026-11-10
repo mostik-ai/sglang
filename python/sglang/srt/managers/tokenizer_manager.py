@@ -70,6 +70,7 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
@@ -94,6 +95,7 @@ from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     EncoderDispatchErrorReq,
+    FrankyEndChainReq,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -157,6 +159,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
     get_exec,
+    get_franky,
     get_lora,
     get_memory,
     get_mm,
@@ -1606,6 +1609,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.franky_room is not None
                     else None
                 ),
+                franky_chain=(
+                    FrankyChain.from_request(franky_chain=obj.franky_chain, rid=obj.rid)
+                    if obj.franky_chain is not None
+                    else None
+                ),
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,
@@ -2244,6 +2252,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(gen.aclose() for gen in generators),
                 return_exceptions=True,
             )
+
+    def end_franky_chain(self, obj: FrankyEndChainReq) -> None:
+        """Franky: abort the chain's requests and release its holds. Its blocks
+        come one at a time, so between two of them no rid of the chain is live
+        for ``abort_request`` to match."""
+        if get_franky().franky_side == "null":
+            raise ValueError("Ending a Franky chain needs --franky-side.")
+        self._dispatch_to_scheduler(obj)
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.

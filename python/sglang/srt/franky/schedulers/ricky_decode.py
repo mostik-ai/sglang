@@ -6,8 +6,10 @@ from typing_extensions import override
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.franky.transfer.manager import FrankyTapManager
+from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_device, get_franky, get_parallel
+from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -15,8 +17,16 @@ if TYPE_CHECKING:
 
 class RickyDecodeScheduler(Scheduler):
     """A Ricky PD decode engine. Each request's taps come from Ricky prefill in the
-    room of its KV, and PD hands a request to decode only once both landed.
+    room of its KV, and PD hands a request to decode only once both landed. It
+    keeps no cache, so ending a chain only aborts the chain's requests here.
     """
+
+    @override
+    def init_request_dispatcher(self) -> None:
+        super().init_request_dispatcher()
+        self._request_dispatcher += TypeBasedDispatcher(
+            [(FrankyEndChainReq, self._handle_end_chain)]
+        )
 
     @override
     def init_disaggregation(self) -> None:
@@ -62,3 +72,6 @@ class RickyDecodeScheduler(Scheduler):
             # PD hands a request over once its taps landed; it only decodes here.
             franky_parts.keep_past_the_taps(req_pool_indices=req_pool_indices)
         return batch
+
+    def _handle_end_chain(self, recv_req: FrankyEndChainReq) -> None:
+        self.abort_request(AbortReq(rid=recv_req.chain_id))

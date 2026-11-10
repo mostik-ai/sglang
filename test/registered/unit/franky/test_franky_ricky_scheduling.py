@@ -9,6 +9,8 @@ import torch.distributed as dist
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+from sglang.srt.franky.chains.chain import FrankyChain
+from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder
 from sglang.srt.franky.schedulers.ricky import RickyScheduler
 from sglang.srt.franky.transfer import receive_queue as receive_queue_module
@@ -19,7 +21,11 @@ from sglang.srt.franky.transfer.messages import (
 )
 from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
 from sglang.srt.franky.transfer.receive_queue import FrankyReceiveQueue
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    FINISH_MATCHED_TOKEN,
+    Req,
+)
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -35,13 +41,13 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _PAGE_SIZE = 16
 _NUM_TOKENS = 1024
-_PREFIX_PAGES = (50, 51)
 
 
 class _Receiver:
-    def __init__(self, *, manager, franky_room, tap_pages, num_tokens):
+    def __init__(self, *, manager, franky_room, tap_pages, num_tokens, prefix_len):
         self.manager = manager
         self.tap_pages = tap_pages.tolist()
+        self.prefix_len = prefix_len
         self.bootstrap_room = franky_room.room
         self.state = KVPoll.WaitingForInput
         self.landed_tokens = 0
@@ -68,8 +74,12 @@ class _Receiver:
 
 
 class _Tree:
+    """Unlocking a node's last lock makes its tokens evictable."""
+
     def __init__(self):
         self.locked = []
+        self.node_tokens = {}
+        self.evictable = 0
 
     def lock(self, node):
         self.locked.append(node)
@@ -77,18 +87,18 @@ class _Tree:
 
     def unlock(self, lock):
         self.locked.remove(lock)
+        if lock not in self.locked:
+            self.evictable += self.node_tokens.get(lock, 0)
 
     def evictable_size(self):
-        return 0
-
-    def prefix_device_indices(self, req):
-        first_slot = _PREFIX_PAGES[0] * _PAGE_SIZE
-        return torch.arange(first_slot, first_slot + req.prefix_len)
+        return self.evictable
 
 
 class _Req:
-    def __init__(self, rid, *, prompt_len, cached_prefix_len=0, room=True):
+    def __init__(self, rid, *, prompt_len, cached_prefix_len=0, room=True, chain=None):
         self.rid = rid
+        self.franky_chain = chain
+        self.finished_reason = None
         self.origin_input_ids = list(range(prompt_len))
         self.output_ids = []
         self.cached_prefix_len = cached_prefix_len
@@ -170,6 +180,9 @@ class TestFrankyReceiveQueue(CustomTestCase):
         receiver = patch.object(receive_queue_module, "FrankyReceiver", self._receiver)
         receiver.start()
         self.addCleanup(receiver.stop)
+        self.holds = FrankyChainHolds(
+            tree_cache=self.tree, max_held_tokens=_NUM_TOKENS, hold_seconds=60
+        )
         self.queue = FrankyReceiveQueue(
             tap_cache=FrankyTapCache(
                 encoder_ids=(0,),
@@ -187,6 +200,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
                 attn_cp_cpu_group=dist.group.WORLD,
                 pp_store=self.store,
             ),
+            chain_holds=self.holds,
             page_size=_PAGE_SIZE,
             reserved_decode_tokens=64,
             release_timeout_seconds=600,
@@ -215,14 +229,25 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.queue.poll()
         return req
 
-    def test_taps_land_in_the_pages_of_the_whole_prompt(self):
+    def test_taps_land_only_in_the_pages_past_the_cached_prefix(self):
         req = self._arrive(_Req("r", prompt_len=70, cached_prefix_len=32))
 
         [receiver] = self.receivers
         taken_pages = (req.franky.taken_kv_slots[::_PAGE_SIZE] // _PAGE_SIZE).tolist()
-        self.assertEqual(receiver.tap_pages, [*_PREFIX_PAGES, *taken_pages])
+        self.assertEqual(receiver.tap_pages, taken_pages)
+        self.assertEqual(receiver.prefix_len, 32)
+        self.assertEqual(req.franky.taps_ready, 32)
         self.assertEqual(len(req.franky.taken_kv_slots), 70 - 32)
         self.assertEqual(req.franky.taken_from, 32)
+
+    def test_taps_count_from_the_cached_prefix(self):
+        req = self._arrive(_Req("r", prompt_len=70, cached_prefix_len=32))
+        self.receivers[0].landed_tokens = 48
+
+        messages = self._step(other_stage={"landed:r": 48, "ok:r": 1})
+
+        self.assertEqual(messages, [FrankyTapsReady(request_rid="r", taps_ready=48)])
+        self.assertEqual(req.franky.taps_ready, 48)
 
     def test_an_arrival_that_does_not_fit_holds_back_the_ones_behind_it(self):
         self._arrive(_Req("first", prompt_len=512))
@@ -305,6 +330,52 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.assertEqual(req.franky.taps_ready, 64)
         self.assertEqual(req.franky.tap_len, 0)
         self.assertEqual(req.extra_key, "user|franky=no-taps")
+
+    def _finish(self, req, reason):
+        req.franky.taps_ready = req.franky.tap_len
+        req.done = True
+        req.finished_reason = reason
+
+    def test_a_block_at_its_token_limit_holds_its_prompt_for_the_next_block(self):
+        req = self._arrive(_Req("c-1", prompt_len=64, chain=FrankyChain(id="c")))
+
+        self._finish(req, FINISH_LENGTH(length=8))
+        self.queue.poll()
+
+        self.assertEqual(self.tree.locked, ["node-c-1"])
+        self.assertTrue(self.queue.is_empty())
+
+    def test_a_stopped_or_last_block_holds_nothing(self):
+        stopped = self._arrive(_Req("s-1", prompt_len=64, chain=FrankyChain(id="s")))
+        last_chain = FrankyChain(id="l", last_block=True)
+        last = self._arrive(_Req("l-1", prompt_len=64, chain=last_chain))
+
+        self._finish(stopped, FINISH_MATCHED_TOKEN(matched=0))
+        self._finish(last, FINISH_LENGTH(length=8))
+        self.queue.poll()
+
+        self.assertEqual(self.tree.locked, [])
+
+    def test_an_arrival_that_does_not_fit_releases_the_oldest_holds_first(self):
+        self.tree.node_tokens = {"held-a": 400, "held-b": 400}
+        self.holds.hold(chain_id="a", node="held-a", num_tokens=400)
+        self.holds.hold(chain_id="b", node="held-b", num_tokens=400)
+        self._arrive(_Req("first", prompt_len=512))
+
+        second = self._arrive(_Req("second", prompt_len=400))
+
+        self.assertIsNotNone(second.franky)
+        self.assertEqual(self.tree.locked, ["held-b", "node-first", "node-second"])
+
+    def test_holds_too_small_to_make_room_are_kept(self):
+        self.tree.node_tokens = {"held-a": 8}
+        self.holds.hold(chain_id="a", node="held-a", num_tokens=8)
+        self._arrive(_Req("first", prompt_len=512))
+
+        second = self._arrive(_Req("second", prompt_len=400))
+
+        self.assertIsNone(second.franky)
+        self.assertEqual(self.tree.locked, ["held-a", "node-first"])
 
     def test_kv_past_the_prompt_never_enters_the_cache(self):
         req = self._arrive(_Req("r", prompt_len=64))

@@ -52,6 +52,7 @@ from pydantic import PlainValidator
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
+from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -297,6 +298,9 @@ class GenerateReqInput:
     # Franky: where the request's taps meet, as {"bootstrap_host", "bootstrap_port",
     # "room"}. One room for a batch gives each request the next room.
     franky_room: Optional[Union[List[Optional[Dict[str, Any]]], Dict[str, Any]]] = None
+    # Franky: the chain of blocks this request is one block of, as {"id",
+    # "last_block"}; the rid starts with the id. Single requests only.
+    franky_chain: Optional[Dict[str, Any]] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -960,6 +964,10 @@ class GenerateReqInput:
         else:
             self.franky_room = self.franky_room * self.parallel_sample_num
 
+        # One chain holds the cache of one prompt's blocks.
+        if self.franky_chain is not None:
+            raise ValueError("franky_chain takes a single request with n=1.")
+
     def _get_positional_embed_overrides_item(
         self, i: int
     ) -> Optional[PositionalEmbeds]:
@@ -1135,6 +1143,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
     franky_room: Optional[FrankyRoom] = None
+    franky_chain: Optional[FrankyChain] = None
 
     # For DP routing
     routed_dp_rank: Optional[int] = None
@@ -2296,6 +2305,12 @@ class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
     old_role: str = ""
     new_role: str = ""
     safe_to_restore: bool = False
+
+
+class FrankyEndChainReq(BaseReq, kw_only=True):
+    """Franky: abort a chain's requests and release its holds."""
+
+    chain_id: str
 
 
 class AbortReq(BaseReq, kw_only=True):

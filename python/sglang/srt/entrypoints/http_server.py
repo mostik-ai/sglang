@@ -138,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     DumperControlReqInput,
     EmbeddingReqInput,
     EndWeightUpdateReqInput,
+    FrankyEndChainReq,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1714,6 +1715,17 @@ async def configure_logging(
     """Configure the request logging options."""
     _global_state.tokenizer_manager.configure_logging(obj)
     return Response(status_code=200)
+
+
+@app.post("/franky/end_chain")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def franky_end_chain(obj: Annotated[FrankyEndChainReq, Body()], request: Request):
+    """Franky: end a chain of blocks, aborting its requests and releasing its holds."""
+    try:
+        _global_state.tokenizer_manager.end_franky_chain(obj)
+        return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
 
 
 @app.post("/abort_request")

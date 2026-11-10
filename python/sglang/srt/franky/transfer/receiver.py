@@ -26,15 +26,19 @@ class FrankyReceiver(NixlKVReceiver):
         franky_room: FrankyRoom,
         tap_pages: np.ndarray,
         num_tokens: int,
+        prefix_len: int = 0,
     ) -> None:
         """
         Args:
-            tap_pages: int32 tap pages on this rank for the whole prompt.
+            tap_pages: int32 tap pages on this rank for the prompt past ``prefix_len``.
+            prefix_len: the prompt's first tokens, in whole pages, whose taps this
+                rank already holds; the sender skips them.
         """
         super().__init__(manager, franky_room.bootstrap_address, franky_room.room)
         manager.track_room(franky_room.room)
         self.tap_pages = tap_pages
         self.num_tokens = num_tokens
+        self.prefix_len = prefix_len
         self.pages_registered = False
 
     @override
@@ -49,7 +53,8 @@ class FrankyReceiver(NixlKVReceiver):
             The prompt tokens whose taps have landed on this rank.
         """
         landed_pages = self.kv_mgr.landed_pages(self.bootstrap_room)
-        return min(landed_pages * self.kv_mgr.kv_args.page_size, self.num_tokens)
+        landed = self.prefix_len + landed_pages * self.kv_mgr.kv_args.page_size
+        return min(landed, self.num_tokens)
 
     def writes_stopped(self) -> bool:
         """
@@ -81,7 +86,9 @@ class FrankyReceiver(NixlKVReceiver):
         self.init(sending_dp_rank)
         if self.conclude_state == KVPoll.Failed:
             return
-        self.send_metadata(kv_indices=self.tap_pages, aux_index=0)
+        self.send_metadata(
+            kv_indices=self.tap_pages, aux_index=0, decode_prefix_len=self.prefix_len
+        )
         self.pages_registered = True
 
     def _sending_dp_rank(self) -> Optional[int]:
