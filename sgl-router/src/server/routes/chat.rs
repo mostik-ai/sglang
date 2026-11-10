@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+mod blocks;
 mod forward;
 mod openai;
 mod preparation;
@@ -25,6 +26,7 @@ use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
+use blocks::BlockChain;
 use bytes::Bytes;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
@@ -115,8 +117,11 @@ async fn serve_http(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let (request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
-    routing.dispatch(&ctx, request, headers, start).await
+    let (mut request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
+    match BlockChain::plan(&ctx, &mut request, &headers)? {
+        Some(chain) => chain.serve(&ctx, &routing, headers, start).await,
+        None => routing.dispatch(&ctx, request, headers, start).await,
+    }
 }
 
 /// A gRPC call whose request is `endpoint`'s HTTP body, sent to the engine as `rpc`.
@@ -320,9 +325,6 @@ impl<'a> ModelRouting<'a> {
         }
     }
 
-    /// Select workers for `request` and forward it to them. An attempt that
-    /// fails before any response reaches the client is retried, after a
-    /// backoff, on workers it has not tried, up to `--retry-max-attempts`.
     async fn dispatch(
         &self,
         ctx: &AppContext,
@@ -330,9 +332,31 @@ impl<'a> ModelRouting<'a> {
         headers: HeaderMap,
         start: Instant,
     ) -> Result<Response<Body>, ApiError> {
+        let mut duration = None;
+        let (response, _) = self
+            .forward_with_retries(ctx, &mut request, &headers, start, &mut duration, None)
+            .await?;
+        Ok(response)
+    }
+
+    /// Select workers for `request`, or take `pinned` for the first attempt,
+    /// and forward it to them. An attempt that fails before any response reaches
+    /// the client is retried, after a backoff, on workers it has not tried, up
+    /// to `--retry-max-attempts`.
+    ///
+    /// Returns the response, and the workers that gave it unless every attempt
+    /// failed.
+    async fn forward_with_retries(
+        &self,
+        ctx: &AppContext,
+        request: &mut PreparedRequest,
+        headers: &HeaderMap,
+        start: Instant,
+        duration: &mut Option<Arc<RequestDurationGuard>>,
+        mut pinned: Option<SelectedWorkers>,
+    ) -> Result<(Response<Body>, Option<SelectedWorkers>), ApiError> {
         let mut excluded = Vec::new();
         let mut failed = None;
-        let mut duration = None;
         for attempt in 0..ctx.config.proxy.max_attempts.get() {
             if attempt > 0 {
                 // A retry never starts past the request's stale deadline, so the
@@ -347,29 +371,29 @@ impl<'a> ModelRouting<'a> {
                     break;
                 }
             }
-            let workers = match self
-                .select_workers(ctx, &request, &headers, &excluded)
-                .await
-            {
-                Ok(workers) => workers,
-                // Every eligible worker already failed this request: report the last failure.
-                Err(error) => return failed.ok_or(error),
+            let workers = match pinned.take() {
+                Some(workers) => workers,
+                None => match self.select_workers(ctx, request, headers, &excluded).await {
+                    Ok(workers) => workers,
+                    // Every eligible worker already failed this request: report the last failure.
+                    Err(error) => return failed.map(|response| (response, None)).ok_or(error),
+                },
             };
             if failed.is_some() {
                 ctx.metrics.record_retry(&request.model.0);
             }
             let duration = duration
                 .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
+            let answering = workers.clone();
             let attempt =
-                forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
-                    .await?;
+                forward_request(ctx, request, workers, headers.clone(), start, duration).await?;
             if attempt.retry_excluding.is_empty() {
-                return Ok(attempt.response);
+                return Ok((attempt.response, Some(answering)));
             }
             excluded.extend(attempt.retry_excluding);
             failed = Some(attempt.response);
         }
-        Ok(failed.expect("at least one attempt"))
+        Ok((failed.expect("at least one attempt"), None))
     }
 
     /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,

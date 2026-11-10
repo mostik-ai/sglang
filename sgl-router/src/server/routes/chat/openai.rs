@@ -149,7 +149,7 @@ fn json_response(reply: Reply) -> Response<Body> {
 }
 
 /// The `data:` payloads of an SSE body, then its error if it broke.
-fn sse_data(body: Body) -> impl Stream<Item = Result<Bytes, axum::Error>> {
+pub(super) fn sse_data(body: Body) -> impl Stream<Item = Result<Bytes, axum::Error>> {
     let chunks = body.into_data_stream();
     stream::unfold(
         (chunks, BytesMut::new(), 0),

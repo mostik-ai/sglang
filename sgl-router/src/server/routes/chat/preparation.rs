@@ -330,7 +330,7 @@ impl PreparedRequest {
     /// [`Self::generate`] over a parsed body: the client's `body` gets the
     /// fleet's sampling overrides, while a lowered OpenAI body (`None`) had them
     /// applied to the OpenAI request.
-    fn generate_value(
+    pub(super) fn generate_value(
         ctx: &AppContext,
         model: ModelId,
         mut value: Value,
@@ -674,7 +674,10 @@ fn lower_openai(
 }
 
 /// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.
-fn model_openai_settings(ctx: &AppContext, model: &ModelId) -> Option<Arc<OpenAiSettings>> {
+pub(super) fn model_openai_settings(
+    ctx: &AppContext,
+    model: &ModelId,
+) -> Option<Arc<OpenAiSettings>> {
     let mut workers = ctx.registry.workers_for(model);
     // A Sandy answers no tokens, so its OpenAI server args shape no response.
     workers.retain(|w| w.mode() != WorkerMode::Sandy);
