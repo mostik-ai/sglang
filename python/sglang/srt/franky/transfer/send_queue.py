@@ -52,7 +52,8 @@ class FrankySendQueue:
     catch up. A request whose prefill ended stays here, holding its KV and taps,
     as PD prefill holds one until its transfer ends. Its release goes through
     the request stream, so every rank of the DP rank releases it at one step.
-    A released block of a chain leaves its prompt held for the chain's next block.
+    A released block of a chain leaves its prompt held for the chain's next
+    block; a block after which none follows releases the chain's hold.
     """
 
     def __init__(
@@ -142,8 +143,7 @@ class FrankySendQueue:
                 f"Franky taps of request {req.rid} were not sent.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-        else:
-            self._hold_for_the_next_block(req)
+        self._hold_or_release_the_chain(req, failed=message.failed)
         self._output_streamer.stream_output([req], False)
         send.sender.close()
 
@@ -157,6 +157,7 @@ class FrankySendQueue:
         send.sender.abort()
         send.sender.close()
         del self._sends[req.rid]
+        self._hold_or_release_the_chain(req, failed=True)
 
     def abort(self, *, recv_req: AbortReq) -> None:
         """Stop the sends of the matching held requests; each is released when
@@ -188,9 +189,12 @@ class FrankySendQueue:
         send.landed_end = end
         self._hand_over(send)
 
-    def _hold_for_the_next_block(self, req: Req) -> None:
+    def _hold_or_release_the_chain(self, req: Req, *, failed: bool) -> None:
         chain = req.franky_chain
-        if chain is None or chain.last_block:
+        if chain is None:
+            return
+        if failed or chain.last_block:
+            self._chain_holds.release(chain_id=chain.id)
             return
         self._chain_holds.hold(
             chain_id=chain.id,

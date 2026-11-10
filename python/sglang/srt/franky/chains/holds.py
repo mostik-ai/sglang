@@ -66,6 +66,11 @@ class FrankyChainHolds:
         self._tree_cache.unlock(hold.lock)
         self._held_tokens -= hold.num_tokens
 
+    def release_all(self) -> None:
+        """Before the tree drops every node, as a cache flush does."""
+        for chain_id in list(self._holds):
+            self.release(chain_id=chain_id)
+
     def release_oldest(self) -> bool:
         """
         Returns:

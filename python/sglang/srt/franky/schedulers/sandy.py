@@ -35,7 +35,7 @@ class SandyScheduler(Scheduler):
     """The Sandy engine regime: prefill on input tokens, send taps, never decode.
     It runs the normal event loops; a request ends at its prefill and answers
     with no tokens once its taps are sent. When no waiting request can start,
-    the oldest chain hold goes.
+    the oldest chain hold goes; a cache flush drops every hold.
     """
 
     @override
@@ -171,6 +171,11 @@ class SandyScheduler(Scheduler):
     def abort_request(self, recv_req: AbortReq) -> None:
         self.franky_send_queue.abort(recv_req=recv_req)
         super().abort_request(recv_req)
+
+    @override
+    def flush_cache(self, empty_cache: bool = True) -> bool:
+        self.franky_chain_holds.release_all()
+        return super().flush_cache(empty_cache=empty_cache)
 
     @override
     def on_idle(self) -> None:

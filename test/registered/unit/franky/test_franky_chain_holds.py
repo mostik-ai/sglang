@@ -63,6 +63,16 @@ class TestFrankyChainHolds(CustomTestCase):
         self.assertTrue(holds.release_oldest())
         self.assertFalse(holds.release_oldest())
 
+    def test_release_all_leaves_nothing_locked(self):
+        holds = self._holds()
+        holds.hold(chain_id="a", node="a", num_tokens=3)
+        holds.hold(chain_id="b", node="b", num_tokens=4)
+
+        holds.release_all()
+
+        self.assertEqual(self.tree.locked, [])
+        self.assertEqual(holds.held_tokens, 0)
+
     def test_releasing_a_chain_without_a_hold_does_nothing(self):
         holds = self._holds()
         holds.hold(chain_id="a", node="a", num_tokens=1)

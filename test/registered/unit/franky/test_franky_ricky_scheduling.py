@@ -345,16 +345,41 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.assertEqual(self.tree.locked, ["node-c-1"])
         self.assertTrue(self.queue.is_empty())
 
-    def test_a_stopped_or_last_block_holds_nothing(self):
-        stopped = self._arrive(_Req("s-1", prompt_len=64, chain=FrankyChain(id="s")))
-        last_chain = FrankyChain(id="l", last_block=True)
-        last = self._arrive(_Req("l-1", prompt_len=64, chain=last_chain))
+    def test_a_stopped_or_last_block_releases_its_chains_hold(self):
+        for second_chain, reason in (
+            (FrankyChain(id="s"), FINISH_MATCHED_TOKEN(matched=0)),
+            (FrankyChain(id="l", last_block=True), FINISH_LENGTH(length=8)),
+        ):
+            first = self._arrive(
+                _Req(
+                    f"{second_chain.id}-1",
+                    prompt_len=64,
+                    chain=FrankyChain(id=second_chain.id),
+                )
+            )
+            self._finish(first, FINISH_LENGTH(length=8))
+            self.queue.poll()
+            self.assertEqual(self.tree.locked, [f"node-{second_chain.id}-1"])
 
-        self._finish(stopped, FINISH_MATCHED_TOKEN(matched=0))
-        self._finish(last, FINISH_LENGTH(length=8))
+            second = self._arrive(
+                _Req(f"{second_chain.id}-2", prompt_len=96, chain=second_chain)
+            )
+            self._finish(second, reason)
+            self.queue.poll()
+
+            self.assertEqual(self.tree.locked, [])
+
+    def test_an_aborted_block_releases_its_chains_hold(self):
+        first = self._arrive(_Req("c-1", prompt_len=64, chain=FrankyChain(id="c")))
+        self._finish(first, FINISH_LENGTH(length=8))
         self.queue.poll()
+        second = self._arrive(_Req("c-2", prompt_len=96, chain=FrankyChain(id="c")))
 
-        self.assertEqual(self.tree.locked, [])
+        self.queue.forget(req=second)
+
+        self.assertEqual(
+            self.tree.locked, ["node-c-2"], "the arrival's lock waits for its room"
+        )
 
     def test_an_arrival_that_does_not_fit_releases_the_oldest_holds_first(self):
         self.tree.node_tokens = {"held-a": 400, "held-b": 400}

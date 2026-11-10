@@ -284,19 +284,27 @@ class TestRelease(_Queue):
 
         self.assertEqual(self.lock_tree.locked, ["node-r"])
 
-    def test_a_last_block_or_a_failed_send_holds_nothing(self):
-        last = _req("last", chain=FrankyChain(id="last", last_block=True))
-        self._hold(last)
-        self.sender.state = KVPoll.Success
-        self.store.other_stages["last"] = KVPoll.Success
-        self._step()
-        failed = _req("failed", chain=FrankyChain(id="failed"))
-        self._hold(failed)
-        self.sender.state = KVPoll.Failed
-        self.store.other_stages["failed"] = KVPoll.Success
+    def _send_block(self, rid, chain, state):
+        req = _req(rid, chain=chain)
+        self._hold(req)
+        self.sender.state = state
+        self.store.other_stages[rid] = KVPoll.Success
         self._step()
 
-        self.assertEqual(self.released, ["last", "failed"])
+    def test_a_last_block_releases_its_chains_hold(self):
+        self._send_block("c-1", FrankyChain(id="c"), KVPoll.Success)
+        self.assertEqual(self.lock_tree.locked, ["node-c-1"])
+
+        self._send_block("c-2", FrankyChain(id="c", last_block=True), KVPoll.Success)
+
+        self.assertEqual(self.released, ["c-1", "c-2"])
+        self.assertEqual(self.lock_tree.locked, [])
+
+    def test_a_failed_send_releases_its_chains_hold(self):
+        self._send_block("c-1", FrankyChain(id="c"), KVPoll.Success)
+
+        self._send_block("c-2", FrankyChain(id="c"), KVPoll.Failed)
+
         self.assertEqual(self.lock_tree.locked, [])
 
     def test_a_failed_send_frees_the_request_and_answers_an_error(self):

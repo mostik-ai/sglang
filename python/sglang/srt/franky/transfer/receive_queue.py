@@ -49,9 +49,10 @@ class FrankyReceiveQueue:
     KV pages for its prompt past its cached prefix, as PD decode does, and its
     taps land from Sandy in the tap pages of those pages; the cached prefix
     keeps the taps it has. A block of a chain that ends at its token limit leaves
-    its prompt held for the chain's next block; an arrival that does not fit
-    first releases the oldest holds. Decisions reach every rank and stage at one
-    step as leader messages, as Sandy's releases do.
+    its prompt held for the chain's next block; any other end of a block releases
+    the chain's hold, and an arrival that does not fit first releases the oldest
+    holds. Decisions reach every rank and stage at one step as leader messages,
+    as Sandy's releases do.
     """
 
     def __init__(
@@ -105,6 +106,8 @@ class FrankyReceiveQueue:
         if req in self.arrivals:
             self.arrivals.remove(req)
         self.returning_tap_lens.pop(req.rid, None)
+        if req.franky_chain is not None:
+            self.chain_holds.release(chain_id=req.franky_chain.id)
         if req.rid in self.receptions:
             self._end(self.receptions[req.rid])
 
@@ -115,7 +118,7 @@ class FrankyReceiveQueue:
         """
         for reception in self._live_receptions():
             if reception.req.finished():
-                self._hold_for_the_next_block(reception.req)
+                self._hold_or_release_the_chain(reception.req)
                 self._end(reception)
         self._take_pages_for_arrivals()
         for reception in self._live_receptions():
@@ -211,10 +214,13 @@ class FrankyReceiveQueue:
             reception for reception in self.receptions.values() if not reception.ended
         ]
 
-    def _hold_for_the_next_block(self, req: Req) -> None:
+    def _hold_or_release_the_chain(self, req: Req) -> None:
         chain = req.franky_chain
+        if chain is None:
+            return
         at_token_limit = isinstance(req.finished_reason, FINISH_LENGTH)
-        if chain is None or chain.last_block or not at_token_limit:
+        if chain.last_block or not at_token_limit:
+            self.chain_holds.release(chain_id=chain.id)
             return
         self.chain_holds.hold(
             chain_id=chain.id,
