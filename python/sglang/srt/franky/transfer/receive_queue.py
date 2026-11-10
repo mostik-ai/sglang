@@ -47,12 +47,8 @@ class _Reception(msgspec.Struct, kw_only=True):
 class FrankyReceiveQueue:
     """Ricky's requests from arrival until they end. At arrival a request takes
     KV pages for its prompt past its cached prefix, as PD decode does, and its
-    taps land from Sandy in the tap pages of those pages; the cached prefix
-    keeps the taps it has. A block of a chain that ends at its token limit leaves
-    its prompt held for the chain's next block; any other end of a block releases
-    the chain's hold, and an arrival that does not fit first releases the oldest
-    holds. Decisions reach every rank and stage at one step as leader messages,
-    as Sandy's releases do.
+    taps land from Sandy in the tap pages of those pages. Decisions reach every
+    rank and stage at one step as leader messages, as Sandy's releases do.
     """
 
     def __init__(
@@ -106,8 +102,7 @@ class FrankyReceiveQueue:
         if req in self.arrivals:
             self.arrivals.remove(req)
         self.returning_tap_lens.pop(req.rid, None)
-        if req.franky_chain is not None:
-            self.chain_holds.release(chain_id=req.franky_chain.id)
+        self.chain_holds.release_chain_of(req)
         if req.rid in self.receptions:
             self._end(self.receptions[req.rid])
 
@@ -186,7 +181,7 @@ class FrankyReceiveQueue:
             )
             return True
         prefix_lock = self.tree_cache.lock(req.last_node)
-        if not self._fits(num_page_slots):
+        if not self._fits_after_releasing_holds(num_page_slots):
             self.tree_cache.unlock(prefix_lock)
             return False
         self.returning_tap_lens.pop(req.rid, None)
@@ -215,18 +210,10 @@ class FrankyReceiveQueue:
         ]
 
     def _hold_or_release_the_chain(self, req: Req) -> None:
-        chain = req.franky_chain
-        if chain is None:
-            return
-        at_token_limit = isinstance(req.finished_reason, FINISH_LENGTH)
-        if chain.last_block or not at_token_limit:
-            self.chain_holds.release(chain_id=chain.id)
-            return
-        self.chain_holds.hold(
-            chain_id=chain.id,
-            node=req.last_node,
-            num_tokens=len(req.origin_input_ids),
-        )
+        if isinstance(req.finished_reason, FINISH_LENGTH):
+            self.chain_holds.hold_for_next_block(req)
+        else:
+            self.chain_holds.release_chain_of(req)
 
     def _keep_kv_past_the_prompt_out_of_the_cache(self, req: Req) -> None:
         if req.franky.tap_len > 0 and req.prefix_len >= req.franky.tap_len:
@@ -237,7 +224,7 @@ class FrankyReceiveQueue:
             return self.returning_tap_lens[req.rid]
         return len(req.origin_input_ids) if req.franky_room is not None else 0
 
-    def _fits(self, num_page_slots: int) -> bool:
+    def _fits_after_releasing_holds(self, num_page_slots: int) -> bool:
         if self._free_slots() + self.chain_holds.held_tokens < num_page_slots:
             return False
         while self._free_slots() < num_page_slots:

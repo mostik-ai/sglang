@@ -306,8 +306,7 @@ class GenerateReqInput:
     # Franky: where the request's taps meet, as {"bootstrap_host", "bootstrap_port",
     # "room"}. One room for a batch gives each request the next room.
     franky_room: Optional[Union[List[Optional[Dict[str, Any]]], Dict[str, Any]]] = None
-    # Franky: the chain of blocks this request is one block of, as {"id",
-    # "last_block"}; the rid starts with the id. Single requests only.
+    # Franky: the chain this request is a block of, as FrankyChain's fields.
     franky_chain: Optional[Dict[str, Any]] = None
 
     # For DP routing — external router assigns a specific DP worker
@@ -1012,7 +1011,6 @@ class GenerateReqInput:
         else:
             self.franky_room = self.franky_room * self.parallel_sample_num
 
-        # One chain holds the cache of one prompt's blocks.
         if self.franky_chain is not None:
             raise ValueError("franky_chain takes a single request with n=1.")
 
@@ -1250,7 +1248,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
-    # Franky: where the request's taps meet, and the chain of blocks it is one of.
     franky_room: Optional[FrankyRoom] = None
     franky_chain: Optional[FrankyChain] = None
 

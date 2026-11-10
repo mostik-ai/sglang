@@ -45,6 +45,8 @@ def handle_franky(server_args: ServerArgs) -> None:
             "handle_franky",
             disaggregation_decode_retraction_backup="none",
         )
+    if cfg.franky_side == "sandy":
+        declare_resolution(server_args, "handle_franky", disable_overlap_schedule=True)
 
 
 def _shared_checks(*, cfg: Any, model_config: ModelConfig) -> dict[str, bool]:
@@ -66,6 +68,9 @@ def _shared_checks(*, cfg: Any, model_config: ModelConfig) -> dict[str, bool]:
         ),
         f"--franky-chain-hold-ratio {cfg.franky_chain_hold_ratio}, it is a share": (
             not 0 <= cfg.franky_chain_hold_ratio <= 1
+        ),
+        f"--franky-chain-chunked-prefill-size {cfg.franky_chain_chunked_prefill_size}": (
+            cfg.franky_chain_chunked_prefill_size <= 0
         ),
     }
 

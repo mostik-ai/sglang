@@ -2475,6 +2475,15 @@ class Scheduler(
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
         return PrefillAdder
 
+    def get_chunked_prefill_size_for_batch(self) -> Optional[int]:
+        """The chunk size of the next prefill batch; ``None`` means no chunking."""
+        if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
+            history_len = self.chunked_req.prefix_len
+            dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
+            if dynamic_size is not None:
+                return dynamic_size
+        return self.chunked_prefill_size
+
     def prefillable_queue_len(self) -> int:
         """Waiting requests a prefill could take now; the prefill delayer waits
         for enough of them."""
@@ -4168,13 +4177,7 @@ class Scheduler(
             # in the waiting queue.
             return None, running_batch
 
-        # Determine chunked_prefill_size for this batch
-        chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
-            history_len = self.chunked_req.prefix_len
-            dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
-            if dynamic_size is not None:
-                chunked_prefill_size = dynamic_size
+        chunked_prefill_size = self.get_chunked_prefill_size_for_batch()
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic

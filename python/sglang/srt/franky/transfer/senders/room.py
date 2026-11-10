@@ -15,9 +15,7 @@ if TYPE_CHECKING:
 
 class FrankyRoomSender(NixlKVSender):
     """One request's taps leaving one Sandy rank over PD's NIXL transfer. Pages
-    that land before the room's receivers arrive wait here for them. The pages
-    of the receivers' cached prefix, which they report as PD's decode prefix,
-    are never sent.
+    that land before the room's receivers arrive wait here for them.
     """
 
     def __init__(

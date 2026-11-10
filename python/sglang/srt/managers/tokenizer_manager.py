@@ -2467,9 +2467,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def end_franky_chain(self, obj: FrankyEndChainReq) -> None:
-        """Franky: abort the chain's requests and release its holds. Its blocks
-        come one at a time, so between two of them no rid of the chain is live
-        for ``abort_request`` to match."""
+        """
+        Raises:
+            ValueError: the engine runs without ``--franky-side``.
+        """
         if get_franky().franky_side == "null":
             raise ValueError("Ending a Franky chain needs --franky-side.")
         self._dispatch_to_scheduler(obj)

@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
+from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.franky.schedulers.parked_chunks import FrankyParkedChunks
@@ -40,7 +41,6 @@ class RickyScheduler(Scheduler):
     """A Ricky engine that runs prefills: without PD, or as PD prefill. A request
     takes KV pages for its prompt at arrival, and joins a batch only for tokens
     whose taps have landed. PD prefill relays the taps to Ricky decode with the KV.
-    A cache flush drops every chain hold.
     """
 
     @override
@@ -171,6 +171,7 @@ class RickyScheduler(Scheduler):
         self, prefill_delayer_single_pass, running_batch: ScheduleBatch
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         self.chunked_req = self.franky_parked_chunks.pick(current=self.chunked_req)
+        put_continuations_first(self.waiting_queue)
         new_batch, running_batch = super()._get_new_batch_prefill_raw(
             prefill_delayer_single_pass, running_batch
         )
@@ -189,6 +190,12 @@ class RickyScheduler(Scheduler):
                     ]
                 )
         return new_batch, running_batch
+
+    @override
+    def get_chunked_prefill_size_for_batch(self) -> Optional[int]:
+        return self.franky_chain_holds.chunk_size_for_batch(
+            super().get_chunked_prefill_size_for_batch()
+        )
 
     @override
     def abort_request(self, recv_req: AbortReq) -> None:
