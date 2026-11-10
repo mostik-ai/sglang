@@ -440,6 +440,13 @@ in the next block:
   routed experts and sessions are refused with `400`.
 - A stop string across two blocks is not matched; each block checks its own
   output.
+- Between two blocks a chain waits for Sandy to prefill the last block's tokens
+  and send their taps, and for Ricky to prefill them again. On busy engines that
+  wait is mostly scheduling. Sandy sends a prefill batch's taps only after its
+  next forward unless it runs `--disable-overlap-schedule`, and a smaller
+  `--chunked-prefill-size` shortens the batch a block waits behind.
+  `--schedule-policy lpm` on both engines serves a chain's next block, whose
+  cached prefix is the longest, before new prompts.
 
 ## Chat rendering
 
