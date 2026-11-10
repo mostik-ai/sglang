@@ -9,15 +9,14 @@ use std::time::Duration;
 const END_CHAIN_PATH: &str = "/franky/end_chain";
 const END_CHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Ends a chain on every engine it reached, when it is dropped: the engines
-/// abort the chain's requests and release its holds. A chain that ended with
-/// its last block left no hold, and needs no end.
+/// On drop, asks every engine the chain reached to abort its requests and release
+/// its holds, unless the chain ended with its last block.
 pub(super) struct ChainEnd {
     client: Client,
     chain_id: String,
     authorization: Option<HeaderValue>,
     engine_urls: Vec<String>,
-    needed: bool,
+    must_end: bool,
 }
 
 impl ChainEnd {
@@ -27,12 +26,11 @@ impl ChainEnd {
             chain_id,
             authorization: headers.get(AUTHORIZATION).cloned(),
             engine_urls: Vec::new(),
-            needed: true,
+            must_end: true,
         }
     }
 
-    /// Remember the engines a block went to.
-    pub(super) fn reach(&mut self, workers: &SelectedWorkers) {
+    pub(super) fn remember_engines(&mut self, workers: &SelectedWorkers) {
         let engines = [
             Some(&workers.prefill),
             workers.decode.as_ref(),
@@ -46,16 +44,20 @@ impl ChainEnd {
     }
 
     pub(super) fn ended_with_last_block(&mut self) {
-        self.needed = false;
+        self.must_end = false;
     }
 }
 
 impl Drop for ChainEnd {
     fn drop(&mut self) {
-        if !self.needed {
+        if !self.must_end || self.engine_urls.is_empty() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                chain = %self.chain_id,
+                "no runtime to end a Franky chain on its engines; their holds expire"
+            );
             return;
         };
         for url in self.engine_urls.drain(..) {
