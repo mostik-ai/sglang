@@ -295,15 +295,13 @@ async fn a_failed_sandy_is_blamed_and_not_retried() {
     }
 }
 
-/// An engine for blocks: a Ricky generates the next ids after its prompt, up to
-/// the block's `max_new_tokens`, and stops once the chain generated `stop_at`;
-/// a Sandy answers no tokens. Both record every request and chain end.
 #[derive(Clone, Default)]
 struct BlockEngine {
     stop_at: usize,
     prompt_len: Arc<Mutex<Option<usize>>>,
     requests: Arc<Mutex<Vec<Value>>>,
     chain_ends: Arc<Mutex<Vec<Value>>>,
+    chain_ended: Arc<tokio::sync::Notify>,
 }
 
 impl BlockEngine {
@@ -376,6 +374,7 @@ impl BlockEngine {
 
     async fn end_chain(State(engine): State<Self>, Json(request): Json<Value>) -> StatusCode {
         engine.chain_ends.lock().unwrap().push(request);
+        engine.chain_ended.notify_one();
         StatusCode::OK
     }
 
@@ -383,16 +382,15 @@ impl BlockEngine {
         self.requests.lock().unwrap().clone()
     }
 
-    async fn chain_ends(&self) -> Vec<Value> {
-        // The router ends a chain in the background once the response is done.
-        for _ in 0..50 {
-            let ends = self.chain_ends.lock().unwrap().clone();
-            if !ends.is_empty() {
-                return ends;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        Vec::new()
+    fn chain_ends(&self) -> Vec<Value> {
+        self.chain_ends.lock().unwrap().clone()
+    }
+
+    async fn wait_for_chain_end(&self) -> Vec<Value> {
+        tokio::time::timeout(Duration::from_secs(5), self.chain_ended.notified())
+            .await
+            .expect("the engine got no chain end within 5 seconds");
+        self.chain_ends()
     }
 }
 
@@ -418,9 +416,6 @@ async fn blocks_router(stop_at: usize) -> (Arc<AppContext>, [BlockEngine; 2], [S
     (ctx, [ricky, sandy], [ricky_stop, sandy_stop])
 }
 
-/// Each block sends the prompt and everything generated so far, under one
-/// chain, to the same Ricky and Sandy, until Ricky stops; the client gets one
-/// answer, and both engines are told to end the chain.
 #[tokio::test]
 async fn blocks_run_until_ricky_stops_and_answer_once() {
     let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
@@ -461,12 +456,13 @@ async fn blocks_run_until_ricky_stops_and_answer_once() {
     assert_eq!(sandy.requests().len(), 3);
     assert_eq!(sandy.requests()[2]["input_ids"], requests[2]["input_ids"]);
     for engine in [&ricky, &sandy] {
-        assert_eq!(engine.chain_ends().await, [json!({"chain_id": chain})]);
+        assert_eq!(
+            engine.wait_for_chain_end().await,
+            [json!({"chain_id": chain})]
+        );
     }
 }
 
-/// A chain that reaches its token limit marks its last block, after which no
-/// engine holds anything, so the chain needs no end.
 #[tokio::test]
 async fn a_chain_at_its_token_limit_marks_its_last_block() {
     let (ctx, [ricky, _sandy], _stop) = blocks_router(100).await;
@@ -479,11 +475,9 @@ async fn a_chain_at_its_token_limit_marks_its_last_block() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1]["sampling_params"]["max_new_tokens"], 2);
     assert_eq!(requests[1]["franky_chain"]["last_block"], true);
-    assert!(ricky.chain_ends().await.is_empty());
+    assert!(ricky.chain_ends().is_empty());
 }
 
-/// A streamed chain is one stream: frames continue across blocks, a block cut
-/// has no finish reason, and one `[DONE]` ends it.
 #[tokio::test]
 async fn a_streamed_chain_is_one_stream() {
     let (ctx, [_ricky, _sandy], _stop) = blocks_router(6).await;
@@ -530,7 +524,6 @@ async fn a_streamed_chain_is_one_stream() {
     assert_eq!(frames[5]["text"], "<3><4><5><6><7><8>");
 }
 
-/// Blocks refuse what they cannot join or would restart.
 #[tokio::test]
 async fn requests_blocks_cannot_serve_are_refused() {
     let (ctx, [ricky, _sandy], _stop) = blocks_router(10).await;
