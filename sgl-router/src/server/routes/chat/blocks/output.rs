@@ -104,6 +104,8 @@ pub(super) struct ChainOutput {
     finished: Generated,
     current: Generated,
     prompt_meta: Option<Map<String, Value>>,
+    /// The current block's own prompt fields, as its engine reported them.
+    block_prompt: Map<String, Value>,
     last_block: bool,
     finish_reason: Value,
 }
@@ -116,6 +118,7 @@ impl ChainOutput {
             finished: Generated::default(),
             current: Generated::default(),
             prompt_meta: None,
+            block_prompt: Map::new(),
             last_block: false,
             finish_reason: Value::Null,
         }
@@ -179,6 +182,12 @@ impl ChainOutput {
         self.finished.extend(current);
     }
 
+    /// The current block's prompt fields as its engine reported them, such as
+    /// `cached_tokens`, which shows what the chain's hold kept.
+    pub(super) fn block_prompt(&self) -> &Map<String, Value> {
+        &self.block_prompt
+    }
+
     /// The token ids every finished block generated, in order.
     pub(super) fn generated_ids(&self) -> &[Value] {
         &self.finished.output_ids
@@ -186,11 +195,12 @@ impl ChainOutput {
 
     fn record(&mut self, frame: &Value, incremental: bool) {
         let meta = &frame["meta_info"];
+        self.block_prompt = PROMPT_FIELDS
+            .iter()
+            .filter_map(|field| Some(((*field).to_string(), meta.get(field)?.clone())))
+            .collect();
         if self.prompt_meta.is_none() {
-            let prompt = PROMPT_FIELDS
-                .iter()
-                .filter_map(|field| Some(((*field).to_string(), meta.get(field)?.clone())));
-            self.prompt_meta = Some(prompt.collect());
+            self.prompt_meta = Some(self.block_prompt.clone());
         }
         if !meta["finish_reason"].is_null() {
             self.finish_reason = meta["finish_reason"].clone();

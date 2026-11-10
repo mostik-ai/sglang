@@ -244,6 +244,7 @@ impl BlockChain {
                     Body::from(chain_frame.to_string()),
                 ));
             }
+            self.log_block();
             self.output.finish_block();
             response = self
                 .send_block(ctx, routing, headers, start, duration)
@@ -293,6 +294,7 @@ impl BlockChain {
                 }
                 Pumped::Gone => return,
             }
+            self.log_block();
             self.output.finish_block();
             let next = match ModelRouting::lookup(&ctx, &self.model) {
                 Ok(routing) => {
@@ -350,9 +352,21 @@ impl BlockChain {
     }
 
     fn ended(&mut self) {
+        self.log_block();
         if self.output.on_last_block() {
             self.end.ended_with_last_block();
         }
+    }
+
+    fn log_block(&self) {
+        let prompt = self.output.block_prompt();
+        tracing::debug!(
+            chain = %self.id,
+            block = self.blocks_sent,
+            prompt_tokens = %prompt.get("prompt_tokens").unwrap_or(&serde_json::Value::Null),
+            cached_tokens = %prompt.get("cached_tokens").unwrap_or(&serde_json::Value::Null),
+            "franky block ended"
+        );
     }
 }
 
