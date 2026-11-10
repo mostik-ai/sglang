@@ -58,24 +58,22 @@ class RickyScheduler(Scheduler):
     @override
     def init_disaggregation(self) -> None:
         super().init_disaggregation()
+        self.init_franky_chain_holds()
         self.init_franky_receiving()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.init_franky_relay()
+
+    def init_franky_chain_holds(self) -> None:
+        self.franky_chain_holds = FrankyChainHolds.from_config(
+            tree_cache=self.tree_cache, max_total_num_tokens=self.max_total_num_tokens
+        )
 
     def init_franky_receiving(self) -> None:
         """Ricky's end of tap transfers: this rank's tap manager, the queue of
         requests with their taken pages, and the chunked requests waiting for taps.
         """
         parallel = get_parallel()
-        franky = get_franky()
         tap_cache = self.tp_worker.model_runner.franky_parts.tap_cache
-        self.franky_chain_holds = FrankyChainHolds(
-            tree_cache=self.tree_cache,
-            max_held_tokens=int(
-                franky.franky_chain_hold_ratio * self.max_total_num_tokens
-            ),
-            hold_seconds=franky.franky_chain_hold_seconds,
-        )
         self.franky_tap_manager = FrankyTapManager.from_tap_cache(
             tap_cache=tap_cache,
             side=DisaggregationMode.DECODE,

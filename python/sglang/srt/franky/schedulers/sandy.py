@@ -82,13 +82,8 @@ class SandyScheduler(Scheduler):
         )
 
     def init_franky_chain_holds(self) -> None:
-        franky = get_franky()
-        self.franky_chain_holds = FrankyChainHolds(
-            tree_cache=self.tree_cache,
-            max_held_tokens=int(
-                franky.franky_chain_hold_ratio * self.max_total_num_tokens
-            ),
-            hold_seconds=franky.franky_chain_hold_seconds,
+        self.franky_chain_holds = FrankyChainHolds.from_config(
+            tree_cache=self.tree_cache, max_total_num_tokens=self.max_total_num_tokens
         )
 
     def init_franky_send_queue(self) -> None:

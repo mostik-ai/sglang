@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
+from sglang.srt.runtime_context import get_franky
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -39,6 +40,19 @@ class FrankyChainHolds:
         self._holds: dict[str, _Hold] = {}
         self._held_tokens = 0
         self._next_order = 0
+
+    @staticmethod
+    def from_config(
+        *, tree_cache: BasePrefixCache, max_total_num_tokens: int
+    ) -> FrankyChainHolds:
+        """The holds of an engine whose KV pool has ``max_total_num_tokens``, as
+        ``--franky-chain-hold-ratio`` and ``--franky-chain-hold-seconds`` say."""
+        franky = get_franky()
+        return FrankyChainHolds(
+            tree_cache=tree_cache,
+            max_held_tokens=int(franky.franky_chain_hold_ratio * max_total_num_tokens),
+            hold_seconds=franky.franky_chain_hold_seconds,
+        )
 
     def hold(self, *, chain_id: str, node: Any, num_tokens: int) -> None:
         """Lock ``node`` for the chain's next block, in place of the chain's last
