@@ -75,6 +75,18 @@ def _split_lora_named_tensors(named_tensors):
     return base_tensors, lora_tensors
 
 
+def _split_franky_named_tensors(named_tensors, franky_parts):
+    """Partition a weight-update payload into the model's tensors and the
+    Franky parts' tensors, which a Franky engine names as in --franky-weights."""
+    if franky_parts is None:
+        return named_tensors, []
+    model_tensors, part_tensors = [], []
+    for name, tensor in named_tensors:
+        is_part = name.startswith(("encoders.", "readers."))
+        (part_tensors if is_part else model_tensors).append((name, tensor))
+    return model_tensors, part_tensors
+
+
 def _sha256_tensor(tensor: torch.Tensor) -> str:
     return hashlib.sha256(
         tensor.detach().cpu().contiguous().flatten().view(torch.uint8).numpy().tobytes()
@@ -286,11 +298,18 @@ class SchedulerWeightUpdaterManager:
                     load_format=recv_req.load_format,
                 )
                 base_tensors, lora_tensors = _split_lora_named_tensors(weights)
+                base_tensors, franky_tensors = _split_franky_named_tensors(
+                    base_tensors, self.tp_worker.model_runner.franky_parts
+                )
                 if base_tensors:
                     assert self._session.sync_base, (
                         "base tensors arrived in a sync_base=False weight-update session"
                     )
                 self._stash_lora_tensors(lora_tensors)
+                if franky_tensors:
+                    self.tp_worker.model_runner.franky_parts.load_weights(
+                        franky_tensors
+                    )
             except Exception as e:
                 success, message = False, f"Failed to receive weights: {e}"
                 logger.error(message)

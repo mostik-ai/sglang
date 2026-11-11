@@ -40,6 +40,15 @@ class _Parts(FrankyParts):
     def build(cls, **kwargs):
         raise NotImplementedError
 
+    def _weight_prefix(self):
+        return "encoders"
+
+    def _parts(self):
+        return {}
+
+    def _num_parts(self):
+        return 0
+
     def _tap_encoder_ids(self):
         return (0, 2)
 

@@ -110,6 +110,18 @@ class RickyParts(FrankyParts):
             )
 
     @override
+    def _weight_prefix(self) -> str:
+        return "readers"
+
+    @override
+    def _parts(self) -> dict[int, nn.Module]:
+        return dict(self._readers)
+
+    @override
+    def _num_parts(self) -> int:
+        return len(self.config.reader.layers)
+
+    @override
     def _attention_workspace(self) -> Optional[torch.Tensor]:
         return attention_workspace(device=self.device)
 

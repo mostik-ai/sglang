@@ -455,6 +455,38 @@ class TestRickyParts(_Files):
         self.assertEqual([stage._tap_encoder_ids() for stage in stages], [(0, 1)] * 3)
         self.assertEqual(stages[2].kv_options().tap_bytes_per_token, 2 * _TAP_SIZE * 2)
 
+    def test_updated_weights_reach_the_reader_on_their_stage_only(self):
+        config_path, weights_path, _ = self._write(reader_type="fixed_query")
+        edges = (0, 1, _NUM_LAYERS)
+        stages = [
+            self._attach(
+                model=_Model(start_layer=start_layer, end_layer=end_layer),
+                config_path=config_path,
+                weights_path=weights_path,
+            )
+            for start_layer, end_layer in zip(edges, edges[1:])
+        ]
+        before = stages[0]._readers[0].mlp[2].bias.clone()
+        bias = torch.full_like(stages[1]._readers[1].mlp[2].bias, 0.5)
+
+        for stage in stages:
+            stage.load_weights([("readers.1.mlp.2.bias", bias)])
+
+        self.assertTrue(torch.equal(stages[0]._readers[0].mlp[2].bias, before))
+        self.assertTrue(torch.equal(stages[1]._readers[1].mlp[2].bias, bias))
+
+    def test_weights_of_another_side_or_part_are_refused(self):
+        config_path, weights_path, _ = self._write(reader_type="fixed_query")
+        parts = self._attach(
+            model=_Model(start_layer=0, end_layer=_NUM_LAYERS),
+            config_path=config_path,
+            weights_path=weights_path,
+        )
+
+        for name in ("encoders.0.projection.weight", "readers.7.queries"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                parts.load_weights([(name, torch.zeros(1))])
+
 
 if __name__ == "__main__":
     unittest.main()

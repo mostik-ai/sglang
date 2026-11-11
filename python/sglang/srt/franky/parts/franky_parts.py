@@ -159,6 +159,23 @@ class FrankyParts(ABC):
             return hidden_states, residual
         return hidden_states + extra, residual
 
+    def load_weights(self, named_tensors: list[tuple[str, torch.Tensor]]) -> None:
+        """Copy updated weights, named as in the --franky-weights file, into this
+        rank's parts; a part on another PP stage skips its weights.
+
+        Raises:
+            ValueError: a name is not a weight of this side's parts.
+        """
+        prefix, parts, num_parts = self._weight_prefix(), self._parts(), self._num_parts()
+        with torch.no_grad():
+            for name, tensor in named_tensors:
+                side, index, weight = name.split(".", 2)
+                if side != prefix or not 0 <= int(index) < num_parts:
+                    raise ValueError(f"{name!r} is not a weight of this side's {prefix}")
+                part = parts.get(int(index))
+                if part is not None:
+                    part.get_parameter(weight).copy_(tensor)
+
     def read_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         """Take what an earlier PP stage carried."""
 
@@ -168,6 +185,21 @@ class FrankyParts(ABC):
 
     def write_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         """Hand what the next PP stage needs."""
+
+    @abstractmethod
+    def _weight_prefix(self) -> str:
+        """The first part of this side's weight names: encoders or readers."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _parts(self) -> dict[int, nn.Module]:
+        """This rank's encoders or readers, by index."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _num_parts(self) -> int:
+        """This side's encoders or readers on every PP stage."""
+        raise NotImplementedError
 
     @abstractmethod
     def _tap_encoder_ids(self) -> tuple[int, ...]:

@@ -97,6 +97,18 @@ class SandyParts(FrankyParts):
         )
 
     @override
+    def _weight_prefix(self) -> str:
+        return "encoders"
+
+    @override
+    def _parts(self) -> dict[int, nn.Module]:
+        return dict(self._encoders)
+
+    @override
+    def _num_parts(self) -> int:
+        return len(self.config.encoder.layers)
+
+    @override
     def _tap_encoder_ids(self) -> tuple[int, ...]:
         return tuple(
             index
