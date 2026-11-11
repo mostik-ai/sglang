@@ -55,7 +55,7 @@ class RickyParts(FrankyParts):
         model: nn.Module,
         language_model: FrankyMixin,
         config: FrankyConfig,
-        weights: dict[str, torch.Tensor],
+        weights: Optional[dict[str, torch.Tensor]],
         dtype: torch.dtype,
         device: str,
     ) -> RickyParts:

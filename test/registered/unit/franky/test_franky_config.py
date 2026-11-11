@@ -308,12 +308,15 @@ class TestHandleFranky(_WithFiles):
         with self.assertRaisesRegex(ValueError, "LoRA.*--enable-hierarchical-cache"):
             handle_franky(server_args)
 
-    def test_paths_are_required(self):
-        for field in ("franky_config", "franky_weights"):
-            with self.subTest(field):
-                server_args = self._server_args(side="sandy", **{field: None})
-                with self.assertRaisesRegex(ValueError, "--franky-config"):
-                    handle_franky(server_args)
+    def test_the_config_is_required(self):
+        server_args = self._server_args(side="sandy", franky_config=None)
+        with self.assertRaisesRegex(ValueError, "--franky-config"):
+            handle_franky(server_args)
+
+    def test_the_weights_may_come_with_the_first_weight_update(self):
+        for side in ("sandy", "ricky"):
+            with self.subTest(side):
+                handle_franky(self._server_args(side=side, franky_weights=None))
 
     def test_a_solo_server_is_not_checked(self):
         handle_franky(

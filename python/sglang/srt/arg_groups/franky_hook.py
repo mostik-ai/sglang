@@ -20,11 +20,8 @@ def handle_franky(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if cfg.franky_side == "null":
         return
-    if cfg.franky_config is None or cfg.franky_weights is None:
-        raise ValueError(
-            f"--franky-side {cfg.franky_side} needs --franky-config and "
-            "--franky-weights."
-        )
+    if cfg.franky_config is None:
+        raise ValueError(f"--franky-side {cfg.franky_side} needs --franky-config.")
     config = FrankyConfig.load(cfg.franky_config)
     model_config = model_config_of(cfg)
     side_checks = _sandy_checks if cfg.franky_side == "sandy" else _ricky_checks

@@ -475,6 +475,18 @@ class TestRickyParts(_Files):
         self.assertTrue(torch.equal(stages[0]._readers[0].mlp[2].bias, before))
         self.assertTrue(torch.equal(stages[1]._readers[1].mlp[2].bias, bias))
 
+    def test_readers_without_a_weights_file_start_at_zero(self):
+        config_path, _, _ = self._write(reader_type="fixed_query")
+        parts = self._attach(
+            model=_Model(start_layer=0, end_layer=_NUM_LAYERS),
+            config_path=config_path,
+            weights_path=None,
+        )
+
+        for reader in parts._readers.values():
+            for parameter in reader.parameters():
+                self.assertEqual(parameter.abs().sum().item(), 0)
+
     def test_weights_of_another_side_or_part_are_refused(self):
         config_path, weights_path, _ = self._write(reader_type="fixed_query")
         parts = self._attach(

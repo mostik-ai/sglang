@@ -44,7 +44,7 @@ class FrankyParts(ABC):
         model: nn.Module,
         side: str,
         config_path: str,
-        weights_path: str,
+        weights_path: Optional[str],
         dtype: torch.dtype,
         device: str,
     ) -> FrankyParts:
@@ -61,7 +61,7 @@ class FrankyParts(ABC):
             model=model,
             language_model=language_model,
             config=FrankyConfig.load(config_path),
-            weights=load_file(weights_path),
+            weights=None if weights_path is None else load_file(weights_path),
             dtype=dtype,
             device=device,
         )
@@ -76,11 +76,11 @@ class FrankyParts(ABC):
         model: nn.Module,
         language_model: FrankyMixin,
         config: FrankyConfig,
-        weights: dict[str, torch.Tensor],
+        weights: Optional[dict[str, torch.Tensor]],
         dtype: torch.dtype,
         device: str,
     ) -> FrankyParts:
-        """Build this rank's parts from the config and the weights file."""
+        """Build this rank's parts from the config and the weights file, or at zero without one."""
         raise NotImplementedError
 
     def kv_options(self) -> FrankyKvOptions:
@@ -230,12 +230,18 @@ def _franky_module_of(model: nn.Module) -> FrankyMixin:
 def load_part(
     *,
     part: nn.Module,
-    weights: dict[str, torch.Tensor],
+    weights: Optional[dict[str, torch.Tensor]],
     prefix: str,
     dtype: torch.dtype,
     device: str,
 ) -> nn.Module:
-    """Load one encoder or reader from the weights under ``prefix``, frozen."""
+    """Load one encoder or reader from the weights under ``prefix``, frozen;
+    without weights it starts at zero, until a weight update sends them."""
+    if weights is None:
+        with torch.no_grad():
+            for parameter in part.parameters():
+                parameter.zero_()
+        return part.to(device=device, dtype=dtype).requires_grad_(False)
     own = {
         name[len(prefix) :]: tensor
         for name, tensor in weights.items()
