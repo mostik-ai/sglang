@@ -177,12 +177,6 @@ class FrankyReceiveQueue:
             num_pinned_states=len(self._pinned_nodes())
         )
 
-    def num_continuing_blocks(self) -> int:
-        """Blocks after their chain's first, from arrival to end; each took over
-        its chain's hold."""
-        requests = self.arrivals + [r.req for r in self._live_receptions()]
-        return sum(_continues_a_chain(req) for req in requests)
-
     def is_empty(self) -> bool:
         return not self.arrivals and not self.receptions
 
@@ -421,7 +415,3 @@ class FrankyReceiveQueue:
             key = f"{name}:{rid}"
             self.agreed.pop(key, None)
             self.rank_reports.forget(key=key)
-
-
-def _continues_a_chain(req: Req) -> bool:
-    return req.franky_chain is not None and req.franky_chain.continues

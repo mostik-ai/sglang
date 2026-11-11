@@ -42,7 +42,6 @@ class TestFrankyChainHolds(CustomTestCase):
             tree_cache=self.tree,
             max_held_tokens=max_held_tokens,
             hold_seconds=hold_seconds,
-            chunked_prefill_size=2048,
         )
 
     def test_a_chains_next_hold_replaces_its_last(self):
@@ -136,21 +135,6 @@ class TestFrankyChainHolds(CustomTestCase):
         holds.hold_for_next_block(_block("a", node="a"))
 
         self.assertEqual(holds.expired_messages(), [])
-
-    def test_prefill_chunks_shrink_only_while_a_chain_holds_its_prompt(self):
-        holds = self._holds()
-        self.assertEqual(holds.chunk_size_for_batch(8192), 8192)
-
-        holds.hold_for_next_block(_block("a", node="a"))
-
-        self.assertEqual(holds.chunk_size_for_batch(8192), 2048)
-        self.assertEqual(holds.chunk_size_for_batch(1024), 1024)
-        self.assertIsNone(holds.chunk_size_for_batch(None))
-
-    def test_a_later_block_in_flight_keeps_prefill_chunks_small(self):
-        holds = self._holds()
-
-        self.assertEqual(holds.chunk_size_for_batch(8192, num_blocks_in_flight=1), 2048)
 
     def test_an_expiry_of_an_older_hold_keeps_the_newer_one(self):
         holds = self._holds()

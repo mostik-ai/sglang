@@ -49,9 +49,3 @@ class Franky(msgspec.Struct):
         "Share of the KV pool that chain holds may lock; past it the oldest holds "
         "are released. Default is 0.25.",
     ] = 0.25
-    franky_chain_chunked_prefill_size: A[
-        int,
-        "While chains hold cached prompts on a sandy or ricky engine, its prefill "
-        "batches take at most this many tokens (and at most --chunked-prefill-size), "
-        "so a chain's next block waits less behind other prefills. Default is 2048.",
-    ] = 2048

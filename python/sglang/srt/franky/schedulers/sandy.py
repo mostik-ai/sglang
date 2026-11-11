@@ -174,12 +174,6 @@ class SandyScheduler(Scheduler):
         return new_batch, running_batch
 
     @override
-    def get_chunked_prefill_size_for_batch(self) -> Optional[int]:
-        return self.franky_chain_holds.chunk_size_for_batch(
-            super().get_chunked_prefill_size_for_batch()
-        )
-
-    @override
     def get_num_allocatable_reqs(
         self,
         running_bs: int,

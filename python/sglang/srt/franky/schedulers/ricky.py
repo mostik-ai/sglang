@@ -206,13 +206,6 @@ class RickyScheduler(Scheduler):
         return new_batch, running_batch
 
     @override
-    def get_chunked_prefill_size_for_batch(self) -> Optional[int]:
-        return self.franky_chain_holds.chunk_size_for_batch(
-            super().get_chunked_prefill_size_for_batch(),
-            num_blocks_in_flight=self.franky_receive_queue.num_continuing_blocks(),
-        )
-
-    @override
     def get_num_allocatable_reqs(
         self,
         running_bs: int,

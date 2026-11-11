@@ -162,7 +162,6 @@ class _Queue(CustomTestCase):
                 tree_cache=self.lock_tree,
                 max_held_tokens=1000,
                 hold_seconds=60,
-                chunked_prefill_size=2048,
             ),
             page_size=_PAGE_SIZE,
             open_room=lambda req: self.sender,

@@ -32,12 +32,10 @@ class FrankyChainHolds:
         tree_cache: BasePrefixCache,
         max_held_tokens: int,
         hold_seconds: float,
-        chunked_prefill_size: int,
     ) -> None:
         self._tree_cache = tree_cache
         self._max_held_tokens = max_held_tokens
         self._hold_seconds = hold_seconds
-        self._chunked_prefill_size = chunked_prefill_size
         self._holds: dict[str, _Hold] = {}
         self._held_tokens = 0
         self._next_order = 0
@@ -53,7 +51,6 @@ class FrankyChainHolds:
             tree_cache=tree_cache,
             max_held_tokens=int(franky.franky_chain_hold_ratio * max_total_num_tokens),
             hold_seconds=franky.franky_chain_hold_seconds,
-            chunked_prefill_size=franky.franky_chain_chunked_prefill_size,
         )
 
     def hold_for_next_block(self, req: Req) -> None:
@@ -111,16 +108,6 @@ class FrankyChainHolds:
         hold = self._holds.get(message.chain_id)
         if hold is not None and hold.order == message.order:
             self.release(chain_id=message.chain_id)
-
-    def chunk_size_for_batch(
-        self, chunked_prefill_size: Optional[int], *, num_blocks_in_flight: int = 0
-    ) -> Optional[int]:
-        """The engine's chunk size for its next prefill batch, cut to the chains'
-        chunk size while any chain holds its prompt here or has a later block in
-        flight here (``num_blocks_in_flight``); no chunking stays."""
-        if chunked_prefill_size is None or not (self._holds or num_blocks_in_flight):
-            return chunked_prefill_size
-        return min(chunked_prefill_size, self._chunked_prefill_size)
 
     def locked_nodes(self) -> set[Any]:
         """The tree nodes the holds lock, each once."""
