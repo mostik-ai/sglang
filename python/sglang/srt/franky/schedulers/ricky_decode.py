@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 from typing_extensions import override
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.franky.cache.tap_reading import FrankyTapReading
 from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
 from sglang.srt.managers.scheduler import Scheduler
@@ -61,10 +62,17 @@ class RickyDecodeScheduler(Scheduler):
         if batch is not None:
             franky_parts = self.tp_worker.model_runner.franky_parts
             req_pool_indices = [req.kv.req_pool_idx for req in batch.reqs]
-            franky_parts.tap_cache.set_tap_lens(
+            franky_parts.tap_cache.set_readings(
                 req_pool_indices=req_pool_indices,
-                tap_lens=[
-                    len(req.origin_input_ids) if req.franky_room is not None else 0
+                readings=[
+                    FrankyTapReading.of(
+                        tap_len=(
+                            len(req.origin_input_ids)
+                            if req.franky_room is not None
+                            else 0
+                        ),
+                        chain=req.franky_chain,
+                    )
                     for req in batch.reqs
                 ],
             )

@@ -151,7 +151,7 @@ class _Manager:
 
 def _held(chain_id, *, node, num_tokens):
     return SimpleNamespace(
-        franky_chain=FrankyChain(id=chain_id),
+        franky_chain=FrankyChain(block_size=8, id=chain_id),
         last_node=node,
         origin_input_ids=[0] * num_tokens,
     )
@@ -356,7 +356,9 @@ class TestFrankyReceiveQueue(CustomTestCase):
         req.finished_reason = reason
 
     def test_a_block_at_its_token_limit_holds_its_prompt_for_the_next_block(self):
-        req = self._arrive(_Req("c-1", prompt_len=64, chain=FrankyChain(id="c")))
+        req = self._arrive(
+            _Req("c-1", prompt_len=64, chain=FrankyChain(block_size=8, id="c"))
+        )
 
         self._finish(req, FINISH_LENGTH(length=8))
         self.queue.poll()
@@ -366,14 +368,17 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
     def test_a_stopped_or_last_block_releases_its_chains_hold(self):
         for second_chain, reason in (
-            (FrankyChain(id="s"), FINISH_MATCHED_TOKEN(matched=0)),
-            (FrankyChain(id="l", last_block=True), FINISH_LENGTH(length=8)),
+            (FrankyChain(block_size=8, id="s"), FINISH_MATCHED_TOKEN(matched=0)),
+            (
+                FrankyChain(block_size=8, id="l", last_block=True),
+                FINISH_LENGTH(length=8),
+            ),
         ):
             first = self._arrive(
                 _Req(
                     f"{second_chain.id}-1",
                     prompt_len=64,
-                    chain=FrankyChain(id=second_chain.id),
+                    chain=FrankyChain(block_size=8, id=second_chain.id),
                 )
             )
             self._finish(first, FINISH_LENGTH(length=8))
@@ -389,12 +394,14 @@ class TestFrankyReceiveQueue(CustomTestCase):
             self.assertEqual(self.tree.locked, [])
 
     def test_a_block_aborted_before_it_took_pages_releases_its_chains_hold(self):
-        first = self._arrive(_Req("c-1", prompt_len=64, chain=FrankyChain(id="c")))
+        first = self._arrive(
+            _Req("c-1", prompt_len=64, chain=FrankyChain(block_size=8, id="c"))
+        )
         self._finish(first, FINISH_LENGTH(length=8))
         self.queue.poll()
         self._arrive(_Req("big", prompt_len=900))
         second = self._arrive(
-            _Req("c-2", prompt_len=96, chain=FrankyChain(id="c", block=2))
+            _Req("c-2", prompt_len=96, chain=FrankyChain(block_size=8, id="c", block=2))
         )
         self.assertIsNone(second.franky)
 
@@ -464,14 +471,16 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.assertEqual(req.copies_mamba_state, [False])
 
     def test_a_blocks_arrival_takes_over_its_chains_hold(self):
-        first = self._arrive(_Req("c-1", prompt_len=64, chain=FrankyChain(id="c")))
+        first = self._arrive(
+            _Req("c-1", prompt_len=64, chain=FrankyChain(block_size=8, id="c"))
+        )
         self._finish(first, FINISH_LENGTH(length=8))
         self.queue.poll()
         second = _Req(
             "c-2",
             prompt_len=72,
             cached_prefix_len=64,
-            chain=FrankyChain(id="c", block=2),
+            chain=FrankyChain(block_size=8, id="c", block=2),
         )
         second.last_node = "node-c-1"
 

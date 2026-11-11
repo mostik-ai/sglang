@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
+from sglang.srt.franky.cache.tap_reading import FrankyTapReading
 from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
@@ -191,9 +192,14 @@ class RickyScheduler(Scheduler):
         if new_batch is not None:
             self.franky_receive_queue.on_started(reqs=new_batch.reqs)
             franky_parts = self.tp_worker.model_runner.franky_parts
-            franky_parts.tap_cache.set_tap_lens(
+            franky_parts.tap_cache.set_readings(
                 req_pool_indices=[req.kv.req_pool_idx for req in new_batch.reqs],
-                tap_lens=[req.franky.tap_len for req in new_batch.reqs],
+                readings=[
+                    FrankyTapReading.of(
+                        tap_len=req.franky.tap_len, chain=req.franky_chain
+                    )
+                    for req in new_batch.reqs
+                ],
             )
             if self.disaggregation_mode == DisaggregationMode.NULL:
                 franky_parts.keep_past_the_taps(

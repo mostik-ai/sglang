@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 class Reader(nn.Module, ABC):
     """Runs on Ricky: turns one encoder's taps into what the injector adds.
 
-    A token at position ``p`` may read taps ``0 .. min(p, tap_len - 1)``; a token
+    A token reads the taps its request's ``FrankyTapReading`` gives it; a token
     of a request without taps must get exactly zero.
 
     To add an implementation: make a folder here with its reader and its

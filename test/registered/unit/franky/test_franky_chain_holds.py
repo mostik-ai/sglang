@@ -26,7 +26,7 @@ class _Tree:
 
 def _block(chain_id, *, node, num_tokens=1, last_block=False):
     return SimpleNamespace(
-        franky_chain=FrankyChain(id=chain_id, last_block=last_block),
+        franky_chain=FrankyChain(id=chain_id, block_size=8, last_block=last_block),
         last_node=node,
         origin_input_ids=[0] * num_tokens,
     )
@@ -149,7 +149,11 @@ class TestFrankyChainHolds(CustomTestCase):
 class TestFrankyChain(CustomTestCase):
     def test_continuations_go_first_and_keep_their_order(self):
         def req(name, block):
-            chain = None if block is None else FrankyChain(id=name, block=block)
+            chain = (
+                None
+                if block is None
+                else FrankyChain(id=name, block=block, block_size=8)
+            )
             return SimpleNamespace(name=name, franky_chain=chain)
 
         requests = [
@@ -166,19 +170,43 @@ class TestFrankyChain(CustomTestCase):
             [request.name for request in requests], ["c1", "c2", "new", "plain", "new2"]
         )
 
-    def test_a_chain_needs_an_id_and_blocks_count_from_one(self):
-        for franky_chain in ({"id": "", "block": 1}, {"id": "abc", "block": 0}):
+    def test_a_chain_needs_an_id_a_block_size_and_blocks_count_from_one(self):
+        for franky_chain in (
+            {"id": "", "block": 1, "block_size": 8},
+            {"id": "abc", "block": 0, "block_size": 8},
+            {"id": "abc", "block": 1},
+            {"id": "abc", "block": 1, "block_size": 0},
+        ):
             with self.subTest(franky_chain), self.assertRaises(msgspec.ValidationError):
-                FrankyChain.from_request(franky_chain=franky_chain, rid="abc-0")
+                FrankyChain.from_request(
+                    franky_chain=franky_chain, rid="abc-0", prompt_len=20
+                )
 
     def test_a_block_rid_must_start_with_the_chain_id(self):
         chain = FrankyChain.from_request(
-            franky_chain={"id": "abc", "last_block": True}, rid="abc-3"
+            franky_chain={"id": "abc", "block_size": 8, "last_block": True},
+            rid="abc-3",
+            prompt_len=20,
         )
-        self.assertEqual(chain, FrankyChain(id="abc", last_block=True))
+        self.assertEqual(chain, FrankyChain(id="abc", block_size=8, last_block=True))
 
         with self.assertRaisesRegex(ValueError, "starts with the chain id"):
-            FrankyChain.from_request(franky_chain={"id": "abc"}, rid="xyz-1")
+            FrankyChain.from_request(
+                franky_chain={"id": "abc", "block_size": 8}, rid="xyz-1", prompt_len=20
+            )
+
+    def test_a_blocks_prompt_must_hold_the_earlier_blocks_and_a_prompt(self):
+        third_block = {"id": "abc", "block": 3, "block_size": 8}
+
+        chain = FrankyChain.from_request(
+            franky_chain=third_block, rid="abc-3", prompt_len=17
+        )
+
+        self.assertEqual(chain.num_generated_before, 16)
+        with self.assertRaisesRegex(ValueError, "too short"):
+            FrankyChain.from_request(
+                franky_chain=third_block, rid="abc-3", prompt_len=16
+            )
 
 
 if __name__ == "__main__":
