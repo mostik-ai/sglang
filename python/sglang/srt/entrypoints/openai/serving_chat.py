@@ -1388,6 +1388,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
             franky_room=request.franky_room,
+            franky_generated_spans=request.franky_generated_spans,
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,

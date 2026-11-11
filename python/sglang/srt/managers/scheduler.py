@@ -3018,6 +3018,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 franky_room=recv_req.franky_room,
                 franky_chain=recv_req.franky_chain,
+                franky_generated_spans=recv_req.franky_generated_spans,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,

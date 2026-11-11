@@ -196,7 +196,9 @@ class RickyScheduler(Scheduler):
                 req_pool_indices=[req.kv.req_pool_idx for req in new_batch.reqs],
                 readings=[
                     FrankyTapReading.of(
-                        tap_len=req.franky.tap_len, chain=req.franky_chain
+                        tap_len=req.franky.tap_len,
+                        chain=req.franky_chain,
+                        earlier_answers=req.franky_generated_spans,
                     )
                     for req in new_batch.reqs
                 ],
