@@ -133,13 +133,14 @@ async fn main() -> Result<()> {
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
-    let (discovery_handle, worker_manager_handle, worker_events) = start_worker_discovery_and_manager(
-        &config,
-        &worker_registry,
-        &engine_state,
-        &local_inflight_requests,
-    )
-    .await?;
+    let (discovery_handle, worker_manager_handle, worker_events) =
+        start_worker_discovery_and_manager(
+            &config,
+            &worker_registry,
+            &engine_state,
+            &local_inflight_requests,
+        )
+        .await?;
 
     // Share routing dependencies with HTTP handlers and mark startup complete.
     let mut app_context = build_app_context(
@@ -353,8 +354,9 @@ async fn start_worker_discovery_and_manager(
     JoinHandle<()>,
     Option<tokio::sync::mpsc::Sender<DiscoveryEvent>>,
 )> {
-    let (worker_events, discovery_handle, api_events) =
-        spawn_discovery_with_api(config).await.context("spawn discovery")?;
+    let (worker_events, discovery_handle, api_events) = spawn_discovery_with_api(config)
+        .await
+        .context("spawn discovery")?;
     // Keep engine subscriptions and local request counters in sync with worker membership.
     let worker_manager_handle = tokio::spawn(manager::run_with_config(
         worker_events,
