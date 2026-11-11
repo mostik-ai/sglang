@@ -197,7 +197,6 @@ class TestFrankyReceiveQueue(CustomTestCase):
             tree_cache=self.tree,
             max_held_tokens=_NUM_TOKENS,
             hold_seconds=60,
-            chunked_prefill_size=2048,
         )
         self.queue = self._queue(mamba_room=None)
 
@@ -480,21 +479,6 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
         self.assertEqual(self.tree.locked, ["node-c-1"])
         self.assertEqual(self.holds.locked_nodes(), set())
-
-    def test_a_later_block_counts_as_in_flight_from_arrival_to_end(self):
-        first = self._arrive(_Req("c-1", prompt_len=64, chain=FrankyChain(id="c")))
-        self.assertEqual(self.queue.num_continuing_blocks(), 0)
-        self._finish(first, FINISH_LENGTH(length=8))
-        self.queue.poll()
-
-        second = self._arrive(
-            _Req("c-2", prompt_len=96, chain=FrankyChain(id="c", block=2))
-        )
-
-        self.assertEqual(self.queue.num_continuing_blocks(), 1)
-        self._finish(second, FINISH_LENGTH(length=8))
-        self.queue.poll()
-        self.assertEqual(self.queue.num_continuing_blocks(), 0)
 
     def test_a_started_request_no_longer_pins_its_prefix(self):
         req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=32))

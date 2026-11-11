@@ -445,10 +445,10 @@ in the next block:
   output.
 - Between two blocks a chain waits for Sandy to prefill the last block's tokens
   and send their taps, and for Ricky to prefill them again. Both engines take a
-  chain's next block before new prompts, Sandy runs without overlap scheduling
-  so a batch's taps leave right after its forward, and while chains hold cache
-  an engine's prefill batches take at most `--franky-chain-chunked-prefill-size`
-  tokens (2048 by default).
+  chain's next block before new prompts, and Sandy runs without overlap
+  scheduling so a batch's taps leave right after its forward. Engines started
+  with a smaller `--chunked-prefill-size` (2048 in our runs) make a next block
+  wait less behind other prefills, at a small cost in throughput.
 
 ## Chat rendering
 
