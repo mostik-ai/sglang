@@ -260,6 +260,15 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             post(crate::server::routes::cache::flush_cache),
         )
         .route(
+            "/workers",
+            get(crate::server::routes::workers::list_workers)
+                .post(crate::server::routes::workers::add_worker),
+        )
+        .route(
+            "/workers/{id}",
+            axum::routing::delete(crate::server::routes::workers::remove_worker),
+        )
+        .route(
             crate::state::kv_events::bootstrap::SNAPSHOT_PATH,
             get(crate::server::routes::cache::kv_snapshot),
         );

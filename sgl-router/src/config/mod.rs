@@ -93,9 +93,9 @@ impl Config {
             );
         }
         match &self.discovery {
-            DiscoveryBackend::StaticUrls(s) => {
+            DiscoveryBackend::StaticUrls(s) | DiscoveryBackend::WorkerApi(s) => {
                 ensure!(
-                    !s.urls.is_empty(),
+                    !s.urls.is_empty() || matches!(self.discovery, DiscoveryBackend::WorkerApi(_)),
                     "discovery.static_urls.urls must be a non-empty list"
                 );
                 // Normalize URLs before deduplication so trailing slashes cannot register a worker twice.

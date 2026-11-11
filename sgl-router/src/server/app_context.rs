@@ -89,6 +89,9 @@ pub struct AppContext {
     /// The local KV-event index; `None` in metadata-only mode, which makes
     /// `/internal/kv_snapshot` a 404. See [`KvEventIndex::snapshot_source`].
     pub kv_index: Option<Arc<KvEventIndex>>,
+    /// Where `/workers` sends the workers it adds and removes; `None` without
+    /// `--worker-api`.
+    pub worker_events: Option<tokio::sync::mpsc::Sender<crate::discovery::DiscoveryEvent>>,
     readiness: AtomicU8,
 }
 
@@ -153,6 +156,7 @@ impl AppContext {
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
+            worker_events: None,
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
     }
@@ -262,6 +266,7 @@ impl AppContext {
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
+            worker_events: None,
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
     }

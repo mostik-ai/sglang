@@ -24,10 +24,26 @@ pub const DISCOVERY_CHANNEL_CAP: usize = 128;
 pub async fn spawn_discovery(
     cfg: &Config,
 ) -> Result<(mpsc::Receiver<DiscoveryEvent>, tokio::task::JoinHandle<()>)> {
+    let (rx, handle, _) = spawn_discovery_with_api(cfg).await?;
+    Ok((rx, handle))
+}
+
+/// As [`spawn_discovery`], plus the sender that `/workers` adds and removes
+/// workers through under [`DiscoveryBackend::WorkerApi`]; `None` otherwise.
+pub async fn spawn_discovery_with_api(
+    cfg: &Config,
+) -> Result<(
+    mpsc::Receiver<DiscoveryEvent>,
+    tokio::task::JoinHandle<()>,
+    Option<mpsc::Sender<DiscoveryEvent>>,
+)> {
     let (tx, rx) = mpsc::channel(DISCOVERY_CHANNEL_CAP);
+    let api = matches!(cfg.discovery, DiscoveryBackend::WorkerApi(_)).then(|| tx.clone());
     let handle = match &cfg.discovery {
-        DiscoveryBackend::StaticUrls(s) => static_urls::spawn(s.clone(), tx).await?,
+        DiscoveryBackend::StaticUrls(s) | DiscoveryBackend::WorkerApi(s) => {
+            static_urls::spawn(s.clone(), tx).await?
+        }
         DiscoveryBackend::K8s(k) => k8s::spawn(k.clone(), tx).await?,
     };
-    Ok((rx, handle))
+    Ok((rx, handle, api))
 }

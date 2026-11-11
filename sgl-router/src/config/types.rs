@@ -772,6 +772,9 @@ pub fn default_cb_cool_down() -> u64 {
 #[derive(Debug, Clone)]
 pub enum DiscoveryBackend {
     StaticUrls(StaticUrlsDiscoveryConfig),
+    /// The static URLs, then the workers clients add and remove over `/workers`,
+    /// as Miles registers the engines it launches.
+    WorkerApi(StaticUrlsDiscoveryConfig),
     K8s(K8sDiscoveryConfig),
 }
 
@@ -781,7 +784,7 @@ impl DiscoveryBackend {
     pub fn peer_selector(&self) -> Option<&str> {
         match self {
             Self::K8s(k) => k.peer_selector.as_deref(),
-            Self::StaticUrls(_) => None,
+            Self::StaticUrls(_) | Self::WorkerApi(_) => None,
         }
     }
 }

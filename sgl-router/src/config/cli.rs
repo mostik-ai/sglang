@@ -208,6 +208,12 @@ pub struct DiscoveryArgs {
     #[arg(long, num_args = 1..)]
     pub worker_urls: Vec<String>,
 
+    /// Let clients add and remove workers over POST /workers, GET /workers and
+    /// DELETE /workers/{id}, as Miles registers its engines; the router may then
+    /// start without --worker-urls. Conflicts with --service-discovery.
+    #[arg(long)]
+    pub worker_api: bool,
+
     /// Enable Kubernetes EndpointSlice discovery.
     #[arg(long)]
     pub service_discovery: bool,
@@ -716,7 +722,7 @@ impl Cli {
 
 impl DiscoveryArgs {
     fn into_config(self) -> Result<DiscoveryBackend> {
-        let has_static = !self.worker_urls.is_empty();
+        let has_static = !self.worker_urls.is_empty() || self.worker_api;
         let backend = match (has_static, self.service_discovery) {
             (true, true) => {
                 return Err(anyhow!(
@@ -749,9 +755,14 @@ impl DiscoveryArgs {
                     "--kv-peer-selector requires --service-discovery (peer replicas are \
                      found via Kubernetes EndpointSlices)"
                 );
-                DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                let urls = StaticUrlsDiscoveryConfig {
                     urls: self.worker_urls,
-                })
+                };
+                if self.worker_api {
+                    DiscoveryBackend::WorkerApi(urls)
+                } else {
+                    DiscoveryBackend::StaticUrls(urls)
+                }
             }
             (false, true) => {
                 let mode = resolve_mode(

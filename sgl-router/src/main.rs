@@ -9,7 +9,7 @@ use sgl_router::{
         CachePrefixProvider, ChatRoutingKind, Cli, Config, DiscoveryBackend,
         KvIndexerEndpointConfig, LogFormat, PolicyKind,
     },
-    discovery::{spawn_discovery, ModelId},
+    discovery::{spawn_discovery_with_api, DiscoveryEvent, ModelId},
     policies::{factory::build_registry as build_policy_registry, PolicyRegistry},
     policies_reorg::factory::{build_resolver as build_reorg_resolver, build_sandy_group},
     proxy::Proxy,
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
-    let (discovery_handle, worker_manager_handle) = start_worker_discovery_and_manager(
+    let (discovery_handle, worker_manager_handle, worker_events) = start_worker_discovery_and_manager(
         &config,
         &worker_registry,
         &engine_state,
@@ -153,6 +153,7 @@ async fn main() -> Result<()> {
     )?;
     app_context.chat_routing = chat_routing;
     app_context.sandy = Some(sandy);
+    app_context.worker_events = worker_events;
     let app_context = Arc::new(app_context);
     app_context.mark_ready();
 
@@ -347,9 +348,13 @@ async fn start_worker_discovery_and_manager(
     worker_registry: &Arc<WorkerRegistry>,
     engine_state: &Arc<KvEventIndex>,
     local_inflight_requests: &Arc<RouterInflightLoadRegistry>,
-) -> Result<(JoinHandle<()>, JoinHandle<()>)> {
-    let (worker_events, discovery_handle) =
-        spawn_discovery(config).await.context("spawn discovery")?;
+) -> Result<(
+    JoinHandle<()>,
+    JoinHandle<()>,
+    Option<tokio::sync::mpsc::Sender<DiscoveryEvent>>,
+)> {
+    let (worker_events, discovery_handle, api_events) =
+        spawn_discovery_with_api(config).await.context("spawn discovery")?;
     // Keep engine subscriptions and local request counters in sync with worker membership.
     let worker_manager_handle = tokio::spawn(manager::run_with_config(
         worker_events,
@@ -358,7 +363,7 @@ async fn start_worker_discovery_and_manager(
         Some(Arc::clone(engine_state)),
         Some(Arc::clone(local_inflight_requests)),
     ));
-    Ok((discovery_handle, worker_manager_handle))
+    Ok((discovery_handle, worker_manager_handle, api_events))
 }
 
 fn build_app_context(
