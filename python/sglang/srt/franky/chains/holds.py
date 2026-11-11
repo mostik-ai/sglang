@@ -113,13 +113,20 @@ class FrankyChainHolds:
             self.release(chain_id=message.chain_id)
 
     def chunk_size_for_batch(
-        self, chunked_prefill_size: Optional[int]
+        self, chunked_prefill_size: Optional[int], *, num_blocks_in_flight: int = 0
     ) -> Optional[int]:
         """The engine's chunk size for its next prefill batch, cut to the chains'
-        chunk size while any chain holds its prompt here; no chunking stays."""
-        if chunked_prefill_size is None or not self._holds:
+        chunk size while any chain holds its prompt here or has a later block in
+        flight here (``num_blocks_in_flight``); no chunking stays."""
+        if chunked_prefill_size is None or not (self._holds or num_blocks_in_flight):
             return chunked_prefill_size
         return min(chunked_prefill_size, self._chunked_prefill_size)
+
+    def locked_nodes(self) -> set[Any]:
+        """The tree nodes the holds lock, each once."""
+        return {
+            hold.lock.node for hold in self._holds.values() if hold.lock is not None
+        }
 
     def _hold(self, *, chain_id: str, node: Any, num_tokens: int) -> None:
         self.release(chain_id=chain_id)

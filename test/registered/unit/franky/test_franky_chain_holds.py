@@ -18,10 +18,10 @@ class _Tree:
 
     def lock(self, node):
         self.locked.append(node)
-        return node
+        return SimpleNamespace(node=node)
 
     def unlock(self, lock):
-        self.locked.remove(lock)
+        self.locked.remove(lock.node)
 
 
 def _block(chain_id, *, node, num_tokens=1, last_block=False):
@@ -93,6 +93,14 @@ class TestFrankyChainHolds(CustomTestCase):
         self.assertTrue(holds.release_oldest())
         self.assertFalse(holds.release_oldest())
 
+    def test_locked_nodes_name_each_held_node_once(self):
+        holds = self._holds()
+        holds.hold_for_next_block(_block("a", node="shared"))
+        holds.hold_for_next_block(_block("b", node="shared"))
+        holds.hold_for_next_block(_block("c", node="c"))
+
+        self.assertEqual(holds.locked_nodes(), {"shared", "c"})
+
     def test_release_all_leaves_nothing_locked(self):
         holds = self._holds()
         holds.hold_for_next_block(_block("a", node="a", num_tokens=3))
@@ -138,6 +146,11 @@ class TestFrankyChainHolds(CustomTestCase):
         self.assertEqual(holds.chunk_size_for_batch(8192), 2048)
         self.assertEqual(holds.chunk_size_for_batch(1024), 1024)
         self.assertIsNone(holds.chunk_size_for_batch(None))
+
+    def test_a_later_block_in_flight_keeps_prefill_chunks_small(self):
+        holds = self._holds()
+
+        self.assertEqual(holds.chunk_size_for_batch(8192, num_blocks_in_flight=1), 2048)
 
     def test_an_expiry_of_an_older_hold_keeps_the_newer_one(self):
         holds = self._holds()

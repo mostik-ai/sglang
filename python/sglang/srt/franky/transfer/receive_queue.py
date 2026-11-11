@@ -17,13 +17,14 @@ from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
+    from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
     from sglang.srt.franky.cache.tap_cache import FrankyTapCache
     from sglang.srt.franky.chains.holds import FrankyChainHolds
     from sglang.srt.franky.transfer.manager import FrankyTapManager
     from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, TreeLock
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ class FrankyReceiveQueue:
         tap_manager: FrankyTapManager,
         rank_reports: FrankyRankReports,
         chain_holds: FrankyChainHolds,
+        mamba_room: Optional[FrankyMambaRoom],
         page_size: int,
         reserved_decode_tokens: int,
         release_timeout_seconds: float,
@@ -71,6 +73,7 @@ class FrankyReceiveQueue:
         self.tap_manager = tap_manager
         self.rank_reports = rank_reports
         self.chain_holds = chain_holds
+        self.mamba_room = mamba_room
         self.page_size = page_size
         self.reserved_decode_tokens = reserved_decode_tokens
         self.release_timeout_seconds = release_timeout_seconds
@@ -115,6 +118,7 @@ class FrankyReceiveQueue:
             if reception.req.finished():
                 self._hold_or_release_the_chain(reception.req)
                 self._end(reception)
+        self._release_holds_past_the_mamba_room()
         self._take_pages_for_arrivals()
         for reception in self._live_receptions():
             self._keep_kv_past_the_prompt_out_of_the_cache(reception.req)
@@ -153,6 +157,32 @@ class FrankyReceiveQueue:
         if reception is not None and reception.ended:
             self._release(reception)
 
+    def on_started(self, *, reqs: list[Req]) -> None:
+        """The scheduler started ``reqs``; each now locks its cached prefix itself."""
+        for req in reqs:
+            reception = self.receptions.get(req.rid)
+            if reception is not None:
+                self.tree_cache.unlock(reception.prefix_lock)
+                reception.prefix_lock = None
+
+    def num_startable_requests(self) -> Optional[int]:
+        """
+        Returns:
+            How many requests may start beside the running ones as far as the
+            mamba state pool goes, or None without such a pool.
+        """
+        if self.mamba_room is None:
+            return None
+        return self.mamba_room.num_startable_requests(
+            num_pinned_states=len(self._pinned_nodes())
+        )
+
+    def num_continuing_blocks(self) -> int:
+        """Blocks after their chain's first, from arrival to end; each took over
+        its chain's hold."""
+        requests = self.arrivals + [r.req for r in self._live_receptions()]
+        return sum(_continues_a_chain(req) for req in requests)
+
     def is_empty(self) -> bool:
         return not self.arrivals and not self.receptions
 
@@ -166,7 +196,7 @@ class FrankyReceiveQueue:
     def _take_pages(self, req: Req) -> bool:
         returning = req.rid in self.returning_tap_lens
         tap_len = self._tap_len_of(req)
-        req.init_next_round_input(self.tree_cache)
+        req.init_next_round_input(self.tree_cache, cow_mamba=False)
         num_tokens = len(req.full_untruncated_fill_ids)
         num_taken = num_tokens - req.prefix_len
         num_page_slots = ceil_div(num_taken, self.page_size) * self.page_size
@@ -180,10 +210,15 @@ class FrankyReceiveQueue:
                 req, f"The taps of request {req.rid} left the prefix cache."
             )
             return True
-        prefix_lock = self.tree_cache.lock(req.last_node)
-        if not self._fits_after_releasing_holds(num_page_slots):
+        prefix_lock = (
+            self.tree_cache.lock(req.last_node) if req.prefix_len > 0 else None
+        )
+        if not self._fits_after_releasing_holds(
+            num_page_slots, prefix_lock=prefix_lock
+        ):
             self.tree_cache.unlock(prefix_lock)
             return False
+        self.chain_holds.release_chain_of(req)
         self.returning_tap_lens.pop(req.rid, None)
         taken = self._take_slots(num_page_slots)[:num_taken]
         receives_taps = not returning and tap_len > 0
@@ -224,13 +259,41 @@ class FrankyReceiveQueue:
             return self.returning_tap_lens[req.rid]
         return len(req.origin_input_ids) if req.franky_room is not None else 0
 
-    def _fits_after_releasing_holds(self, num_page_slots: int) -> bool:
+    def _fits_after_releasing_holds(
+        self, num_page_slots: int, *, prefix_lock: Optional[TreeLock]
+    ) -> bool:
         if self._free_slots() + self.chain_holds.held_tokens < num_page_slots:
             return False
-        while self._free_slots() < num_page_slots:
+        while not self._fits(num_page_slots, prefix_lock=prefix_lock):
             if not self.chain_holds.release_oldest():
                 return False
         return True
+
+    def _fits(self, num_page_slots: int, *, prefix_lock: Optional[TreeLock]) -> bool:
+        return self._free_slots() >= num_page_slots and self._fits_mamba_room(
+            arriving_prefix_lock=prefix_lock
+        )
+
+    def _release_holds_past_the_mamba_room(self) -> None:
+        while not self._fits_mamba_room():
+            if not self.chain_holds.release_oldest():
+                return
+
+    def _fits_mamba_room(
+        self, *, arriving_prefix_lock: Optional[TreeLock] = None
+    ) -> bool:
+        if self.mamba_room is None:
+            return True
+        pinned_nodes = self._pinned_nodes(arriving_prefix_lock=arriving_prefix_lock)
+        return self.mamba_room.fits_pinned_states(num_pinned_states=len(pinned_nodes))
+
+    def _pinned_nodes(
+        self, *, arriving_prefix_lock: Optional[TreeLock] = None
+    ) -> set[Any]:
+        locks = [reception.prefix_lock for reception in self.receptions.values()]
+        locks.append(arriving_prefix_lock)
+        nodes = {lock.node for lock in locks if lock is not None}
+        return nodes | self.chain_holds.locked_nodes()
 
     def _free_slots(self) -> int:
         free = self.kv_allocator.available_size() + self.tree_cache.evictable_size()
@@ -358,3 +421,7 @@ class FrankyReceiveQueue:
             key = f"{name}:{rid}"
             self.agreed.pop(key, None)
             self.rank_reports.forget(key=key)
+
+
+def _continues_a_chain(req: Req) -> bool:
+    return req.franky_chain is not None and req.franky_chain.continues

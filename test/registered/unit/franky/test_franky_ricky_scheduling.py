@@ -8,11 +8,13 @@ import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
+from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.cache.tap_cache import FrankyTapCache
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder
 from sglang.srt.franky.schedulers.ricky import RickyScheduler
+from sglang.srt.franky.schedulers.sandy import SandyScheduler
 from sglang.srt.franky.transfer import receive_queue as receive_queue_module
 from sglang.srt.franky.transfer.messages import (
     FrankyRoom,
@@ -27,6 +29,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefResult,
@@ -81,12 +84,14 @@ class _Tree:
 
     def lock(self, node):
         self.locked.append(node)
-        return node
+        return SimpleNamespace(node=node)
 
     def unlock(self, lock):
-        self.locked.remove(lock)
-        if lock not in self.locked:
-            self.evictable += self.node_tokens.get(lock, 0)
+        if lock is None:
+            return
+        self.locked.remove(lock.node)
+        if lock.node not in self.locked:
+            self.evictable += self.node_tokens.get(lock.node, 0)
 
     def evictable_size(self):
         return self.evictable
@@ -111,10 +116,12 @@ class _Req:
         self.extra_key = None
         self.skip_radix_cache_insert = False
         self.done = False
+        self.copies_mamba_state = []
 
-    def init_next_round_input(self, tree_cache):
+    def init_next_round_input(self, tree_cache, cow_mamba=None):
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
         self.prefix_len = self.cached_prefix_len
+        self.copies_mamba_state.append(cow_mamba is not False)
 
     def finished(self):
         return self.done
@@ -192,7 +199,10 @@ class TestFrankyReceiveQueue(CustomTestCase):
             hold_seconds=60,
             chunked_prefill_size=2048,
         )
-        self.queue = FrankyReceiveQueue(
+        self.queue = self._queue(mamba_room=None)
+
+    def _queue(self, *, mamba_room):
+        return FrankyReceiveQueue(
             tap_cache=FrankyTapCache(
                 encoder_ids=(0,),
                 output_size=2,
@@ -210,6 +220,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
                 pp_store=self.store,
             ),
             chain_holds=self.holds,
+            mamba_room=mamba_room,
             page_size=_PAGE_SIZE,
             reserved_decode_tokens=64,
             release_timeout_seconds=600,
@@ -378,17 +389,33 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
             self.assertEqual(self.tree.locked, [])
 
-    def test_an_aborted_block_releases_its_chains_hold(self):
+    def test_a_block_aborted_before_it_took_pages_releases_its_chains_hold(self):
         first = self._arrive(_Req("c-1", prompt_len=64, chain=FrankyChain(id="c")))
         self._finish(first, FINISH_LENGTH(length=8))
         self.queue.poll()
-        second = self._arrive(_Req("c-2", prompt_len=96, chain=FrankyChain(id="c")))
+        self._arrive(_Req("big", prompt_len=900))
+        second = self._arrive(
+            _Req("c-2", prompt_len=96, chain=FrankyChain(id="c", block=2))
+        )
+        self.assertIsNone(second.franky)
 
         self.queue.forget(req=second)
 
+        self.assertEqual(self.holds.locked_nodes(), set())
+
+    def test_an_aborted_blocks_prefix_lock_waits_for_its_room(self):
+        req = self._arrive(_Req("r", prompt_len=96, cached_prefix_len=64))
+
+        self.queue.forget(req=req)
+
         self.assertEqual(
-            self.tree.locked, ["node-c-2"], "the arrival's lock waits for its room"
+            self.tree.locked, ["node-r"], "the arrival's lock waits for its room"
         )
+
+    def test_an_arrival_without_a_cached_prefix_locks_nothing(self):
+        self._arrive(_Req("r", prompt_len=64))
+
+        self.assertEqual(self.tree.locked, [])
 
     def test_an_arrival_that_does_not_fit_releases_the_oldest_holds_first(self):
         self.tree.node_tokens = {"held-a": 400, "held-b": 400}
@@ -399,7 +426,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
         second = self._arrive(_Req("second", prompt_len=400))
 
         self.assertIsNotNone(second.franky)
-        self.assertEqual(self.tree.locked, ["held-b", "node-first", "node-second"])
+        self.assertEqual(self.tree.locked, ["held-b"])
 
     def test_holds_too_small_to_make_room_are_kept(self):
         self.tree.node_tokens = {"held-a": 8}
@@ -409,7 +436,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
         second = self._arrive(_Req("second", prompt_len=400))
 
         self.assertIsNone(second.franky)
-        self.assertEqual(self.tree.locked, ["held-a", "node-first"])
+        self.assertEqual(self.tree.locked, ["held-a"])
 
     def test_kv_past_the_prompt_never_enters_the_cache(self):
         req = self._arrive(_Req("r", prompt_len=64))
@@ -421,6 +448,130 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.queue.poll()
 
         self.assertTrue(req.skip_radix_cache_insert)
+
+    def _with_mamba_room(self, *, num_states):
+        pool = SimpleNamespace(
+            size=4,
+            available_size=lambda: 4,
+            mamba_allocator=SimpleNamespace(size=num_states),
+        )
+        self.queue = self._queue(
+            mamba_room=FrankyMambaRoom(req_to_token_pool=pool, states_per_request=5)
+        )
+
+    def test_an_arrival_matches_its_prefix_without_copying_its_mamba_state(self):
+        req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=32))
+
+        self.assertEqual(req.copies_mamba_state, [False])
+
+    def test_a_blocks_arrival_takes_over_its_chains_hold(self):
+        first = self._arrive(_Req("c-1", prompt_len=64, chain=FrankyChain(id="c")))
+        self._finish(first, FINISH_LENGTH(length=8))
+        self.queue.poll()
+        second = _Req(
+            "c-2",
+            prompt_len=72,
+            cached_prefix_len=64,
+            chain=FrankyChain(id="c", block=2),
+        )
+        second.last_node = "node-c-1"
+
+        self._arrive(second)
+
+        self.assertEqual(self.tree.locked, ["node-c-1"])
+        self.assertEqual(self.holds.locked_nodes(), set())
+
+    def test_a_later_block_counts_as_in_flight_from_arrival_to_end(self):
+        first = self._arrive(_Req("c-1", prompt_len=64, chain=FrankyChain(id="c")))
+        self.assertEqual(self.queue.num_continuing_blocks(), 0)
+        self._finish(first, FINISH_LENGTH(length=8))
+        self.queue.poll()
+
+        second = self._arrive(
+            _Req("c-2", prompt_len=96, chain=FrankyChain(id="c", block=2))
+        )
+
+        self.assertEqual(self.queue.num_continuing_blocks(), 1)
+        self._finish(second, FINISH_LENGTH(length=8))
+        self.queue.poll()
+        self.assertEqual(self.queue.num_continuing_blocks(), 0)
+
+    def test_a_started_request_no_longer_pins_its_prefix(self):
+        req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=32))
+
+        self.queue.on_started(reqs=[req])
+
+        self.assertEqual(self.tree.locked, [])
+        req.franky.taps_ready = 64
+        self.queue.forget(req=req)
+        self.assertTrue(self.queue.is_empty())
+
+    def test_an_arrival_past_the_mamba_room_releases_the_oldest_holds_first(self):
+        self._with_mamba_room(num_states=7)
+        self.holds.hold_for_next_block(_held("a", node="held-a", num_tokens=16))
+        self.holds.hold_for_next_block(_held("b", node="held-b", num_tokens=16))
+
+        req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=32))
+
+        self.assertIsNotNone(req.franky)
+        self.assertEqual(self.tree.locked, ["held-b", "node-r"])
+
+    def test_an_arrival_waits_while_waiting_prefixes_fill_the_mamba_room(self):
+        self._with_mamba_room(num_states=7)
+        first = self._arrive(_Req("a", prompt_len=64, cached_prefix_len=32))
+        self._arrive(_Req("b", prompt_len=64, cached_prefix_len=32))
+
+        third = self._arrive(_Req("c", prompt_len=64, cached_prefix_len=32))
+
+        self.assertIsNone(third.franky)
+        self.assertEqual(self.failed, [])
+        self.queue.on_started(reqs=[first])
+        self.queue.poll()
+        self.assertIsNotNone(third.franky)
+
+    def test_holds_past_the_mamba_room_go_oldest_first(self):
+        self._with_mamba_room(num_states=7)
+        for chain_id in ("a", "b", "c"):
+            self.holds.hold_for_next_block(
+                _held(chain_id, node=f"held-{chain_id}", num_tokens=16)
+            )
+
+        self.queue.poll()
+
+        self.assertEqual(self.tree.locked, ["held-b", "held-c"])
+
+    def test_a_prefix_shared_by_waiting_requests_takes_one_state(self):
+        self._with_mamba_room(num_states=22)
+        for rid in ("a", "b"):
+            req = _Req(rid, prompt_len=64, cached_prefix_len=32)
+            req.last_node = "system-prompt"
+            self._arrive(req)
+        self.holds.hold_for_next_block(_held("c", node="held-c", num_tokens=16))
+
+        self.assertEqual(self.queue.num_startable_requests(), 4)
+
+    def test_an_engine_without_a_mamba_pool_sets_no_limit(self):
+        self._arrive(_Req("r", prompt_len=64, cached_prefix_len=32))
+
+        self.assertIsNone(self.queue.num_startable_requests())
+
+
+class TestFrankyStartableRequests(CustomTestCase):
+    def test_pinned_mamba_states_cap_the_requests_a_prefill_may_start(self):
+        for scheduler_class in (RickyScheduler, SandyScheduler):
+            scheduler = object.__new__(scheduler_class)
+            with (
+                self.subTest(scheduler=scheduler_class.__name__),
+                patch.object(Scheduler, "get_num_allocatable_reqs", return_value=10),
+            ):
+                scheduler.franky_num_startable_reqs = 2
+                self.assertEqual(
+                    scheduler.get_num_allocatable_reqs(0, num_held_rows=1), 3
+                )
+                scheduler.franky_num_startable_reqs = None
+                self.assertEqual(
+                    scheduler.get_num_allocatable_reqs(0, num_held_rows=1), 10
+                )
 
 
 class TestFrankyPrefillAdder(CustomTestCase):

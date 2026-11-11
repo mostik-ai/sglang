@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
+from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
@@ -59,6 +60,7 @@ class RickyScheduler(Scheduler):
     def init_disaggregation(self) -> None:
         super().init_disaggregation()
         self.init_franky_chain_holds()
+        self.init_franky_mamba_room()
         self.init_franky_receiving()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.init_franky_relay()
@@ -67,6 +69,13 @@ class RickyScheduler(Scheduler):
         self.franky_chain_holds = FrankyChainHolds.from_config(
             tree_cache=self.tree_cache, max_total_num_tokens=self.max_total_num_tokens
         )
+
+    def init_franky_mamba_room(self) -> None:
+        self.franky_mamba_room = FrankyMambaRoom.from_engine(
+            req_to_token_pool=self.req_to_token_pool,
+            kv_cache_configurator=self.tp_worker.model_runner.kv_cache_configurator,
+        )
+        self.franky_num_startable_reqs: Optional[int] = None
 
     def init_franky_receiving(self) -> None:
         """Ricky's end of tap transfers: this rank's tap manager, the queue of
@@ -98,6 +107,7 @@ class RickyScheduler(Scheduler):
                 ),
             ),
             chain_holds=self.franky_chain_holds,
+            mamba_room=self.franky_mamba_room,
             page_size=self.page_size,
             reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
             release_timeout_seconds=(
@@ -172,10 +182,14 @@ class RickyScheduler(Scheduler):
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         self.chunked_req = self.franky_parked_chunks.pick(current=self.chunked_req)
         put_continuations_first(self.waiting_queue)
+        self.franky_num_startable_reqs = (
+            self.franky_receive_queue.num_startable_requests()
+        )
         new_batch, running_batch = super()._get_new_batch_prefill_raw(
             prefill_delayer_single_pass, running_batch
         )
         if new_batch is not None:
+            self.franky_receive_queue.on_started(reqs=new_batch.reqs)
             franky_parts = self.tp_worker.model_runner.franky_parts
             franky_parts.tap_cache.set_tap_lens(
                 req_pool_indices=[req.kv.req_pool_idx for req in new_batch.reqs],
@@ -194,8 +208,27 @@ class RickyScheduler(Scheduler):
     @override
     def get_chunked_prefill_size_for_batch(self) -> Optional[int]:
         return self.franky_chain_holds.chunk_size_for_batch(
-            super().get_chunked_prefill_size_for_batch()
+            super().get_chunked_prefill_size_for_batch(),
+            num_blocks_in_flight=self.franky_receive_queue.num_continuing_blocks(),
         )
+
+    @override
+    def get_num_allocatable_reqs(
+        self,
+        running_bs: int,
+        beam_width: Optional[int] = None,
+        running_batch: Optional[ScheduleBatch] = None,
+        num_held_rows: int = 0,
+    ) -> int:
+        allocatable = super().get_num_allocatable_reqs(
+            running_bs,
+            beam_width,
+            running_batch=running_batch,
+            num_held_rows=num_held_rows,
+        )
+        if self.franky_num_startable_reqs is None:
+            return allocatable
+        return min(allocatable, num_held_rows + self.franky_num_startable_reqs)
 
     @override
     def abort_request(self, recv_req: AbortReq) -> None:
