@@ -8,6 +8,7 @@ from typing_extensions import override
 from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, is_aborted
+from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
@@ -54,6 +55,7 @@ class SandyScheduler(Scheduler):
         super().init_batch_result_processor()
         self.init_franky_sending()
         self.init_franky_chain_holds()
+        self.init_franky_mamba_room()
         self.init_franky_send_queue()
         self.batch_result_processor = SandyBatchResultProcessor.extend(
             self.batch_result_processor, franky_send_queue=self.franky_send_queue
@@ -85,6 +87,13 @@ class SandyScheduler(Scheduler):
         self.franky_chain_holds = FrankyChainHolds.from_config(
             tree_cache=self.tree_cache, max_total_num_tokens=self.max_total_num_tokens
         )
+
+    def init_franky_mamba_room(self) -> None:
+        self.franky_mamba_room = FrankyMambaRoom.from_engine(
+            req_to_token_pool=self.req_to_token_pool,
+            kv_cache_configurator=self.tp_worker.model_runner.kv_cache_configurator,
+        )
+        self.franky_num_startable_reqs: Optional[int] = None
 
     def init_franky_send_queue(self) -> None:
         pp_size, pp_rank = get_parallel().pp_size, get_parallel().pp_rank
@@ -156,6 +165,7 @@ class SandyScheduler(Scheduler):
         self, prefill_delayer_single_pass, running_batch: ScheduleBatch
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         put_continuations_first(self.waiting_queue)
+        self.franky_num_startable_reqs = self._num_franky_startable_reqs()
         new_batch, running_batch = super()._get_new_batch_prefill_raw(
             prefill_delayer_single_pass, running_batch
         )
@@ -168,6 +178,24 @@ class SandyScheduler(Scheduler):
         return self.franky_chain_holds.chunk_size_for_batch(
             super().get_chunked_prefill_size_for_batch()
         )
+
+    @override
+    def get_num_allocatable_reqs(
+        self,
+        running_bs: int,
+        beam_width: Optional[int] = None,
+        running_batch: Optional[ScheduleBatch] = None,
+        num_held_rows: int = 0,
+    ) -> int:
+        allocatable = super().get_num_allocatable_reqs(
+            running_bs,
+            beam_width,
+            running_batch=running_batch,
+            num_held_rows=num_held_rows,
+        )
+        if self.franky_num_startable_reqs is None:
+            return allocatable
+        return min(allocatable, num_held_rows + self.franky_num_startable_reqs)
 
     @override
     def abort_request(self, recv_req: AbortReq) -> None:
@@ -200,6 +228,13 @@ class SandyScheduler(Scheduler):
     def _handle_end_chain(self, recv_req: FrankyEndChainReq) -> None:
         self.abort_request(AbortReq(rid=recv_req.chain_id))
         self.franky_chain_holds.release(chain_id=recv_req.chain_id)
+
+    def _num_franky_startable_reqs(self) -> Optional[int]:
+        if self.franky_mamba_room is None:
+            return None
+        return self.franky_mamba_room.num_startable_requests(
+            num_pinned_states=len(self.franky_chain_holds.locked_nodes())
+        )
 
     def _waits_without_running(self, running_batch: ScheduleBatch) -> bool:
         return (
