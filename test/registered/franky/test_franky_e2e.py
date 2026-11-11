@@ -53,14 +53,20 @@ def _layer_output(output):
     return output[0] if isinstance(output, tuple) else output
 
 
-def _reader(weights, index, layer_output, taps):
-    """The PR's fixed-query reader on one sequence: token ``p`` reads taps
-    ``0 .. min(p, tap_len - 1)``."""
+def _taps_read(position, *, tap_len, generation_start, block_size):
+    """The reader rule from its definition: up to the token in the prompt, then
+    the taps before the block of the token it predicts."""
+    if block_size is None or position < generation_start:
+        return min(position + 1, tap_len)
+    blocks = (position + 1 - generation_start) // block_size
+    return min(generation_start + blocks * block_size, tap_len)
+
+
+def _reader(weights, index, layer_output, taps, num_taps):
+    """The PR's fixed-query reader on one sequence, token ``p`` reading the first
+    ``num_taps[p]`` taps."""
     prefix = f"readers.{index}."
-    positions = torch.arange(layer_output.shape[0], device=taps.device)
-    visible = (
-        torch.arange(taps.shape[0], device=taps.device)[None] <= positions[:, None]
-    )
+    visible = torch.arange(taps.shape[0], device=taps.device)[None] < num_taps[:, None]
     heads = weights[f"{prefix}queries"].expand(layer_output.shape[0], -1, -1)
     attended = functional.scaled_dot_product_attention(
         heads.transpose(0, 1), taps[None], taps[None], attn_mask=visible
@@ -186,7 +192,7 @@ class TestFrankyEndToEnd(CustomTestCase):
         pairs = answers[self.ricky_url]["meta_info"]["output_token_logprobs"]
         return [pair[1] for pair in pairs], torch.tensor([pair[0] for pair in pairs])
 
-    def _send(self, ids, room, **block):
+    def _send(self, ids, room, ricky_sampling=None, ricky_fields=None, **block):
         franky_room = {
             "bootstrap_host": "127.0.0.1",
             "bootstrap_port": self.bootstrap_port,
@@ -194,7 +200,7 @@ class TestFrankyEndToEnd(CustomTestCase):
         }
         answers = {}
 
-        def post(url, sampling_params):
+        def post(url, sampling_params, fields):
             answers[url] = requests.post(
                 f"{url}/generate",
                 json={
@@ -203,13 +209,14 @@ class TestFrankyEndToEnd(CustomTestCase):
                     "return_logprob": True,
                     "franky_room": franky_room,
                     **block,
+                    **fields,
                 },
                 timeout=600,
             ).json()
 
         threads = [
-            threading.Thread(target=post, args=(self.ricky_url, {"temperature": 0, "max_new_tokens": _NEW_TOKENS})),
-            threading.Thread(target=post, args=(self.sandy_url, {"max_new_tokens": 1})),
+            threading.Thread(target=post, args=(self.ricky_url, ricky_sampling or {"temperature": 0, "max_new_tokens": _NEW_TOKENS}, ricky_fields or {})),
+            threading.Thread(target=post, args=(self.sandy_url, {"max_new_tokens": 1}, {})),
         ]  # fmt: skip
         for thread in threads:
             thread.start()
@@ -217,8 +224,10 @@ class TestFrankyEndToEnd(CustomTestCase):
             thread.join()
         return answers
 
-    def _reference(self, prompts, outputs):
-        """HF logprobs of Ricky's tokens, with the readers and without them."""
+    def _reference(self, prompts, outputs, generation_start=None, block_size=None):
+        """HF logprobs of Ricky's tokens, with the readers and without them. For a
+        chain's later block, ``generation_start`` and ``block_size`` place its
+        earlier blocks in the prompt."""
         model, language_model = _hf_model()
         weights = {name: tensor.cuda() for name, tensor in self.sandy_weights.items()}
         weights.update(
@@ -236,7 +245,9 @@ class TestFrankyEndToEnd(CustomTestCase):
                     return output
                 if state["mode"] == "plain":
                     return output
-                extra = _reader(weights, index, hidden[0], state["taps"][index])
+                extra = _reader(
+                    weights, index, hidden[0], state["taps"][index], state["num_taps"]
+                )
                 hidden = hidden + extra[None]
                 return (hidden, *output[1:]) if isinstance(output, tuple) else hidden
 
@@ -244,7 +255,20 @@ class TestFrankyEndToEnd(CustomTestCase):
         results = []
         with torch.no_grad():
             for ids, (tokens, _) in zip(prompts, outputs):
-                state.update(mode="taps", taps={})
+                num_taps = [
+                    _taps_read(
+                        position,
+                        tap_len=len(ids),
+                        generation_start=generation_start or len(ids),
+                        block_size=block_size,
+                    )
+                    for position in range(len(ids) + len(tokens) - 1)
+                ]
+                state.update(
+                    mode="taps",
+                    taps={},
+                    num_taps=torch.tensor(num_taps, device="cuda"),
+                )
                 language_model(input_ids=torch.tensor([ids], device="cuda"))
                 row = {}
                 for mode in ("readers", "plain"):
@@ -281,15 +305,21 @@ class TestFrankyEndToEnd(CustomTestCase):
             prompt,
             4200,
             rid=f"{chain}-1",
-            franky_chain={"id": chain, "last_block": False},
+            franky_chain={"id": chain, "block_size": _NEW_TOKENS, "last_block": False},
         )
         pairs = first[self.ricky_url]["meta_info"]["output_token_logprobs"]
+        self.assertEqual(len(pairs), _NEW_TOKENS)
         context = prompt + [pair[1] for pair in pairs]
         second = self._send(
             context,
             4201,
             rid=f"{chain}-2",
-            franky_chain={"id": chain, "block": 2, "last_block": True},
+            franky_chain={
+                "id": chain,
+                "block": 2,
+                "block_size": _NEW_TOKENS,
+                "last_block": True,
+            },
         )
 
         whole_chunks = len(prompt) - len(prompt) % _STATE_CHUNK
@@ -300,13 +330,63 @@ class TestFrankyEndToEnd(CustomTestCase):
         pairs = second[self.ricky_url]["meta_info"]["output_token_logprobs"]
         tokens = [pair[1] for pair in pairs]
         logprobs = torch.tensor([pair[0] for pair in pairs])
-        [ref] = self._reference([context], [(tokens, logprobs)])
+        [ref] = self._reference(
+            [context],
+            [(tokens, logprobs)],
+            generation_start=len(prompt),
+            block_size=_NEW_TOKENS,
+        )
         self.assertLess((logprobs - ref["readers"]).abs().max().item(), 0.2)
         for url in (self.sandy_url, self.ricky_url):
             ended = requests.post(
                 f"{url}/franky/end_chain", json={"chain_id": chain}, timeout=60
             )
             self.assertEqual(ended.status_code, 200, url)
+
+    def test_a_next_block_recomputes_the_last_blocks_tokens_as_their_decode_did(self):
+        # A short prompt and a long block make a wrong read show: block 1's last
+        # token would read 47 taps more than the prompt's ones its decode read.
+        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(_TEXT)
+        block_size = 48
+        sampling = {"temperature": 0, "max_new_tokens": block_size, "ignore_eos": True}
+        chain = "chain4300"
+        first = self._send(
+            prompt,
+            4300,
+            ricky_sampling=sampling,
+            rid=f"{chain}-1",
+            franky_chain={"id": chain, "block_size": block_size, "last_block": False},
+        )
+        decoded = first[self.ricky_url]["meta_info"]["output_token_logprobs"]
+        self.assertEqual(len(decoded), block_size)
+        second = self._send(
+            prompt + [pair[1] for pair in decoded],
+            4301,
+            ricky_sampling=sampling,
+            ricky_fields={"logprob_start_len": len(prompt) - 1},
+            rid=f"{chain}-2",
+            franky_chain={
+                "id": chain,
+                "block": 2,
+                "block_size": block_size,
+                "last_block": True,
+            },
+        )
+
+        recomputed = second[self.ricky_url]["meta_info"]["input_token_logprobs"]
+        recomputed = recomputed[-block_size:]
+        self.assertEqual(
+            [pair[1] for pair in recomputed], [pair[1] for pair in decoded]
+        )
+        gap = (
+            torch.tensor([pair[0] for pair in recomputed])
+            - torch.tensor([pair[0] for pair in decoded])
+        ).abs()
+        # Prefill and decode kernels differ by about 0.01 on average here, a few
+        # tokens up to 0.1; reading the block's own taps moves them about 0.07 on
+        # average, some past 0.3.
+        self.assertLess(gap.mean().item(), 0.03, gap.tolist())
+        self.assertLess(gap.max().item(), 0.2, gap.tolist())
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from torch.nn import functional
 
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE
+from sglang.srt.franky.cache.tap_reading import FrankyTapReading
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
 from sglang.srt.franky.parts.reader.query import reader as query_reader
@@ -36,8 +37,9 @@ _READER_LAYERS = [1, 3]
 _PAGE_SIZE = 4
 _CONTEXT = 32
 
-# Request rows: 1 has taps for its whole prompt, 2 for less than it, 3 none.
-_TAP_LENS = {1: 5, 2: 3, 3: 0}
+# Request rows: 1 has taps for its whole prompt, 2 for less than it, 3 none; 4 is
+# block 3 of a chain whose prompt is 5 tokens, in blocks of 4.
+_TAP_LENS = {1: 5, 2: 3, 3: 0, 4: 13}
 
 
 class _LanguageModel(FrankyMixin, nn.Module):
@@ -130,7 +132,7 @@ class _Files(CustomTestCase):
         attention.start()
         self.addCleanup(attention.stop)
         # Row r holds its request's KV slots from slot 8 * r on.
-        self.req_to_token = torch.zeros((4, _CONTEXT), dtype=torch.int32)
+        self.req_to_token = torch.zeros((5, _CONTEXT), dtype=torch.int32)
         for row in _TAP_LENS:
             self.req_to_token[row] = torch.arange(8 * row, 8 * row + _CONTEXT)
 
@@ -200,7 +202,12 @@ class _Files(CustomTestCase):
                     taps=taps,
                     kv_slots=self.req_to_token[row, :tap_len].long(),
                 )
-                parts.tap_cache.set_tap_lens(req_pool_indices=[row], tap_lens=[tap_len])
+                parts.tap_cache.set_readings(
+                    req_pool_indices=[row],
+                    readings=[
+                        FrankyTapReading(tap_len=tap_len, generation_start=tap_len)
+                    ],
+                )
                 self.taps[encoder_id, row] = taps
         return parts
 
@@ -209,7 +216,9 @@ def _extend_batch(*, rows, prefix_lens, extend_lens):
     return SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         req_pool_indices=torch.tensor(rows),
+        req_pool_indices_cpu=torch.tensor(rows),
         extend_prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
+        extend_prefix_lens_cpu=list(prefix_lens),
         extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32),
         extend_seq_lens_cpu=list(extend_lens),
     )
@@ -278,6 +287,47 @@ class TestReaders(_Files):
 
     def test_fixed_queries_add_the_pr_result(self):
         self._check_extend(reader_type="fixed_query")
+
+    def test_a_later_blocks_tokens_read_the_taps_before_their_block(self):
+        """Row 4's tokens 5..8 came from block 1 and 9..12 from block 2. Each
+        token reads the taps before the block of the token it predicts, as that
+        block's decode did; token 12 predicts block 3's first token.
+        """
+        config_path, weights_path, weights = self._write(reader_type="residual_query")
+        model = _Model()
+        parts = self._attach(
+            model=model, config_path=config_path, weights_path=weights_path
+        )
+        parts.tap_cache.set_readings(
+            req_pool_indices=[4],
+            readings=[FrankyTapReading(tap_len=13, generation_start=5, block_size=4)],
+        )
+        layer_output = torch.randn(10, _HIDDEN_SIZE)
+
+        hidden_states, _ = model.model.franky_after_layer_with_residual(
+            layer_idx=0,
+            hidden_states=layer_output,
+            residual=None,
+            forward_batch=_extend_batch(rows=[4], prefix_lens=[3], extend_lens=[10]),
+        )
+
+        queries = functional.linear(
+            layer_output, weights["readers.0.query_projection.weight"]
+        ).view(10, _NUM_QUERIES, _TAP_SIZE)
+        visible = (
+            torch.arange(13)[None, :]
+            < torch.tensor([4, 5, 5, 5, 5, 9, 9, 9, 9, 13])[:, None]
+        )
+        expected = _pr_query_reader(
+            queries=queries.to(TAP_DTYPE),
+            taps=self.taps[0, 4],
+            visible=visible,
+            weights=weights,
+            prefix="readers.0.",
+        )
+        torch.testing.assert_close(
+            hidden_states - layer_output, expected, atol=2e-3, rtol=2e-3
+        )
 
     def test_residual_queries_add_the_pr_result(self):
         self._check_extend(reader_type="residual_query")

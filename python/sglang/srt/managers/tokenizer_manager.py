@@ -1610,7 +1610,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     else None
                 ),
                 franky_chain=(
-                    FrankyChain.from_request(franky_chain=obj.franky_chain, rid=obj.rid)
+                    FrankyChain.from_request(
+                        franky_chain=obj.franky_chain,
+                        rid=obj.rid,
+                        prompt_len=len(input_ids_arr or ()),
+                    )
                     if obj.franky_chain is not None
                     else None
                 ),

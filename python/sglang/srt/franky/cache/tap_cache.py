@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import itertools
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
-from torch.nn import functional
 
+from sglang.srt.franky.cache.tap_reading import FrankyTapReading
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
@@ -86,6 +88,9 @@ class FrankyTapCache:
         self._tap_lens = torch.zeros(
             req_to_token.shape[0], dtype=torch.int32, device=device
         )
+        self._readings = [
+            FrankyTapReading(tap_len=0, generation_start=0)
+        ] * req_to_token.shape[0]
         # One more page, as in the KV pool: padded tokens write to page 0, and
         # padded requests read its zeros.
         self._buffers = {
@@ -119,47 +124,26 @@ class FrankyTapCache:
     ) -> None:
         self._buffers[encoder_id][self.slots_of(kv_slots=kv_slots)] = taps
 
-    def set_tap_lens(self, *, req_pool_indices: list[int], tap_lens: list[int]) -> None:
+    def set_readings(
+        self, *, req_pool_indices: list[int], readings: list[FrankyTapReading]
+    ) -> None:
         device = self._tap_lens.device
         rows = async_h2d(req_pool_indices, dtype=torch.int64, device=device)
-        self._tap_lens[rows] = async_h2d(tap_lens, dtype=torch.int32, device=device)
+        self._tap_lens[rows] = async_h2d(
+            [reading.tap_len for reading in readings], dtype=torch.int32, device=device
+        )
+        for row, reading in zip(req_pool_indices, readings):
+            self._readings[row] = reading
 
     def view(self, *, encoder_id: int, forward_batch: ForwardBatch) -> TapView:
-        """Token ``p`` of a request with ``tap_len`` taps reads taps
-        ``0 .. min(p, tap_len - 1)``.
-        """
-        req_pool_indices = forward_batch.req_pool_indices
+        """Each token reads the taps its request's ``FrankyTapReading`` gives it."""
         if forward_batch.forward_mode.is_decode_or_idle():
             return self._one_token_view(
                 encoder_id=encoder_id,
-                req_pool_indices=req_pool_indices,
+                req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
             )
-        taps = self._buffers[encoder_id].view(-1, self.page_size, 1, self._output_size)
-        page_table = self._page_table(req_pool_indices)
-        tap_lens = self._tap_lens[req_pool_indices]
-        first_positions = forward_batch.extend_prefix_lens
-        extend_lens = forward_batch.extend_seq_lens
-        within = (tap_lens - first_positions).clamp(min=0).minimum(extend_lens)
-        past = extend_lens - within
-        zero = torch.zeros_like(within)
-        sequence_lens = torch.stack([within, past], dim=1).flatten()
-        return TapView(
-            taps=taps,
-            page_table=page_table.repeat_interleave(2, dim=0),
-            cu_seqlens_q=functional.pad(sequence_lens.cumsum(0), (1, 0)).to(
-                torch.int32
-            ),
-            max_seqlen_q=max(forward_batch.extend_seq_lens_cpu, default=0),
-            causal_lens=torch.stack([first_positions + within, zero], dim=1)
-            .flatten()
-            .to(torch.int32),
-            full_lens=torch.stack([zero, torch.where(past > 0, tap_lens, zero)], dim=1)
-            .flatten()
-            .to(torch.int32),
-            num_tokens=sum(forward_batch.extend_seq_lens_cpu),
-            trtllm_workspace=self._attention_workspace,
-        )
+        return self._extend_view(encoder_id=encoder_id, forward_batch=forward_batch)
 
     def view_past_the_taps(
         self, *, encoder_id: int, req_pool_indices: torch.Tensor
@@ -167,6 +151,49 @@ class FrankyTapCache:
         """One token per request, at or past its last tap: it reads all taps."""
         return self._one_token_view(
             encoder_id=encoder_id, req_pool_indices=req_pool_indices, seq_lens=None
+        )
+
+    def _extend_view(self, *, encoder_id: int, forward_batch: ForwardBatch) -> TapView:
+        runs, run_requests = [], []
+        for index, (row, first_position, num_tokens) in enumerate(
+            zip(
+                _on_host(
+                    forward_batch.req_pool_indices_cpu, forward_batch.req_pool_indices
+                ),
+                _on_host(
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_prefix_lens,
+                ),
+                forward_batch.extend_seq_lens_cpu,
+            )
+        ):
+            request_runs = self._readings[row].runs(
+                first_position=first_position, num_tokens=num_tokens
+            )
+            runs += request_runs
+            run_requests += [index] * len(request_runs)
+        device = self._tap_lens.device
+        run_lens = [run.num_tokens for run in runs]
+        page_table = self._page_table(forward_batch.req_pool_indices)
+        return TapView(
+            taps=self._buffers[encoder_id].view(
+                -1, self.page_size, 1, self._output_size
+            ),
+            page_table=page_table[
+                async_h2d(run_requests, dtype=torch.int64, device=device)
+            ],
+            cu_seqlens_q=async_h2d(
+                [0, *itertools.accumulate(run_lens)], dtype=torch.int32, device=device
+            ),
+            max_seqlen_q=max(run_lens, default=0),
+            causal_lens=async_h2d(
+                [run.causal_len for run in runs], dtype=torch.int32, device=device
+            ),
+            full_lens=async_h2d(
+                [run.full_len for run in runs], dtype=torch.int32, device=device
+            ),
+            num_tokens=sum(run_lens),
+            trtllm_workspace=self._attention_workspace,
         )
 
     def _one_token_view(
@@ -198,3 +225,11 @@ class FrankyTapCache:
         return (
             self._req_to_token[req_pool_indices, :: self.page_size] // self.page_size
         ).to(torch.int32)
+
+
+def _on_host(
+    host: Optional[Sequence[int] | torch.Tensor], device: torch.Tensor
+) -> list[int]:
+    # The prefill graph's warmup and capture batches keep these on the device only.
+    values = device if host is None else host
+    return values.tolist() if isinstance(values, torch.Tensor) else list(values)

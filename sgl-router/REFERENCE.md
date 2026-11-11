@@ -427,8 +427,9 @@ in the next block:
 - Block `k` sends the prompt and every token of blocks `1..k-1` as `input_ids`
   to the Sandy and the Ricky that answered block 1 (a failed attempt retries as
   usual). Its rid is `{chain}-{k}`, and `franky_chain` carries the chain id, the
-  block number `k`, and whether this is the last block the total
-  `max_new_tokens` allows.
+  block number `k`, the block size, and whether this is the last block the total
+  `max_new_tokens` allows. Ricky uses the block size to recompute a block's
+  tokens with the taps its decode read: those before the block.
 - The chain goes on while Ricky's block ends at the block's token limit. The
   client gets one response: frames continue across blocks, `meta_info` keeps
   the first block's prompt fields and adds up the counts, and the chain's id

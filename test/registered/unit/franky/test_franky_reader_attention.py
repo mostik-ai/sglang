@@ -1,7 +1,8 @@
 """Ricky's reader attention runs on FlashAttention's paged KV cache. For any mix
-of requests it must read exactly the taps the reader rule allows: token ``p`` of
-a request with ``tap_len`` taps reads taps ``0 .. min(p, tap_len - 1)``. That
-holds for tokens past the last tap, requests without taps, padded tokens, and a
+of requests it must read exactly the taps the reader rule allows: a prompt token
+reads up to its own tap, and a later token the taps before the block of the token
+it predicts, never past the request's last tap. That holds for tokens past the
+last tap, a chain's later blocks, requests without taps, padded tokens, and a
 decode CUDA graph replayed with other requests.
 """
 
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
+from sglang.srt.franky.cache.tap_reading import FrankyTapReading
 from sglang.srt.franky.parts.reader.query.reader import (
     _attend_taps,
     attention_workspace,
@@ -27,15 +29,23 @@ _CONTEXT = 256
 _NUM_ROWS = 6
 
 
-def _reference_token_by_token(*, tap_cache, queries, rows, positions):
+def _taps_read(position, reading):
+    """The rule, token by token, from its definition."""
+    if reading.block_size is None or position < reading.generation_start:
+        return min(position + 1, reading.tap_len)
+    blocks = (position + 1 - reading.generation_start) // reading.block_size
+    block_start = reading.generation_start + blocks * reading.block_size
+    return min(block_start, reading.tap_len)
+
+
+def _reference_token_by_token(*, tap_cache, queries, rows, num_taps):
     taps = tap_cache._buffers[0].float()
     out = torch.zeros(queries.shape, dtype=torch.float32, device="cuda")
     has_taps = torch.zeros(queries.shape[0], device="cuda")
-    for token, (row, position) in enumerate(zip(rows, positions)):
-        last_tap = min(position, int(tap_cache._tap_lens[row]) - 1)
-        if last_tap < 0:
+    for token, (row, num_read) in enumerate(zip(rows, num_taps)):
+        if num_read == 0:
             continue
-        values = taps[tap_cache._req_to_token[row, : last_tap + 1].long()]
+        values = taps[tap_cache._req_to_token[row, :num_read].long()]
         weights = torch.softmax(
             queries[token].float() @ values.T * queries.shape[-1] ** -0.5, dim=-1
         )
@@ -85,9 +95,9 @@ class TestReaderAttention(CustomTestCase):
         )
         return queries, attended, has_taps
 
-    def _assert_matches(self, *, queries, attended, has_taps, rows, positions):
+    def _assert_matches(self, *, queries, attended, has_taps, rows, num_taps):
         expected, expected_has_taps = _reference_token_by_token(
-            tap_cache=self.tap_cache, queries=queries, rows=rows, positions=positions
+            tap_cache=self.tap_cache, queries=queries, rows=rows, num_taps=num_taps
         )
         num_tokens = len(rows)
         torch.testing.assert_close(
@@ -103,35 +113,54 @@ class TestReaderAttention(CustomTestCase):
     def test_extend_reads_what_the_rule_allows(self):
         # Row 1 runs its whole prompt; row 2 crosses its last tap; row 3 runs only
         # past it, as a retracted request does; row 4 has no taps; row 5 runs a
-        # chunk inside its taps.
-        tap_lens = {1: 70, 2: 40, 3: 30, 4: 0, 5: 200}
-        prefix_lens, extend_lens = [0, 30, 35, 0, 120], [70, 50, 9, 5, 64]
-        self.tap_cache.set_tap_lens(
-            req_pool_indices=list(tap_lens), tap_lens=list(tap_lens.values())
+        # chunk inside its taps; row 6 is block 6 of a chain whose prompt is 40
+        # tokens, in blocks of 32, recomputed from inside its prompt.
+        readings = {
+            1: FrankyTapReading(tap_len=70, generation_start=70),
+            2: FrankyTapReading(tap_len=40, generation_start=40),
+            3: FrankyTapReading(tap_len=30, generation_start=30),
+            4: FrankyTapReading(tap_len=0, generation_start=0),
+            5: FrankyTapReading(tap_len=200, generation_start=200),
+            6: FrankyTapReading(tap_len=200, generation_start=40, block_size=32),
+        }
+        prefix_lens, extend_lens = [0, 30, 35, 0, 120, 30], [70, 50, 9, 5, 64, 175]
+        self.tap_cache.set_readings(
+            req_pool_indices=list(readings), readings=list(readings.values())
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
-            req_pool_indices=torch.tensor(list(tap_lens), device="cuda"),
+            req_pool_indices=torch.tensor(list(readings), device="cuda"),
+            req_pool_indices_cpu=torch.tensor(list(readings)),
             extend_prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32).cuda(),
+            extend_prefix_lens_cpu=prefix_lens,
             extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32).cuda(),
             extend_seq_lens_cpu=extend_lens,
         )
-        rows, positions = [], []
-        for row, prefix_len, extend_len in zip(tap_lens, prefix_lens, extend_lens):
+        rows, num_taps = [], []
+        for (row, reading), prefix_len, extend_len in zip(
+            readings.items(), prefix_lens, extend_lens
+        ):
             rows += [row] * extend_len
-            positions += range(prefix_len, prefix_len + extend_len)
+            num_taps += [
+                _taps_read(position, reading)
+                for position in range(prefix_len, prefix_len + extend_len)
+            ]
         queries, attended, has_taps = self._run(batch=batch, num_tokens=len(rows) + 6)
         self._assert_matches(
             queries=queries,
             attended=attended,
             has_taps=has_taps,
             rows=rows,
-            positions=positions,
+            num_taps=num_taps,
         )
 
     def test_a_decode_cuda_graph_replays_with_other_requests(self):
-        self.tap_cache.set_tap_lens(
-            req_pool_indices=[1, 2, 3, 4], tap_lens=[70, 40, 0, 12]
+        self.tap_cache.set_readings(
+            req_pool_indices=[1, 2, 3, 4],
+            readings=[
+                FrankyTapReading(tap_len=tap_len, generation_start=tap_len)
+                for tap_len in (70, 40, 0, 12)
+            ],
         )
         req_pool_indices = torch.tensor([1, 2, 3], device="cuda")
         seq_lens = torch.tensor([90, 20, 5], device="cuda")
@@ -170,7 +199,7 @@ class TestReaderAttention(CustomTestCase):
             attended=attended,
             has_taps=has_taps,
             rows=[4, 1, 3],
-            positions=[2, 199, 8],
+            num_taps=[3, 70, 0],
         )
 
 
