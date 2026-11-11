@@ -1069,6 +1069,7 @@ class Req(ReqDllmMixin):
         bootstrap_room: Optional[int] = None,
         franky_room: Optional[FrankyRoom] = None,
         franky_chain: Optional[FrankyChain] = None,
+        franky_generated_spans: tuple[tuple[int, int], ...] = (),
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1419,6 +1420,7 @@ class Req(ReqDllmMixin):
         self.franky: Optional[FrankyReqState] = None
         self.franky_room: Optional[FrankyRoom] = franky_room
         self.franky_chain: Optional[FrankyChain] = franky_chain
+        self.franky_generated_spans = franky_generated_spans
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank

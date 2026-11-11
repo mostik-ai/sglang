@@ -72,6 +72,7 @@ class RickyDecodeScheduler(Scheduler):
                             else 0
                         ),
                         chain=req.franky_chain,
+                        earlier_answers=req.franky_generated_spans,
                     )
                     for req in batch.reqs
                 ],

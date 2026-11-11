@@ -1,6 +1,10 @@
 import unittest
 
-from sglang.srt.franky.cache.tap_reading import FrankyTapReading, TapRun
+from sglang.srt.franky.cache.tap_reading import (
+    FrankyTapReading,
+    TapRun,
+    check_earlier_answers,
+)
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -63,6 +67,49 @@ class TestFrankyTapReading(CustomTestCase):
             FrankyTapReading.of(tap_len=356, chain=None),
             FrankyTapReading(tap_len=356, generation_start=356),
         )
+
+    def test_a_later_turn_rereads_an_earlier_answer_as_its_decode_did(self):
+        """Tokens 11..19 of the earlier answer were made from taps 0..9; the
+        answer's last token and the tool output after it read up to themselves."""
+        reading = FrankyTapReading.of(
+            tap_len=30, chain=None, earlier_answers=((10, 20),)
+        )
+
+        runs = reading.runs(first_position=0, num_tokens=40)
+
+        self.assertEqual(
+            runs, [_causal(10, 10), _full(9, 10), _causal(11, 30), _full(10, 30)]
+        )
+
+    def test_each_earlier_answer_keeps_the_blocks_it_was_cut_into(self):
+        chain = FrankyChain(id="c", block=2, block_size=8)
+        reading = FrankyTapReading.of(
+            tap_len=50, chain=chain, earlier_answers=((10, 30),)
+        )
+
+        runs = reading.runs(first_position=0, num_tokens=50)
+
+        self.assertEqual(
+            runs,
+            [
+                _causal(10, 10),
+                _full(7, 10),
+                _full(8, 18),
+                _full(4, 26),
+                _causal(13, 42),
+                _full(7, 42),
+                _full(1, 50),
+            ],
+        )
+
+    def test_earlier_answers_must_be_runs_in_order_inside_the_prompt(self):
+        self.assertEqual(
+            check_earlier_answers([[2, 5], [7, 9]], generation_start=12),
+            ((2, 5), (7, 9)),
+        )
+        for answers in ([[0, 3]], [[2, 5], [4, 6]], [[2, 2]], [[8, 13]], [[5, 3]]):
+            with self.subTest(answers=answers), self.assertRaises(ValueError):
+                check_earlier_answers(answers, generation_start=12)
 
 
 if __name__ == "__main__":
