@@ -19,6 +19,23 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 
 ## Discovery and KV signals
 
+### Workers added at run time
+
+With `--worker-api`, clients add and remove workers over HTTP, as Miles
+registers the engines it launches. The router may then start without
+`--worker-urls`; the flag conflicts with `--service-discovery`.
+
+- `POST /workers` takes `{"url", "worker_type", "bootstrap_port"}`, where
+  `worker_type` is `regular` (the default), `prefill` or `decode`. The worker's
+  role (Sandy included) and models come from its `/server_info`, as for a static
+  URL. The router answers `{"id", "url"}` once it routes to the worker, and
+  `500` when that takes over two minutes.
+- `GET /workers` lists every registered worker, static or added, with its `id`,
+  `url`, `mode` and `model_ids`.
+- `DELETE /workers/{id}` asks the router to remove that worker, and answers
+  before the worker leaves the registry.
+- Without `--worker-api`, `POST` and `DELETE` get `400`.
+
 ### PD version groups
 
 To run two engine versions side by side in PD mode (e.g. during a rollout),
