@@ -31,7 +31,23 @@ pub use peers::{peer_address_family, spawn_peer_watch, AddressFamily};
 ///   server-side watch in PD mode is unfiltered (label selectors for the
 ///   two roles may not be mergeable into one Kubernetes selector), so this
 ///   client-side classification is the gate that drops irrelevant slices.
-fn classify_mode(es: &EndpointSlice, mode: &K8sDiscoveryMode) -> Option<WorkerMode> {
+///
+/// A slice matching `sandy_selector` is a Sandy first. With one, plain mode
+/// also matches its selector client-side, since the watch is unfiltered.
+fn classify_mode(
+    es: &EndpointSlice,
+    mode: &K8sDiscoveryMode,
+    sandy_selector: Option<&str>,
+) -> Option<WorkerMode> {
+    if let Some(sandy) = sandy_selector {
+        let labels = es.metadata.labels.as_ref().cloned().unwrap_or_default();
+        if labels_match_selector(&labels, sandy) {
+            return Some(WorkerMode::Sandy);
+        }
+        if let K8sDiscoveryMode::Plain { label_selector } = mode {
+            return labels_match_selector(&labels, label_selector).then_some(WorkerMode::Plain);
+        }
+    }
     match mode {
         K8sDiscoveryMode::Plain { .. } => Some(WorkerMode::Plain),
         K8sDiscoveryMode::PdDisaggregation {
@@ -287,6 +303,7 @@ async fn process_events<S>(
     tx: mpsc::Sender<DiscoveryEvent>,
     mode: K8sDiscoveryMode,
     version_group_label: Option<String>,
+    sandy_selector: Option<String>,
 ) where
     S: Stream<Item = Result<watcher::Event<EndpointSlice>, watcher::Error>> + Unpin,
 {
@@ -298,8 +315,9 @@ async fn process_events<S>(
         es: &EndpointSlice,
         mode: &K8sDiscoveryMode,
         version_group_label: Option<&str>,
+        sandy_selector: Option<&str>,
     ) -> HashMap<WorkerId, WorkerSpec> {
-        let Some(wm) = classify_mode(es, mode) else {
+        let Some(wm) = classify_mode(es, mode, sandy_selector) else {
             return HashMap::new();
         };
         let group = version_group(es, version_group_label);
@@ -320,7 +338,12 @@ async fn process_events<S>(
             }
             Ok(watcher::Event::InitApply(es)) => {
                 let key = slice_key(&es);
-                let workers = workers_for_slice(&es, &mode, version_group_label.as_deref());
+                let workers = workers_for_slice(
+                    &es,
+                    &mode,
+                    version_group_label.as_deref(),
+                    sandy_selector.as_deref(),
+                );
                 if let Some(buf) = init_buffer.as_mut() {
                     buf.insert(key, workers);
                     Ok(())
@@ -340,7 +363,12 @@ async fn process_events<S>(
             }
             Ok(watcher::Event::Apply(es)) => {
                 let key = slice_key(&es);
-                let workers = workers_for_slice(&es, &mode, version_group_label.as_deref());
+                let workers = workers_for_slice(
+                    &es,
+                    &mode,
+                    version_group_label.as_deref(),
+                    sandy_selector.as_deref(),
+                );
                 per_slice.insert(key, workers);
                 emit_diff(&tx, &per_slice, &mut prev_union).await
             }
@@ -407,6 +435,7 @@ pub async fn spawn(
         mode,
         peer_selector: _,
         version_group_label,
+        sandy_selector,
     } = cfg;
 
     let api = endpoint_slice_api(&namespace)
@@ -418,9 +447,10 @@ pub async fn spawn(
     // because the prefill/decode selectors may not be expressible as one
     // K8s label-selector — classification happens client-side per slice
     // via `classify_mode`.
-    let server_side_selector = match &mode {
-        K8sDiscoveryMode::Plain { label_selector } => label_selector.clone(),
-        K8sDiscoveryMode::PdDisaggregation { .. } => String::new(),
+    // A Sandy selector also leaves it empty: a Sandy slice need not match `--selector`.
+    let server_side_selector = match (&mode, &sandy_selector) {
+        (K8sDiscoveryMode::Plain { label_selector }, None) => label_selector.clone(),
+        _ => String::new(),
     };
     let watcher_cfg = watcher::Config::default().labels(&server_side_selector);
 
@@ -450,11 +480,14 @@ pub async fn spawn(
             "k8s discovery starting (PD mode); a wrong namespace or selector matches zero EndpointSlices"
         ),
     }
+    if let Some(sandy_selector) = &sandy_selector {
+        tracing::info!(%sandy_selector, "k8s discovery also watches Sandy workers");
+    }
 
     let handle = tokio::spawn(async move {
         let stream = watcher(api, watcher_cfg);
         tokio::pin!(stream);
-        process_events(stream, tx, mode, version_group_label).await;
+        process_events(stream, tx, mode, version_group_label, sandy_selector).await;
     });
     Ok(handle)
 }
@@ -549,7 +582,10 @@ mod tests {
     #[test]
     fn classify_mode_plain_returns_some_plain_for_any_slice() {
         let s = make_slice(&["10.0.0.1"], 30000, true);
-        assert_eq!(classify_mode(&s, &plain_mode()), Some(WorkerMode::Plain));
+        assert_eq!(
+            classify_mode(&s, &plain_mode(), None),
+            Some(WorkerMode::Plain)
+        );
     }
 
     #[test]
@@ -560,7 +596,10 @@ mod tests {
             true,
             &[("app", "sglang"), ("role", "prefill")],
         );
-        assert_eq!(classify_mode(&s, &pd_mode()), Some(WorkerMode::Prefill));
+        assert_eq!(
+            classify_mode(&s, &pd_mode(), None),
+            Some(WorkerMode::Prefill)
+        );
     }
 
     #[test]
@@ -571,7 +610,10 @@ mod tests {
             true,
             &[("app", "sglang"), ("role", "decode")],
         );
-        assert_eq!(classify_mode(&s, &pd_mode()), Some(WorkerMode::Decode));
+        assert_eq!(
+            classify_mode(&s, &pd_mode(), None),
+            Some(WorkerMode::Decode)
+        );
     }
 
     #[test]
@@ -582,12 +624,37 @@ mod tests {
             true,
             &[("app", "sglang"), ("role", "router")],
         );
-        assert!(classify_mode(&s, &pd_mode()).is_none());
+        assert!(classify_mode(&s, &pd_mode(), None).is_none());
 
         // No labels at all => still None in PD mode (every selector term
         // requires a key/value).
         let s = make_slice(&["10.0.0.1"], 30000, true);
-        assert!(classify_mode(&s, &pd_mode()).is_none());
+        assert!(classify_mode(&s, &pd_mode(), None).is_none());
+    }
+
+    /// A Sandy slice is a Sandy in either mode, even when it also matches the
+    /// plain selector; with a Sandy selector, plain mode drops other slices.
+    #[test]
+    fn classify_mode_finds_sandy_slices_in_either_mode() {
+        let labels = |role| [("app", "sglang"), ("role", role)];
+        let slice = |role| make_slice_with_labels(&["10.0.0.1"], 30000, true, &labels(role));
+        let sandy = Some("app=sglang,role=sandy");
+        for mode in [plain_mode(), pd_mode()] {
+            assert_eq!(
+                classify_mode(&slice("sandy"), &mode, sandy),
+                Some(WorkerMode::Sandy)
+            );
+        }
+        assert_eq!(
+            classify_mode(&slice("prefill"), &pd_mode(), sandy),
+            Some(WorkerMode::Prefill)
+        );
+        assert_eq!(
+            classify_mode(&slice("ricky"), &plain_mode(), sandy),
+            Some(WorkerMode::Plain)
+        );
+        let other = make_slice_with_labels(&["10.0.0.1"], 30000, true, &[("app", "other")]);
+        assert_eq!(classify_mode(&other, &plain_mode(), sandy), None);
     }
 
     #[test]
@@ -701,7 +768,7 @@ mod tests {
         ];
         let (tx, mut rx) = mpsc::channel(16);
         let stream = futures::stream::iter(events);
-        process_events(stream, tx, plain_mode(), None).await;
+        process_events(stream, tx, plain_mode(), None, None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -729,7 +796,7 @@ mod tests {
             Ok(watcher::Event::InitDone),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, plain_mode(), None).await;
+        process_events(futures::stream::iter(events), tx, plain_mode(), None, None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -763,7 +830,7 @@ mod tests {
         }));
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let handle = tokio::spawn(process_events(events, tx, plain_mode(), None));
+        let handle = tokio::spawn(process_events(events, tx, plain_mode(), None, None));
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("process_events must exit promptly when consumer drops")
@@ -782,7 +849,7 @@ mod tests {
             Ok(watcher::Event::Apply(s)),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, plain_mode(), None).await;
+        process_events(futures::stream::iter(events), tx, plain_mode(), None, None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -828,7 +895,7 @@ mod tests {
             Ok(watcher::Event::Apply(unrelated_slice)),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, pd_mode(), None).await;
+        process_events(futures::stream::iter(events), tx, pd_mode(), None, None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -869,7 +936,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel(16);
         let label = Some("sglang.ai/version-group".into());
-        process_events(futures::stream::iter(events), tx, pd_mode(), label).await;
+        process_events(futures::stream::iter(events), tx, pd_mode(), label, None).await;
         let mut groups = Vec::new();
         while let Ok(DiscoveryEvent::Added(spec)) = rx.try_recv() {
             groups.push((spec.url, spec.version_group));
@@ -1040,7 +1107,7 @@ mod tests {
         ];
         let producer = tokio::spawn(async move {
             let stream = futures::stream::iter(events);
-            process_events(stream, dtx, pd_mode(), None).await;
+            process_events(stream, dtx, pd_mode(), None, None).await;
         });
 
         // Poll the registry until all four workers are present with
@@ -1159,6 +1226,7 @@ mod tests {
             tx,
             plain_mode(),
             None,
+            None,
         )
         .await;
         let mut events = Vec::new();
@@ -1237,6 +1305,7 @@ mod tests {
             ]),
             tx,
             plain_mode(),
+            None,
             None,
         )
         .await;
@@ -1385,7 +1454,7 @@ mod tests {
         // Drive the ready=true slice through the real discovery processor.
         let producer = tokio::spawn(async move {
             let stream = futures::stream::iter(vec![Ok(watcher::Event::Apply(slice))]);
-            process_events(stream, dtx, plain_mode(), None).await;
+            process_events(stream, dtx, plain_mode(), None, None).await;
         });
 
         // No target_ref on the endpoint => id falls back to ns/slice/addr:port.

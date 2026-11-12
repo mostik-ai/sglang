@@ -121,7 +121,8 @@ impl PdPoolResolver {
     /// transient health state.
     pub fn resolve(&self, model: &ModelId) -> Result<PdPools, PdResolveError> {
         let mut all = self.workers.healthy_workers_for(model);
-        all.retain(|w| !self.excluded.contains(&w.id));
+        // A Sandy is picked apart, for the Ricky worker that needs its taps.
+        all.retain(|w| !self.excluded.contains(&w.id) && w.mode() != WorkerMode::Sandy);
         if all.is_empty() {
             // No healthy workers — distinguish "model never registered"
             // (true 404-ish, operator misconfiguration) from "PD model
@@ -148,6 +149,7 @@ impl PdPoolResolver {
                 WorkerMode::Prefill => prefill.push(w),
                 WorkerMode::Decode => decode.push(w),
                 WorkerMode::Plain => plain.push(w),
+                WorkerMode::Sandy => {}
             }
         }
         // PD-mode iff any prefill OR any decode worker exists. Mixing

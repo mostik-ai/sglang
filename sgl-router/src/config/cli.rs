@@ -9,7 +9,7 @@ use reqwest::header::HeaderValue;
 use std::num::NonZeroU32;
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
-use crate::config::types::is_selector_empty;
+use crate::config::types::{is_selector_empty, resolve_sandy_selector};
 use crate::config::{
     default_cb_cool_down, default_cb_threshold, default_host, default_port,
     default_proxy_request_timeout_secs, default_shutdown_drain_secs,
@@ -172,6 +172,13 @@ pub struct ServerArgs {
     /// PD: return decode's stream only once prefill completes, as sgl-model-gateway does.
     #[arg(long)]
     pub pd_stream_after_prefill: bool,
+    /// Franky: run each request as blocks of at most N generated tokens on one
+    /// Sandy and one Ricky. Every block sends the prompt and all tokens generated
+    /// so far, so a block's tokens read their own taps in the next block. Needs
+    /// token ids (`input_ids`, or text the router tokenizes) and a single
+    /// sequence; unset runs each request in one block.
+    #[arg(long)]
+    pub franky_block_size: Option<NonZeroU32>,
 
     /// PD: at most N requests per prefill DP rank go to decode before their
     /// first token; the rest wait and get their decode DP rank when sent.
@@ -222,6 +229,11 @@ pub struct DiscoveryArgs {
     /// Decode equality selector terms (key=value or key==value). Requires --prefill-selector.
     #[arg(long, num_args = 1..)]
     pub decode_selector: Vec<String>,
+
+    /// Sandy equality selector terms (key=value or key==value), with --selector
+    /// or the PD selectors. With --selector, that selector must use equality terms too.
+    #[arg(long, num_args = 1..)]
+    pub sandy_selector: Vec<String>,
 
     /// Label selector matching the EndpointSlices of this router's OWN Service
     /// (the Service's labels, not the pods'), so a booting replica can find
@@ -688,6 +700,7 @@ impl Cli {
                 max_backoff_ms: self.server.retry_max_backoff_ms,
                 decode_dispatch_limit: self.server.decode_dispatch_limit,
                 stream_after_prefill: self.server.pd_stream_after_prefill,
+                franky_block_size: self.server.franky_block_size,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -722,9 +735,11 @@ impl DiscoveryArgs {
                         && self.selector.is_empty()
                         && self.prefill_selector.is_empty()
                         && self.decode_selector.is_empty()
+                        && self.sandy_selector.is_empty()
                         && self.pd_version_group_label.is_none(),
                     "--service-discovery-namespace / --selector / --prefill-selector / \
-                         --decode-selector / --pd-version-group-label require --service-discovery"
+                         --decode-selector / --sandy-selector / --pd-version-group-label \
+                         require --service-discovery"
                 );
                 // Peer replicas are found through EndpointSlices too, so with
                 // any other backend the flag would be accepted and then
@@ -764,11 +779,14 @@ impl DiscoveryArgs {
                     "--kv-peer-selector must not be empty: an empty selector matches \
                      every EndpointSlice in the watched namespace"
                 );
+                let sandy_selector =
+                    resolve_sandy_selector(&mode, join_selector(&self.sandy_selector).as_deref())?;
                 DiscoveryBackend::K8s(K8sDiscoveryConfig {
                     namespace: self.service_discovery_namespace.unwrap_or_default(),
                     mode,
                     peer_selector: self.kv_peer_selector,
                     version_group_label,
+                    sandy_selector,
                 })
             }
         };
@@ -3200,7 +3218,7 @@ mod tests {
                 file.path().to_str().unwrap(),
             ]))?;
             let state = crate::state::kv_events::KvEventIndex::new();
-            let (resolver, _) =
+            let (resolver, _, _) =
                 crate::policies_reorg::factory::build_resolver(&config.model, &state, None)?;
             Ok(resolver)
         }

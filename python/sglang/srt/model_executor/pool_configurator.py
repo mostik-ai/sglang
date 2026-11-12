@@ -31,6 +31,7 @@ from sglang.srt.configs.model_config import (
     uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
+from sglang.srt.franky.cache.kv_options import FrankyKvOptions
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -336,6 +337,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
+
+        if isinstance(kvc.franky_kv_options, FrankyKvOptions):
+            self._cell_size += kvc.franky_kv_options.tap_bytes_per_token
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""

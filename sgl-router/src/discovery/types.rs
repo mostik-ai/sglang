@@ -25,9 +25,9 @@ impl std::fmt::Display for ModelId {
     }
 }
 
-/// Prefill/Decode/Plain role of a worker.
+/// Prefill/Decode/Plain role of a worker, or Sandy.
 ///
-/// Serialises as `"plain"`, `"prefill"`, `"decode"` (snake_case).
+/// Serialises as `"plain"`, `"prefill"`, `"decode"`, `"sandy"` (snake_case).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerMode {
@@ -35,6 +35,9 @@ pub enum WorkerMode {
     Plain,
     Prefill,
     Decode,
+    /// The frozen model of a Franky pair: it computes a prompt's taps and sends
+    /// them to the Ricky worker that serves the request, and never decodes.
+    Sandy,
 }
 
 /// Immutable worker description emitted by a discovery backend.
@@ -51,7 +54,9 @@ pub enum WorkerMode {
 /// bootstrap server. The router copies the selected prefill worker's
 /// `bootstrap_host`/`bootstrap_port` plus a random `bootstrap_room`
 /// u64 onto every PD-disagg request body so the prefill engine can
-/// match incoming KV-transfer requests from the decode peer.
+/// match incoming KV-transfer requests from the decode peer. A Sandy
+/// worker's is its tap bootstrap port (`--franky-bootstrap-port`), sent
+/// the same way as the `franky_room` of the Ricky requests it serves.
 ///
 /// `version_group` scopes PD pairing: a prefill worker is only paired
 /// with a decode worker whose `version_group` is equal, so two engine
@@ -160,6 +165,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&WorkerMode::Decode).unwrap(),
             "\"decode\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkerMode::Sandy).unwrap(),
+            "\"sandy\""
         );
     }
 

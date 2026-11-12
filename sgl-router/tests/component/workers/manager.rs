@@ -958,3 +958,59 @@ async fn service_membership_updates_preserve_live_worker_state() {
     drop(tx);
     handle.await.unwrap();
 }
+
+/// A Sandy joins the router's model under its tap port, whatever model it serves,
+/// and a Franky Ricky is marked as reading taps.
+#[tokio::test]
+async fn manager_registers_a_franky_pair_from_introspection() {
+    let (sandy_url, _sandy) = spawn_fake_worker(json!({
+        "served_model_name": "big",
+        "disaggregation_mode": "null",
+        "franky_side": "sandy",
+        "franky_bootstrap_port": 8996,
+    }))
+    .await;
+    let (ricky_url, _ricky) = spawn_fake_worker(json!({
+        "served_model_name": "m",
+        "disaggregation_mode": "null",
+        "franky_side": "ricky",
+        "franky_bootstrap_port": 8996,
+    }))
+    .await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let argv = format!("sgl-router --model-id m --worker-urls {ricky_url} {sandy_url}");
+    let cli = Cli::try_parse_from(argv.split(' ')).unwrap();
+    let cfg = Some(Arc::new(cli.into_config().unwrap()));
+    let h = tokio::spawn(manager::run_with_config(
+        rx,
+        registry.clone(),
+        cfg,
+        None,
+        None,
+    ));
+    for (id, url) in [("s", &sandy_url), ("r", &ricky_url)] {
+        let spec = spec_for(id, url, WorkerMode::Plain);
+        tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
+    }
+
+    let registered = wait_for(Duration::from_secs(2), || {
+        registry.workers_for(&ModelId("m".into())).len() == 2
+    })
+    .await;
+    assert!(registered, "both workers must join model m");
+    let sandy = registry.get(&WorkerId("s".into())).unwrap();
+    assert_eq!(
+        (sandy.mode(), sandy.bootstrap_port(), sandy.needs_taps()),
+        (WorkerMode::Sandy, Some(8996), false)
+    );
+    let ricky = registry.get(&WorkerId("r".into())).unwrap();
+    assert_eq!(
+        (ricky.mode(), ricky.needs_taps()),
+        (WorkerMode::Plain, true)
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}

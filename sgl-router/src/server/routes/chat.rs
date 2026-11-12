@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+mod blocks;
 mod forward;
 mod openai;
 mod preparation;
@@ -14,6 +15,8 @@ use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
 use crate::policies::{Policy, PrefixLookupResult};
+use crate::policies_reorg::cache_aware::PrefixMemo;
+use crate::policies_reorg::{PickRequest, Stage};
 use crate::proxy::grpc::{EngineRpc, GrpcResponse, TypedRpc};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
@@ -23,6 +26,7 @@ use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
+use blocks::BlockChain;
 use bytes::Bytes;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
@@ -113,8 +117,11 @@ async fn serve_http(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let (request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
-    routing.dispatch(&ctx, request, headers, start).await
+    let (mut request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
+    match BlockChain::plan(&ctx, &mut request, &headers)? {
+        Some(chain) => chain.serve(&ctx, &routing, headers, start).await,
+        None => routing.dispatch(&ctx, request, headers, start).await,
+    }
 }
 
 /// A gRPC call whose request is `endpoint`'s HTTP body, sent to the engine as `rpc`.
@@ -130,7 +137,14 @@ pub async fn route_grpc<R: EngineRpc>(
     Option<RequestLogContext>,
 ) {
     let start = Instant::now();
-    match prepare(ctx, endpoint, &headers, body, true).await {
+    let prepared =
+        prepare(ctx, endpoint, &headers, body, true)
+            .await
+            .and_then(|(request, routing)| {
+                refuse_franky_over_grpc(ctx, &request.model)?;
+                Ok((request, routing))
+            });
+    match prepared {
         Ok((mut request, routing)) => {
             forward_request_grpc(rpc, ctx, &mut request, &routing, headers, start).await
         }
@@ -156,6 +170,7 @@ pub async fn route_typed<R: TypedRpc>(
         if path != GENERATE_PATH {
             require_plain_workers(ctx, &model, path)?;
         }
+        refuse_franky_over_grpc(ctx, &model)?;
         let prepared = PreparedRequest::typed(ctx, path, model, &request.view())?;
         Ok::<_, ApiError>((prepared, routing))
     };
@@ -242,8 +257,13 @@ async fn prepare<'a>(
     Ok((request, routing))
 }
 
-/// Prefill and decode engines serve generation only.
+/// Prefill and decode engines serve generation only, as do Franky pairs.
 fn require_plain_workers(ctx: &AppContext, model: &ModelId, path: &str) -> Result<(), ApiError> {
+    if serves_franky(ctx, model) {
+        return Err(ApiError::BadRequest(format!(
+            "{path} is not served by Franky workers"
+        )));
+    }
     let registered = ctx.registry.workers_for(model);
     if registered.iter().any(|w| w.mode() != WorkerMode::Plain) {
         return Err(ApiError::BadRequest(format!(
@@ -251,6 +271,21 @@ fn require_plain_workers(ctx: &AppContext, model: &ModelId, path: &str) -> Resul
         )));
     }
     Ok(())
+}
+
+/// Franky requests carry the room of their taps over HTTP only.
+fn refuse_franky_over_grpc(ctx: &AppContext, model: &ModelId) -> Result<(), ApiError> {
+    if serves_franky(ctx, model) {
+        return Err(ApiError::BadRequest(format!(
+            "model {model} is served by Franky workers, over HTTP only"
+        )));
+    }
+    Ok(())
+}
+
+fn serves_franky(ctx: &AppContext, model: &ModelId) -> bool {
+    (ctx.registry.workers_for(model).iter())
+        .any(|w| w.needs_taps() || w.mode() == WorkerMode::Sandy)
 }
 
 /// A model's routing state, resolved before the request is prepared.
@@ -290,9 +325,6 @@ impl<'a> ModelRouting<'a> {
         }
     }
 
-    /// Select workers for `request` and forward it to them. An attempt that
-    /// fails before any response reaches the client is retried, after a
-    /// backoff, on workers it has not tried, up to `--retry-max-attempts`.
     async fn dispatch(
         &self,
         ctx: &AppContext,
@@ -300,9 +332,31 @@ impl<'a> ModelRouting<'a> {
         headers: HeaderMap,
         start: Instant,
     ) -> Result<Response<Body>, ApiError> {
+        let mut duration = None;
+        let (response, _) = self
+            .forward_with_retries(ctx, &mut request, &headers, start, &mut duration, None)
+            .await?;
+        Ok(response)
+    }
+
+    /// Select workers for `request`, or take `pinned` for the first attempt,
+    /// and forward it to them. An attempt that fails before any response reaches
+    /// the client is retried, after a backoff, on workers it has not tried, up
+    /// to `--retry-max-attempts`.
+    ///
+    /// Returns the response, and the workers that gave it unless every attempt
+    /// failed.
+    async fn forward_with_retries(
+        &self,
+        ctx: &AppContext,
+        request: &mut PreparedRequest,
+        headers: &HeaderMap,
+        start: Instant,
+        duration: &mut Option<Arc<RequestDurationGuard>>,
+        mut pinned: Option<SelectedWorkers>,
+    ) -> Result<(Response<Body>, Option<SelectedWorkers>), ApiError> {
         let mut excluded = Vec::new();
         let mut failed = None;
-        let mut duration = None;
         for attempt in 0..ctx.config.proxy.max_attempts.get() {
             if attempt > 0 {
                 // A retry never starts past the request's stale deadline, so the
@@ -317,33 +371,33 @@ impl<'a> ModelRouting<'a> {
                     break;
                 }
             }
-            let workers = match self
-                .select_workers(ctx, &request, &headers, &excluded)
-                .await
-            {
-                Ok(workers) => workers,
-                // Every eligible worker already failed this request: report the last failure.
-                Err(error) => return failed.ok_or(error),
+            let workers = match pinned.take() {
+                Some(workers) => workers,
+                None => match self.select_workers(ctx, request, headers, &excluded).await {
+                    Ok(workers) => workers,
+                    // Every eligible worker already failed this request: report the last failure.
+                    Err(error) => return failed.map(|response| (response, None)).ok_or(error),
+                },
             };
             if failed.is_some() {
                 ctx.metrics.record_retry(&request.model.0);
             }
             let duration = duration
                 .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
+            let answering = workers.clone();
             let attempt =
-                forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
-                    .await?;
+                forward_request(ctx, request, workers, headers.clone(), start, duration).await?;
             if attempt.retry_excluding.is_empty() {
-                return Ok(attempt.response);
+                return Ok((attempt.response, Some(answering)));
             }
             excluded.extend(attempt.retry_excluding);
             failed = Some(attempt.response);
         }
-        Ok(failed.expect("at least one attempt"))
+        Ok((failed.expect("at least one attempt"), None))
     }
 
     /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,
-    /// never one in `excluded`.
+    /// and a Sandy when they read taps, never one in `excluded`.
     async fn select_workers(
         &self,
         ctx: &AppContext,
@@ -351,7 +405,8 @@ impl<'a> ModelRouting<'a> {
         headers: &HeaderMap,
         excluded: &[WorkerId],
     ) -> Result<SelectedWorkers, ApiError> {
-        match self {
+        let prefix = PrefixMemo::default();
+        let mut workers = match self {
             Self::Legacy(policy) => {
                 // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
                 let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry)).excluding(excluded);
@@ -366,13 +421,56 @@ impl<'a> ModelRouting<'a> {
                     &candidates,
                     &resolver,
                 )
-                .await
+                .await?
             }
             Self::Reorg(resolver) => {
-                reorg::select_workers(ctx, resolver, request, headers, excluded).await
+                reorg::select_workers(ctx, resolver, request, headers, excluded, &prefix).await?
             }
+        };
+        if workers.prefill.needs_taps() {
+            workers.sandy = Some(pick_sandy(ctx, request, headers, excluded, &prefix).await?);
         }
+        Ok(workers)
     }
+}
+
+/// The Sandy that sends a Franky request's taps: the model's Sandy group picks
+/// it, by prefix when its policy is cache-aware.
+async fn pick_sandy(
+    ctx: &AppContext,
+    request: &PreparedRequest,
+    headers: &HeaderMap,
+    excluded: &[WorkerId],
+    prefix: &PrefixMemo,
+) -> Result<Arc<Worker>, ApiError> {
+    let model = &request.model;
+    let group = ctx
+        .sandy
+        .as_ref()
+        .ok_or_else(|| ApiError::NoSandyWorkersAvailable {
+            model: model.0.clone(),
+        })?;
+    let session_key = (ctx.config.model.affinity.as_ref())
+        .and_then(|config| nonempty_header(headers, &config.session_id_header));
+    let routing_key = (ctx.config.model.sticky.as_ref())
+        .and_then(|config| nonempty_header(headers, &config.header_name));
+    let pick_request = PickRequest {
+        bucket: "sandy",
+        total_input_tokens: request.input_token_count as u64,
+        expected_peak_tokens: request.expected_peak_sequence_tokens,
+        prefix: Some(prefix),
+        token_ids: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        cache_namespace: &request.cache_namespace,
+        session_key,
+        routing_key,
+        ..PickRequest::new(model, Stage::Sandy, request.sequence_token_count as u64)
+    };
+    let pick = group
+        .pick_excluding(&ctx.registry, &pick_request, excluded)
+        .await
+        .map_err(|error| reorg::selection_error(error, model, Some(Stage::Sandy)))?;
+    record_prefill_route(ctx, prefix.local_signal().as_deref(), &pick.engine.url);
+    Ok(pick.engine)
 }
 
 fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
@@ -406,6 +504,7 @@ async fn select_workers(
     Ok(SelectedWorkers {
         prefill,
         decode,
+        sandy: None,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
     })
 }

@@ -1778,6 +1778,11 @@ class ServingChatTestCase(CustomTestCase):
             rid="body-rid",
             routed_dp_rank=3,
             disagg_prefill_dp_rank=4,
+            franky_room={
+                "bootstrap_host": "sandy.internal",
+                "bootstrap_port": 8996,
+                "room": 77,
+            },
             priority=5,
         )
         self.fastapi_request.headers = {
@@ -1814,6 +1819,10 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted_request.conversation_id, "conversation-1")
         self.assertEqual(adapted_request.routed_dp_rank, 6)
         self.assertEqual(adapted_request.disagg_prefill_dp_rank, 7)
+        self.assertEqual(
+            adapted_request.franky_room,
+            {"bootstrap_host": "sandy.internal", "bootstrap_port": 8996, "room": 77},
+        )
         self.assertEqual(adapted_request.priority, 8)
         self.assertEqual(request.model_dump(), body)
         self.assertFalse(hasattr(request, "conversation_id"))

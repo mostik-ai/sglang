@@ -54,8 +54,8 @@ class SchedulerActor:
     ):
         from sglang.srt.environ import envs
         from sglang.srt.managers.scheduler import (
-            Scheduler,
             configure_scheduler_process,
+            get_scheduler_class,
             resolve_spawn_dp_rank,
         )
         from sglang.srt.utils.numa_utils import (
@@ -117,7 +117,7 @@ class SchedulerActor:
                 )
 
         # Create scheduler (loads model into GPU, initializes NCCL)
-        self.scheduler = Scheduler(
+        self.scheduler = get_scheduler_class()(
             server_args=server_args,
             port_args=port_args,
         )

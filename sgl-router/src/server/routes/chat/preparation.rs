@@ -6,7 +6,7 @@
 //! classify and rerank.
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
-use crate::discovery::ModelId;
+use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::proxy::grpc::{sampling_value, RoutingView};
 use crate::server::app_context::AppContext;
@@ -330,7 +330,7 @@ impl PreparedRequest {
     /// [`Self::generate`] over a parsed body: the client's `body` gets the
     /// fleet's sampling overrides, while a lowered OpenAI body (`None`) had them
     /// applied to the OpenAI request.
-    fn generate_value(
+    pub(super) fn generate_value(
         ctx: &AppContext,
         model: ModelId,
         mut value: Value,
@@ -579,11 +579,12 @@ impl PreparedRequest {
     }
 
     /// The engine body for one dispatch attempt; each attempt brings its own
-    /// bootstrap fields and rid.
+    /// bootstrap fields, Franky room and rid.
     pub(super) fn outgoing_body(
         &mut self,
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
+        franky_room: Option<&FrankyRoom>,
         engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
         if self.body.is_empty() {
@@ -600,6 +601,7 @@ impl PreparedRequest {
             self.parsed_body.take(),
             input_ids,
             bootstrap,
+            franky_room,
             &self.sampling_defaults,
             engine_rid,
         )?;
@@ -672,8 +674,13 @@ fn lower_openai(
 }
 
 /// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.
-fn model_openai_settings(ctx: &AppContext, model: &ModelId) -> Option<Arc<OpenAiSettings>> {
-    let workers = ctx.registry.workers_for(model);
+pub(super) fn model_openai_settings(
+    ctx: &AppContext,
+    model: &ModelId,
+) -> Option<Arc<OpenAiSettings>> {
+    let mut workers = ctx.registry.workers_for(model);
+    // A Sandy answers no tokens, so its OpenAI server args shape no response.
+    workers.retain(|w| w.mode() != WorkerMode::Sandy);
     let first = Arc::clone(workers.first()?.openai_settings()?);
     let agree = workers.iter().all(|w| w.openai_settings() == Some(&first));
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1230,6 +1237,14 @@ pub(super) struct BootstrapFields {
     pub(super) room: u64,
 }
 
+/// Where a Franky request's taps meet: its Sandy's tap bootstrap server and a
+/// room, sent as `franky_room` to the Sandy and every Ricky leg.
+pub(super) struct FrankyRoom {
+    pub(super) host: String,
+    pub(super) port: Option<u16>,
+    pub(super) room: u64,
+}
+
 /// Append JSON-encoded `fields` before the closing brace, so they win over
 /// earlier values of the same keys.
 pub(super) fn append_fields(body: &Bytes, fields: &[(&str, String)]) -> Option<Bytes> {
@@ -1264,10 +1279,11 @@ fn build_outgoing_body(
     parsed_body: Option<Value>,
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
+    franky_room: Option<&FrankyRoom>,
     sampling_defaults: &[(SamplingField, Number)],
     rid: Option<&str>,
 ) -> Result<Bytes, ApiError> {
-    let needs_parse = input_ids.is_some() || bootstrap.is_some();
+    let needs_parse = input_ids.is_some() || bootstrap.is_some() || franky_room.is_some();
     if !needs_parse && sampling_defaults.is_empty() && rid.is_none() {
         // Cloning Bytes shares the original allocation when no injection is needed.
         return Ok(body.clone());
@@ -1306,6 +1322,11 @@ fn build_outgoing_body(
         // A missing port must be JSON null, not omitted; the engine's validator distinguishes them.
         body_fields.insert("bootstrap_port".into(), json!(bootstrap.port));
         body_fields.insert("bootstrap_room".into(), json!(bootstrap.room));
+    }
+    if let Some(room) = franky_room {
+        let room =
+            json!({"bootstrap_host": room.host, "bootstrap_port": room.port, "room": room.room});
+        body_fields.insert("franky_room".into(), room);
     }
     let bytes = serde_json::to_vec(&body_fields).map_err(|e| {
         ApiError::Internal(anyhow::Error::new(e).context("re-serialize injected request body"))
@@ -1867,7 +1888,8 @@ mod tests {
                 .extend(fields.as_object().unwrap().clone());
             for value in [None, Some(original.clone())] {
                 let out =
-                    build_outgoing_body(&body, value, ids, bootstrap.as_ref(), &[], None).unwrap();
+                    build_outgoing_body(&body, value, ids, bootstrap.as_ref(), None, &[], None)
+                        .unwrap();
                 assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), expected);
             }
         }
@@ -1878,7 +1900,7 @@ mod tests {
         for raw in [r#"{"model":"x"}"#, r#"{"model":"x","messages":[]}"#] {
             let body = Bytes::copy_from_slice(raw.as_bytes());
             for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
-                let out = build_outgoing_body(&body, value, None, None, &[], None).unwrap();
+                let out = build_outgoing_body(&body, value, None, None, None, &[], None).unwrap();
                 assert_eq!(out, body);
                 assert_eq!(out.as_ptr(), body.as_ptr());
             }
@@ -2295,7 +2317,8 @@ mod tests {
             &metrics(),
         )
         .unwrap();
-        let out = build_outgoing_body(&body, None, Some(&[1, 2, 3]), None, &inject, None).unwrap();
+        let out =
+            build_outgoing_body(&body, None, Some(&[1, 2, 3]), None, None, &inject, None).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&out).unwrap(),
             json!({
@@ -2427,7 +2450,8 @@ mod tests {
             let inject = resolve_sampling_defaults(&config, &fields_of(raw), &metrics()).unwrap();
             assert_eq!(inject.len(), 2);
             for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
-                let out = build_outgoing_body(&body, value, None, None, &inject, None).unwrap();
+                let out =
+                    build_outgoing_body(&body, value, None, None, None, &inject, None).unwrap();
                 assert_eq!(std::str::from_utf8(&out).unwrap(), expected, "{raw}");
                 let parsed: Value = serde_json::from_slice(&out).unwrap();
                 assert_eq!(parsed["temperature"], json!(1.0));

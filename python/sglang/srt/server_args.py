@@ -154,6 +154,9 @@ from sglang.srt.arg_groups.fields.exec_ import (
     ExecOffload,
     ExecOverlap,
 )
+from sglang.srt.arg_groups.fields.franky import (
+    Franky,
+)
 from sglang.srt.arg_groups.fields.lora import (
     Lora,
 )
@@ -545,6 +548,7 @@ _INPUT_NAMESPACES = [
     ExecOverlap,
     Lora,
     Disagg,
+    Franky,
     Spec,
     ExecMoe,
     ExecComm,

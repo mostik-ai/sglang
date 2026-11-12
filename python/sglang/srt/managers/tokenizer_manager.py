@@ -49,6 +49,7 @@ from typing import (
 )
 
 import fastapi
+import msgspec
 import numpy as np
 import pybase64
 import torch
@@ -70,6 +71,8 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.franky.chains.chain import FrankyChain
+from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
@@ -93,6 +96,7 @@ from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     EncoderDispatchErrorReq,
+    FrankyEndChainReq,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -168,6 +172,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
     get_exec,
+    get_franky,
     get_lora,
     get_memory,
     get_mm,
@@ -1696,6 +1701,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                franky_room=(
+                    msgspec.convert(obj.franky_room, FrankyRoom)
+                    if obj.franky_room is not None
+                    else None
+                ),
+                franky_chain=(
+                    FrankyChain.from_request(
+                        franky_chain=obj.franky_chain,
+                        rid=obj.rid,
+                        prompt_len=len(input_ids_arr or ()),
+                    )
+                    if obj.franky_chain is not None
+                    else None
+                ),
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,
@@ -2450,6 +2469,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(gen.aclose() for gen in generators),
                 return_exceptions=True,
             )
+
+    def end_franky_chain(self, obj: FrankyEndChainReq) -> None:
+        """
+        Raises:
+            ValueError: the engine runs without ``--franky-side``.
+        """
+        if get_franky().franky_side == "null":
+            raise ValueError("Ending a Franky chain needs --franky-side.")
+        self._dispatch_to_scheduler(obj)
 
     def abort_request(
         self, rid: str = "", abort_all: bool = False, prefix: bool = False

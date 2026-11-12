@@ -51,6 +51,8 @@ pub struct EngineProfile {
     pub openai: Option<Arc<OpenAiSettings>>,
     /// The engine's native gRPC port; `None` means gRPC clients cannot reach it.
     pub grpc_port: Option<u16>,
+    /// A Franky Ricky engine (`--franky-side ricky`): each request needs a Sandy.
+    pub needs_taps: bool,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -60,6 +62,7 @@ impl From<WireProtocol> for EngineProfile {
             dp_ranks: 1,
             openai: None,
             grpc_port: None,
+            needs_taps: false,
         }
     }
 }
@@ -198,6 +201,7 @@ impl WorkerMode {
             WorkerMode::Plain => 0,
             WorkerMode::Prefill => 1,
             WorkerMode::Decode => 2,
+            WorkerMode::Sandy => 3,
         }
     }
 
@@ -211,6 +215,7 @@ impl WorkerMode {
             0 => WorkerMode::Plain,
             1 => WorkerMode::Prefill,
             2 => WorkerMode::Decode,
+            3 => WorkerMode::Sandy,
             other => unreachable!("invalid WorkerMode discriminant {other}"),
         }
     }
@@ -242,7 +247,7 @@ pub struct Worker {
     bootstrap_host: String,
     /// SGLang bootstrap server port for prefill workers (`None` for
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
-    /// worker startup; carried from `WorkerSpec`.
+    /// worker startup; carried from `WorkerSpec`. A Sandy's tap bootstrap port.
     bootstrap_port: Option<u16>,
     /// When this worker joined its current model pools, starting the grace of
     /// [`Self::awaiting_bootstrap_port`]. Tokio's clock so tests can advance it.
@@ -256,6 +261,7 @@ pub struct Worker {
     /// Round-robin position over this worker's DP ranks.
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
+    needs_taps: bool,
 }
 
 impl Worker {
@@ -276,6 +282,7 @@ impl Worker {
             dp_ranks,
             openai,
             grpc_port,
+            needs_taps,
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -303,11 +310,17 @@ impl Worker {
             dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
             dp_rank_turn: AtomicUsize::new(0),
             openai,
+            needs_taps,
         }
     }
 
     pub fn openai_settings(&self) -> Option<&Arc<OpenAiSettings>> {
         self.openai.as_ref()
+    }
+
+    /// A Franky Ricky worker: each request it serves needs a Sandy to send its taps.
+    pub fn needs_taps(&self) -> bool {
+        self.needs_taps
     }
 
     pub fn services(&self) -> BTreeSet<String> {
@@ -326,12 +339,14 @@ impl Worker {
         *self.services.write().unwrap() = services;
     }
 
-    /// Hostname carried on PD-disagg request bodies as `bootstrap_host`.
+    /// Hostname carried on PD-disagg request bodies as `bootstrap_host`, and
+    /// on Franky request bodies in `franky_room` for a Sandy.
     pub fn bootstrap_host(&self) -> &str {
         &self.bootstrap_host
     }
 
-    /// SGLang bootstrap server port. `None` for decode / plain workers.
+    /// SGLang bootstrap server port, or a Sandy's tap bootstrap port. `None`
+    /// for decode / plain workers.
     pub fn bootstrap_port(&self) -> Option<u16> {
         self.bootstrap_port
     }

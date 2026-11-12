@@ -5,7 +5,8 @@
 
 use super::nonempty_header;
 use super::preparation::{
-    append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
+    append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, FrankyRoom,
+    PreparedRequest,
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
@@ -24,6 +25,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
+use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use sglang_api_types::runtime::v1::DisaggregatedParams;
 use std::future::Future;
@@ -38,10 +40,13 @@ const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url")
 const X_DATA_PARALLEL_RANK: HeaderName = HeaderName::from_static("x-data-parallel-rank");
 type LoadGuards = (LoadGuard, RouterInflightLoadGuard, Option<DpRankGuard>);
 
-/// A plain worker, or a prefill worker paired with a decode worker for PD.
+/// A plain worker, or a prefill worker paired with a decode worker for PD, and
+/// the Sandy that sends their taps when they read taps.
+#[derive(Clone)]
 pub(super) struct SelectedWorkers {
     pub(super) prefill: Arc<Worker>,
     pub(super) decode: Option<Arc<Worker>>,
+    pub(super) sandy: Option<Arc<Worker>>,
     pub(super) track_dispatch_timestamps: bool,
 }
 
@@ -172,6 +177,7 @@ async fn dispatch<T: Transport>(
     let SelectedWorkers {
         prefill,
         decode,
+        sandy,
         track_dispatch_timestamps,
     } = workers;
     let decode_url_header = decode
@@ -212,6 +218,12 @@ async fn dispatch<T: Transport>(
         duration,
     );
     let pd_prefill = decode.is_some().then(|| prefill.id.clone());
+    // The Sandy and every Ricky leg receive the same Franky room for the taps.
+    let franky_room = sandy.as_ref().map(|sandy| FrankyRoom {
+        host: sandy.bootstrap_host().to_string(),
+        port: sandy.bootstrap_port(),
+        room: generate_room_id(),
+    });
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
     let pd = decode.map(|decode| {
         let bootstrap = BootstrapFields {
@@ -239,8 +251,33 @@ async fn dispatch<T: Transport>(
     let body = request.outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
+        franky_room.as_ref(),
         engine_rid.as_deref(),
     )?;
+    // Sandy computes the same prompt, outside PD.
+    let sandy_leg = match (sandy, &franky_room) {
+        (Some(sandy), Some(room)) => {
+            let body = request.outgoing_body(ctx, None, Some(room), engine_rid.as_deref())?;
+            let rank = dp_aware
+                .then(|| prompt_dp_rank(ctx, request, &headers, &sandy))
+                .flatten();
+            let leg = Leg::new(dp_aware, headers.clone(), &body, &additions, rank, None);
+            let load_guards = (
+                sandy.load_guard(),
+                ctx.router_inflight_load.register_aged(
+                    sandy.id.clone(),
+                    sandy.url.clone(),
+                    request.input_token_count,
+                    0,
+                    request_started_at.elapsed(),
+                ),
+                rank.map(|rank| sandy.dp_rank_guard(rank)),
+            );
+            Some((sandy, leg, load_guards, room.room))
+        }
+        _ => None,
+    };
+    let sandy_id = sandy_leg.as_ref().map(|(sandy, ..)| sandy.id.clone());
     let prefill_leg = Leg::new(
         dp_aware,
         headers.clone(),
@@ -255,18 +292,37 @@ async fn dispatch<T: Transport>(
         prefill_rank.map(|rank| prefill.dp_rank_guard(rank)),
     );
 
-    // In PD mode, prefill runs independently and decode supplies the client response.
+    // A Sandy and a PD prefill run independently; the plain or decode
+    // worker supplies the client response.
     let stream_abort = CancellationToken::new();
+    let mut side_tasks = Vec::new();
+    if let Some((sandy, leg, load_guards, room)) = sandy_leg {
+        let task = spawn_side_request(
+            transport.clone(),
+            ctx,
+            &metrics,
+            Arc::clone(&sandy),
+            WorkerModeLabel::Sandy,
+            path,
+            leg,
+            load_guards,
+            room,
+            stream_abort.clone(),
+            None,
+        );
+        side_tasks.push((task, sandy));
+    }
     let decode_slot = (pd.is_some() && ctx.decode_gate.is_enabled() && engine_rid.is_some())
         .then(DecodeSlot::default);
     let mut unanswered = ReleaseOnDrop(decode_slot.clone());
-    let (response_worker, response_leg, response_load_guards, prefill_task) =
+    let (response_worker, response_leg, response_load_guards) =
         if let Some((decode, bootstrap)) = pd {
-            let task = spawn_prefill_request(
+            let task = spawn_side_request(
                 transport.clone(),
                 ctx,
                 &metrics,
                 Arc::clone(&prefill),
+                WorkerModeLabel::Prefill,
                 path,
                 prefill_leg,
                 prefill_load_guards,
@@ -274,6 +330,7 @@ async fn dispatch<T: Transport>(
                 stream_abort.clone(),
                 decode_slot.clone(),
             );
+            side_tasks.push((task, Arc::clone(&prefill)));
             // Counted from arrival, so decode selection sees requests waiting here.
             let decode_load = decode.load_guard();
             if let Some(slot) = &decode_slot {
@@ -317,14 +374,9 @@ async fn dispatch<T: Transport>(
                 decode_rank,
                 prefill_rank,
             );
-            (
-                decode,
-                decode_leg,
-                decode_load_guards,
-                Some((task, prefill)),
-            )
+            (decode, decode_leg, decode_load_guards)
         } else {
-            (prefill, prefill_leg, prefill_load_guards, None)
+            (prefill, prefill_leg, prefill_load_guards)
         };
 
     // In PD mode, prefill can finish before decode. Watch the registration
@@ -342,17 +394,10 @@ async fn dispatch<T: Transport>(
         stream_abort,
         decode_slot,
     );
-    let dispatch = async {
-        match prefill_task {
-            Some((task, prefill)) => {
-                let wait = ctx.config.proxy.stream_after_prefill;
-                forward_pd(task, prefill, response, wait).await
-            }
-            None => (response.await, None),
-        }
-    };
+    let wait = ctx.config.proxy.stream_after_prefill;
+    let dispatch = forward_with_side_legs(side_tasks, response, wait);
     // A ready response wins if request expiration fires in the same poll.
-    let (result, blamed_prefill) = tokio::select! {
+    let (result, blame) = tokio::select! {
         biased;
         dispatch = dispatch => dispatch,
         _ = expiration_token.cancelled() => {
@@ -368,19 +413,22 @@ async fn dispatch<T: Transport>(
         dispatch_outcome::<T>(&result),
         RequestOutcome::Error | RequestOutcome::Backpressure
     );
-    let retry_excluding = match (&blamed_prefill, pd_prefill) {
+    let side_ids: Vec<_> = pd_prefill.into_iter().chain(sandy_id).collect();
+    let retry_excluding = match &blame {
         _ if !retryable => Vec::new(),
-        // The other PD side may still hold a caller's rid, which an engine refuses twice.
-        (_, Some(prefill)) if request.caller_set_rid => vec![prefill, response_worker.id.clone()],
-        (Some(blame), _) => vec![blame.prefill.id.clone()],
-        (None, _) => vec![response_worker.id.clone()],
+        // The other legs may still hold a caller's rid, which an engine refuses twice.
+        _ if request.caller_set_rid && !side_ids.is_empty() => side_ids
+            .into_iter()
+            .chain([response_worker.id.clone()])
+            .collect(),
+        Some(blame) => vec![blame.worker.id.clone()],
+        None => vec![response_worker.id.clone()],
     };
     let result = match result {
         Ok(response) => Ok(T::respond(request, response, metrics.streaming).await),
         result => result,
     };
-    let log_context =
-        metrics.record_dispatch_result::<T>(&result, engine_rid, blamed_prefill.as_ref());
+    let log_context = metrics.record_dispatch_result::<T>(&result, engine_rid, blame.as_ref());
     Ok(Dispatched {
         result,
         log_context,
@@ -760,18 +808,23 @@ fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {
 /// A prefill's client-visible failure; `None` means it succeeded.
 type PrefillFailure<R = Response<Body>> = Option<Result<R, ApiError>>;
 
-/// Runs prefill to completion even if the client disconnects. A failure also
-/// aborts decode's stream until its first token, which proves KV transfer completed.
+/// A side leg: a PD prefill, or a Franky request's Sandy. `room` is the PD
+/// bootstrap room or the Franky room, for logs.
+///
+/// Runs it to completion even if the client disconnects. A failure also aborts
+/// the response stream until its first token, which proves the KV and the taps
+/// arrived.
 #[allow(clippy::too_many_arguments)]
-fn spawn_prefill_request<T: Transport>(
+fn spawn_side_request<T: Transport>(
     transport: T,
     ctx: &AppContext,
     metrics: &DispatchMetrics,
-    prefill_worker: Arc<Worker>,
+    worker: Arc<Worker>,
+    mode: WorkerModeLabel,
     path: &'static str,
     leg: Leg,
     load_guards: LoadGuards,
-    bootstrap_room: u64,
+    room: u64,
     stream_abort: CancellationToken,
     slot: Option<DecodeSlot>,
 ) -> tokio::task::JoinHandle<PrefillFailure<T::Response>> {
@@ -780,24 +833,24 @@ fn spawn_prefill_request<T: Transport>(
     tokio::spawn(async move {
         let _load_guards = load_guards;
         let failure = transport
-            .prefill(proxy, Arc::clone(&prefill_worker), path, leg)
+            .prefill(proxy, Arc::clone(&worker), path, leg)
             .await;
         if let Some(slot) = &slot {
             slot.release();
         }
-        let prefill_url = &prefill_worker.url;
+        let worker_url = &worker.url;
         let outcome = failure
             .as_ref()
             .map_or(RequestOutcome::Success, dispatch_outcome::<T>);
-        registry.record_worker_request(prefill_url, &model, WorkerModeLabel::Prefill, outcome);
+        registry.record_worker_request(worker_url, &model, mode, outcome);
         match &failure {
-            None => tracing::debug!(%prefill_url, bootstrap_room, "prefill side completed"),
+            None => tracing::debug!(%worker_url, ?mode, room, "side leg completed"),
             Some(Ok(response)) => tracing::debug!(
-                %prefill_url, bootstrap_room, status = T::status(response),
-                "prefill rejected the request",
+                %worker_url, ?mode, room, status = T::status(response),
+                "side leg rejected the request",
             ),
             Some(Err(error)) => {
-                tracing::warn!(%prefill_url, bootstrap_room, %error, "prefill failed")
+                tracing::warn!(%worker_url, ?mode, room, %error, "side leg failed")
             }
         }
         if failure.is_some() {
@@ -834,58 +887,69 @@ async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFai
     }))
 }
 
-/// Prefill's failure ended the request, so the client-visible outcome belongs to
-/// `prefill` rather than to the decode worker the dispatch had selected.
+/// A side leg's failure ended the request, so the client-visible outcome belongs
+/// to its `worker` (a PD prefill or a Sandy) rather than to the worker the
+/// dispatch had selected for the response.
 struct Blame {
-    prefill: Arc<Worker>,
-    /// Whether decode had already reached the wire when it was dropped. False
-    /// only if prefill failed before decode's future was ever polled, which is
-    /// a pre-dispatch drop and must stay uncounted.
+    worker: Arc<Worker>,
+    /// Whether the response leg had already reached the wire when it was
+    /// dropped. False only if a side leg failed before the response future was
+    /// ever polled, which is a pre-dispatch drop and must stay uncounted.
     decode_dispatched: bool,
 }
 
-/// Returns decode's response as soon as decode answers, or with
-/// `stream_after_prefill` once prefill also completes, unless prefill fails
-/// first; then prefill's failure is returned along with the blamed prefill.
-async fn forward_pd<R>(
-    mut task: tokio::task::JoinHandle<PrefillFailure<R>>,
-    prefill: Arc<Worker>,
-    decode: impl Future<Output = Result<R, ApiError>>,
+/// A running side leg and its worker.
+type SideTask<R> = (tokio::task::JoinHandle<PrefillFailure<R>>, Arc<Worker>);
+
+/// Returns the response as soon as its worker answers, or with
+/// `stream_after_prefill` once every side leg also completes, unless a side leg
+/// fails first; then its failure is returned along with the blamed worker.
+async fn forward_with_side_legs<R>(
+    side_tasks: Vec<SideTask<R>>,
+    response: impl Future<Output = Result<R, ApiError>>,
     stream_after_prefill: bool,
 ) -> (Result<R, ApiError>, Option<Blame>) {
-    // Set on decode's first poll, which is where `forward_to_response_worker`
+    // Set on the response's first poll, which is where `forward_to_response_worker`
     // begins and the request reaches the worker. Read from the same task, so
     // `Relaxed` needs no ordering beyond what the select already gives.
     let dispatched = AtomicBool::new(false);
-    let decode = async {
+    let response = async {
         dispatched.store(true, Ordering::Relaxed);
-        decode.await
+        response.await
     };
-    let mut decode = std::pin::pin!(decode);
-    let blame = |prefill| {
+    let mut response = std::pin::pin!(response);
+    let blame = |worker| {
         Some(Blame {
-            prefill,
+            worker,
             decode_dispatched: dispatched.load(Ordering::Relaxed),
         })
     };
+    let mut side: FuturesUnordered<_> = side_tasks
+        .into_iter()
+        .map(|(task, worker)| async move { (task.await, worker) })
+        .collect();
     let mut held = None;
     loop {
         tokio::select! {
             biased;
-            failure = &mut task => return match failure {
-                Ok(None) => match held {
+            finished = side.next() => match finished {
+                // Every side leg succeeded.
+                None => return match held {
                     Some(response) => (response, None),
-                    None => (decode.await, None),
+                    None => (response.await, None),
                 },
-                Ok(Some(failure)) => (failure, blame(prefill)),
-                Err(_) => (Err(ApiError::PrefillFailed { status: None }), blame(prefill)),
-            },
-            // Dropping the handle leaves prefill running.
-            response = &mut decode, if held.is_none() => {
-                if !stream_after_prefill {
-                    return (response, None);
+                Some((Ok(None), _)) => {}
+                Some((Ok(Some(failure)), worker)) => return (failure, blame(worker)),
+                Some((Err(_), worker)) => {
+                    return (Err(ApiError::PrefillFailed { status: None }), blame(worker))
                 }
-                held = Some(response);
+            },
+            // Dropping the handles leaves the side legs running.
+            answer = &mut response, if held.is_none() => {
+                if !stream_after_prefill {
+                    return (answer, None);
+                }
+                held = Some(answer);
             }
         }
     }
@@ -969,6 +1033,7 @@ impl DispatchMetrics {
                 WorkerMode::Prefill => WorkerModeLabel::Prefill,
                 WorkerMode::Decode => WorkerModeLabel::Decode,
                 WorkerMode::Plain => WorkerModeLabel::Plain,
+                WorkerMode::Sandy => WorkerModeLabel::Sandy,
             },
             streaming: request.streaming,
             request_started_at,
@@ -1030,7 +1095,7 @@ impl DispatchMetrics {
                         RequestOutcome::Cancelled,
                     );
                 }
-                &blame.prefill.url
+                &blame.worker.url
             }
             None => {
                 self.registry.record_worker_request(
@@ -1111,7 +1176,8 @@ mod tests {
                 None
             });
             let decode = async { Ok(Response::new(Body::empty())) };
-            let (response, blame) = forward_pd(task, Arc::clone(&prefill), decode, wait).await;
+            let side = vec![(task, Arc::clone(&prefill))];
+            let (response, blame) = forward_with_side_legs(side, decode, wait).await;
             assert!(response.is_ok() && blame.is_none());
             assert_eq!(done.load(Ordering::SeqCst), wait);
         }

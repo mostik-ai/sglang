@@ -11,7 +11,7 @@ use sgl_router::{
     },
     discovery::{spawn_discovery, ModelId},
     policies::{factory::build_registry as build_policy_registry, PolicyRegistry},
-    policies_reorg::factory::build_resolver as build_reorg_resolver,
+    policies_reorg::factory::{build_resolver as build_reorg_resolver, build_sandy_group},
     proxy::Proxy,
     server::{
         app::build_router,
@@ -76,22 +76,32 @@ async fn main() -> Result<()> {
     // Monitor engine-reported KV-cache events and load statistics for routing.
     let engine_state = start_engine_state_monitor(&config, external_kv_indexer_client.is_some());
 
-    // Build the policies that choose which workers receive each request.
-    let (routing_policies, chat_routing, reorg_cleanup) = match routing {
-        ChatRoutingKind::Legacy => (
-            Arc::new(
-                build_policy_registry(
-                    &config,
-                    engine_state.tree(),
-                    engine_state.block_size_oracle(),
-                )
-                .context("build policy registry")?,
-            ),
-            ChatRouting::Legacy,
-            None,
-        ),
+    // Build the policies that choose which workers receive each request, and
+    // the group a Franky Ricky's Sandy is picked from.
+    let (routing_policies, chat_routing, sandy, reorg_cleanup) = match routing {
+        ChatRoutingKind::Legacy => {
+            let (sandy, cleanup) = build_sandy_group(
+                &config.model,
+                &engine_state,
+                external_kv_indexer_client.clone(),
+            )
+            .context("build Sandy group")?;
+            (
+                Arc::new(
+                    build_policy_registry(
+                        &config,
+                        engine_state.tree(),
+                        engine_state.block_size_oracle(),
+                    )
+                    .context("build policy registry")?,
+                ),
+                ChatRouting::Legacy,
+                sandy,
+                cleanup,
+            )
+        }
         ChatRoutingKind::Reorg => {
-            let (resolver, cleanup) = build_reorg_resolver(
+            let (resolver, sandy, cleanup) = build_reorg_resolver(
                 &config.model,
                 &engine_state,
                 external_kv_indexer_client.clone(),
@@ -100,6 +110,7 @@ async fn main() -> Result<()> {
             (
                 Arc::new(PolicyRegistry::default()),
                 ChatRouting::Reorg([(ModelId(config.model.id.clone()), resolver)].into()),
+                sandy,
                 cleanup,
             )
         }
@@ -108,7 +119,8 @@ async fn main() -> Result<()> {
     // Ask the built policies, so any term or filter that reads the prompt is covered.
     ensure!(
         config.model.tokenizer_path.is_some()
-            || !chat_routing.needs_request_tokens(&routing_policies),
+            || !(chat_routing.needs_request_tokens(&routing_policies)
+                || sandy.policy.needs_request_tokens()),
         "--no-tokenizer is incompatible with cache-aware routing and prefix-cache terms or filters"
     );
 
@@ -140,6 +152,7 @@ async fn main() -> Result<()> {
         external_kv_indexer_client,
     )?;
     app_context.chat_routing = chat_routing;
+    app_context.sandy = Some(sandy);
     let app_context = Arc::new(app_context);
     app_context.mark_ready();
 

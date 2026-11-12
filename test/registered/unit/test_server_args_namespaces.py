@@ -35,6 +35,7 @@ VALID_NAMESPACES = {
     "lora",
     "mm",
     "disagg",
+    "franky",
     "serving",
     "observability",
     "exec.kernel",

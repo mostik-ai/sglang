@@ -180,13 +180,14 @@ pub fn validate(model: &ModelConfig) -> Result<()> {
     Ok(())
 }
 
-/// Build `model.reorg_buckets`, or the default plain and P/D buckets. Callers
-/// run [`validate`] first; `Cli::into_config` does so before startup reaches this point.
+/// Build `model.reorg_buckets`, or the default plain and P/D buckets, and the
+/// model's Sandy group. Callers run [`validate`] first; `Cli::into_config` does
+/// so before startup reaches this point.
 pub fn build_resolver(
     model: &ModelConfig,
     state: &KvEventIndex,
     external_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
-) -> Result<(BucketResolver, Option<JanitorHandle>)> {
+) -> Result<(BucketResolver, EngineGroup, Option<JanitorHandle>)> {
     let mut groups = Groups {
         model,
         state,
@@ -252,7 +253,45 @@ pub fn build_resolver(
     let mut resolver = BucketResolver::new(buckets)?;
     resolver.ttft_slo = config.ttft_slo;
     resolver.tps_slo = config.tps_slo;
-    Ok((resolver, groups.cleanup))
+    // Shares the buckets' cache source, so one prefix lookup serves both picks.
+    let sandy = groups.build("sandy", Stage::Sandy, &GroupSpec::default())?;
+    Ok((resolver, sandy, groups.cleanup))
+}
+
+/// The model's Sandy group under legacy routing. `--policy cache_aware` and
+/// `session_aware` pick as they do under reorg, in prefer mode; any other
+/// policy picks by load.
+pub fn build_sandy_group(
+    model: &ModelConfig,
+    state: &KvEventIndex,
+    external_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
+) -> Result<(EngineGroup, Option<JanitorHandle>)> {
+    let policy = match model.policy {
+        PolicyKind::CacheAware | PolicyKind::SessionAware => model.policy,
+        _ => PolicyKind::PowerOfTwo,
+    };
+    // Legacy-only affinity modes and cache queue gates have no reorg form.
+    let affinity = AffinityConfig {
+        mode: AffinityMode::Prefer,
+        worker_queue_limit: None,
+        saturation_queue_floor: None,
+        ..model.affinity.clone().unwrap_or_default()
+    };
+    let mut groups = Groups {
+        model,
+        state,
+        external_index,
+        affinity,
+        store: None,
+        cleanup: None,
+        source: None,
+    };
+    let spec = GroupSpec {
+        policy: Some(policy),
+        ..Default::default()
+    };
+    let sandy = groups.build("sandy", Stage::Sandy, &spec)?;
+    Ok((sandy, groups.cleanup))
 }
 
 /// Builds group policies; session stores and cache sources are shared by all groups.

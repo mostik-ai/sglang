@@ -17,6 +17,7 @@ __pycache__/
 **/lib/
 **/lib64/
 **/parts/
+!python/sglang/srt/franky/parts/
 **/sdist/
 **/var/
 **/wheels/

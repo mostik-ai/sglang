@@ -34,6 +34,10 @@ pub struct ProxyConfig {
     pub decode_dispatch_limit: Option<NonZeroU32>,
     /// PD: return decode's response only once prefill completes.
     pub stream_after_prefill: bool,
+    /// Franky: run each request as blocks of at most this many generated tokens,
+    /// so a block's tokens read their own taps in the next block. `None` runs
+    /// it in one block.
+    pub franky_block_size: Option<NonZeroU32>,
 }
 
 impl ProxyConfig {
@@ -67,6 +71,7 @@ impl Default for ProxyConfig {
             max_backoff_ms: 2000,
             decode_dispatch_limit: None,
             stream_after_prefill: false,
+            franky_block_size: None,
         }
     }
 }
@@ -816,6 +821,8 @@ pub struct K8sDiscoveryConfig {
     /// EndpointSlice label key whose value is a worker's PD version group.
     /// Set only in PD mode.
     pub version_group_label: Option<String>,
+    /// Equality selector of Sandy workers' EndpointSlices, in either mode.
+    pub sandy_selector: Option<String>,
 }
 
 /// Validated selector mode. Plain selectors run server-side; PD selectors
@@ -870,6 +877,11 @@ pub enum ConfigError {
          leave the decode pool empty. The two selectors must differ."
     )]
     IdenticalPdSelectors,
+    #[error(
+        "discovery.k8s: `sandy_selector` is empty or equals another selector; classify_mode \
+         tags a matching slice as Sandy first, so it would take the Ricky workers too"
+    )]
+    SandySelectorNotDistinct,
 }
 
 /// An empty selector matches every slice, which is invalid for a PD role.
@@ -970,9 +982,77 @@ pub fn resolve_mode(
     }
 }
 
+/// Validate `sandy_selector` against the resolved `mode`. It is matched client-side,
+/// and with it the plain selector too, so both must use equality terms.
+pub fn resolve_sandy_selector(
+    mode: &K8sDiscoveryMode,
+    sandy_selector: Option<&str>,
+) -> Result<Option<String>, ConfigError> {
+    let Some(sandy) = sandy_selector else {
+        return Ok(None);
+    };
+    if !is_equality_selector(sandy) {
+        return Err(ConfigError::UnsupportedSelectorGrammar {
+            selector: "sandy",
+            value: sandy.to_string(),
+        });
+    }
+    let others = match mode {
+        K8sDiscoveryMode::Plain { label_selector } => {
+            if !is_equality_selector(label_selector) {
+                return Err(ConfigError::UnsupportedSelectorGrammar {
+                    selector: "label",
+                    value: label_selector.clone(),
+                });
+            }
+            vec![label_selector.as_str()]
+        }
+        K8sDiscoveryMode::PdDisaggregation {
+            prefill_selector,
+            decode_selector,
+        } => vec![prefill_selector.as_str(), decode_selector.as_str()],
+    };
+    let canonical = canonical_selector(sandy);
+    if is_selector_empty(sandy)
+        || others
+            .iter()
+            .any(|other| canonical_selector(other) == canonical)
+    {
+        return Err(ConfigError::SandySelectorNotDistinct);
+    }
+    Ok(Some(sandy.to_string()))
+}
+
 #[cfg(test)]
 mod k8s_discovery_config_tests {
     use super::*;
+
+    /// The Sandy selector runs client-side, as the plain selector then does, and
+    /// must not take another role's slices.
+    #[test]
+    fn sandy_selector_is_checked_against_the_mode() {
+        let plain = resolve_mode(Some("app=sglang"), None, None).unwrap();
+        let pd = resolve_mode(None, Some("role=prefill"), Some("role=decode")).unwrap();
+        let sandy = Some("role=sandy");
+        assert_eq!(resolve_sandy_selector(&plain, None).unwrap(), None);
+        assert_eq!(
+            resolve_sandy_selector(&pd, sandy).unwrap().as_deref(),
+            sandy
+        );
+        for (mode, selector) in [(&pd, "role=prefill"), (&plain, "app==sglang"), (&pd, ",")] {
+            assert!(matches!(
+                resolve_sandy_selector(mode, Some(selector)),
+                Err(ConfigError::SandySelectorNotDistinct)
+            ));
+        }
+        let set_based = resolve_mode(Some("app in (a,b)"), None, None).unwrap();
+        for (mode, selector) in [(&pd, "role!=sandy"), (&set_based, "role=sandy")] {
+            assert!(matches!(
+                resolve_sandy_selector(mode, Some(selector)),
+                Err(ConfigError::UnsupportedSelectorGrammar { .. })
+            ));
+        }
+    }
 
     #[test]
     fn mode_constructs_pd_disaggregation_from_prefill_and_decode_selectors() {

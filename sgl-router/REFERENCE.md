@@ -6,6 +6,7 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 - [Discovery and KV signals](#discovery-and-kv-signals)
 - [Bucket file membership](#bucket-file-membership)
 - [Routing and reliability](#routing-and-reliability)
+- [Franky pairs](#franky-pairs)
 - [Chat rendering](#chat-rendering)
 - [Native `/generate`](#native-generate)
 - [OpenAI over /generate](#openai-over-generate)
@@ -381,6 +382,74 @@ What stays the router's to own either way is the enforcement half: the
 queue slot and no engine round-trip — the `sampling_contract_violation` code
 and per-parameter counter, bands, and one contract applied at a shared ingress
 across engines whose own flags the router operator may not control.
+
+## Franky pairs
+
+A Franky pair serves one model with two engines per request: a Ricky engine
+(`--franky-side ricky`, plain or PD) answers it, and a Sandy engine
+(`--franky-side sandy`) computes the prompt's taps and sends them to Ricky. Both
+run behind one router, under the Ricky model's `--model-id`:
+
+```bash
+sgl-router --model-id ricky --chat-routing reorg --policy cache_aware \
+  --worker-urls http://ricky-0:30000 http://sandy-0:30000
+```
+
+- The router reads each engine's side from `/server_info` (`franky_side`). A
+  Sandy joins the router's model whatever name it serves under, and its tap
+  port is its `franky_bootstrap_port`.
+- Each request to a Ricky worker also gets a Sandy, picked from all Sandy
+  workers, not per bucket, by `--policy` and the admission flags as a prefill
+  group is. `cache_aware` picks the Sandy holding the longest cached prefix of
+  the prompt (Sandy publishes KV events with `--kv-events-config`); the legacy
+  path picks by load for other policies. `--dp-aware` picks Sandy's rank as it
+  picks a prefill's.
+- The Sandy request and every Ricky request (both legs under PD) carry the same
+  `franky_room`: Sandy's host, its tap port and a random `room`. Sandy gets the
+  same prompt on the same path, without PD fields.
+- Sandy's request runs like a PD prefill: to the end even if the client leaves.
+  Its failure ends the request with `prefill_failed` before Ricky's first token,
+  and a retry avoids that Sandy.
+- With no Sandy available, a Ricky request gets `503 no_sandy_workers_available`.
+  One model cannot mix Ricky workers with solo workers.
+- Franky pairs serve generation over HTTP only: native gRPC, embeddings,
+  classify and rerank are refused.
+- With Kubernetes discovery, `--sandy-selector` (equality terms) finds Sandy
+  EndpointSlices in plain or PD mode; next to `--selector`, that selector must
+  use equality terms too.
+
+### Blocks
+
+With `--franky-block-size N`, the router runs each Franky request as a chain of
+blocks of at most `N` generated tokens, so a block's tokens read their own taps
+in the next block:
+
+- Block `k` sends the prompt and every token of blocks `1..k-1` as `input_ids`
+  to the Sandy and the Ricky that answered block 1 (a failed attempt retries as
+  usual). Its rid is `{chain}-{k}`, and `franky_chain` carries the chain id, the
+  block number `k`, the block size, and whether this is the last block the total
+  `max_new_tokens` allows. Ricky uses the block size to recompute a block's
+  tokens with the taps its decode read: those before the block.
+- The chain goes on while Ricky's block ends at the block's token limit. The
+  client gets one response: frames continue across blocks, `meta_info` keeps
+  the first block's prompt fields and adds up the counts, and the chain's id
+  replaces each block's.
+- Between blocks each engine holds the chain's cached prefix. Unless the chain
+  ended with its last block, the router posts `/franky/end_chain` to its engines
+  when it ends: after a stop, an error, or a client that left.
+- Blocks need token ids (`input_ids`, or text or chat the router renders) and
+  one sequence. Batches, `n` above 1, constrained decoding, hidden states,
+  routed experts and sessions are refused with `400`, as is chat the router
+  does not lower to `/generate`: it lowers chat only for the templates it
+  renders as SGLang does (see [Chat rendering](#chat-rendering)).
+- A stop string across two blocks is not matched; each block checks its own
+  output.
+- Between two blocks a chain waits for Sandy to prefill the last block's tokens
+  and send their taps, and for Ricky to prefill them again. Both engines take a
+  chain's next block before new prompts, and Sandy runs without overlap
+  scheduling so a batch's taps leave right after its forward. Engines started
+  with a smaller `--chunked-prefill-size` (2048 in our runs) make a next block
+  wait less behind other prefills, at a small cost in throughput.
 
 ## Chat rendering
 
