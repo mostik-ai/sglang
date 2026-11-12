@@ -735,17 +735,18 @@ impl Cli {
 
 impl DiscoveryArgs {
     fn into_config(self) -> Result<DiscoveryBackend> {
-        let has_static = !self.worker_urls.is_empty() || self.worker_api;
-        let backend = match (has_static, self.service_discovery) {
+        let static_urls_backend = !self.worker_urls.is_empty() || self.worker_api;
+        let backend = match (static_urls_backend, self.service_discovery) {
             (true, true) => {
                 return Err(anyhow!(
-                    "--worker-urls and --service-discovery are mutually exclusive; pass exactly one"
+                    "--worker-urls and --worker-api are mutually exclusive with \
+                     --service-discovery; pass exactly one backend"
                 ));
             }
             (false, false) => {
                 return Err(anyhow!(
-                    "no discovery backend selected; pass --worker-urls <URL...> (static) \
-                     or --service-discovery (kubernetes)"
+                    "no discovery backend selected; pass --worker-urls <URL...> (static), \
+                     --worker-api (workers added at run time) or --service-discovery (kubernetes)"
                 ));
             }
             (true, false) => {
@@ -1689,6 +1690,31 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn the_worker_api_takes_workers_with_or_without_static_urls() {
+        for (urls, expected) in [
+            (vec![], vec![]),
+            (
+                vec!["--worker-urls", "http://x:30000"],
+                vec!["http://x:30000".to_owned()],
+            ),
+        ] {
+            let args = [urls, vec!["--worker-api"]].concat();
+            match into_config_owned(with_model(&args)).unwrap().discovery {
+                DiscoveryBackend::WorkerApi(s) => assert_eq!(s.urls, expected),
+                other => panic!("expected the worker API backend, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_the_worker_api_with_service_discovery() {
+        let err = into_config_owned(with_model(&["--worker-api", "--service-discovery"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--worker-api"), "got: {err}");
     }
 
     #[test]
