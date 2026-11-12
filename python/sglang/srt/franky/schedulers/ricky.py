@@ -10,8 +10,8 @@ from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
+from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
-from sglang.srt.franky.cache.tap_reading import FrankyTapReading
 from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
@@ -192,16 +192,21 @@ class RickyScheduler(Scheduler):
         if new_batch is not None:
             self.franky_receive_queue.on_started(reqs=new_batch.reqs)
             franky_parts = self.tp_worker.model_runner.franky_parts
-            franky_parts.tap_cache.set_readings(
+            franky_parts.tap_cache.set_generated_spans(
                 req_pool_indices=[req.kv.req_pool_idx for req in new_batch.reqs],
-                readings=[
-                    FrankyTapReading.of(
-                        tap_len=req.franky.tap_len,
-                        chain=req.franky_chain,
-                        earlier_answers=req.franky_generated_spans,
+                generated_spans=[
+                    (
+                        FrankyGeneratedSpans.of(
+                            earlier_answers=req.franky_generated_spans,
+                            num_input_tokens=len(req.origin_input_ids),
+                            chain=req.franky_chain,
+                        )
+                        if req.franky.tap_len > 0
+                        else None
                     )
                     for req in new_batch.reqs
                 ],
+                num_input_tokens=[len(req.origin_input_ids) for req in new_batch.reqs],
             )
         return new_batch, running_batch
 

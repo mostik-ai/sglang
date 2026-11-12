@@ -16,9 +16,12 @@ from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional
 
+from sglang.srt.franky.cache.generated_spans import (
+    FrankyGeneratedSpans,
+    GeneratedSpan,
+)
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE
-from sglang.srt.franky.cache.tap_reading import FrankyTapReading
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
 from sglang.srt.franky.parts.reader.query import reader as query_reader
@@ -56,37 +59,25 @@ class _Model(nn.Module):
 
 
 def _flash_attention_on_cpu(
-    *,
-    q,
-    k_cache,
-    v_cache,
-    page_table,
-    cache_seqlens,
-    cu_seqlens_q,
-    max_seqlen_q,
-    softmax_scale,
-    causal,
-    out,
+    *, q, k_cache, v_cache, page_table, cache_seqlens, softmax_scale, causal, out
 ):
     """FlashAttention's paged KV cache call needs a GPU, so this does what it does,
-    sequence by sequence: every token of a sequence attends to all its keys, a
-    token with no key gets zero, and only the sequences' rows are written.
+    one query row at a time: a row attends to the first ``cache_seqlens`` keys of
+    its pages, and a row with no key gets zero.
     """
     page_size = k_cache.shape[1]
     keys_of_slots = k_cache.reshape(-1, k_cache.shape[-1])
-    for sequence in range(len(cu_seqlens_q) - 1):
-        start, end = int(cu_seqlens_q[sequence]), int(cu_seqlens_q[sequence + 1])
-        num_keys = int(cache_seqlens[sequence])
+    for row in range(q.shape[0]):
+        num_keys = int(cache_seqlens[row])
+        if num_keys == 0:
+            out[row] = 0
+            continue
         slots = (
-            page_table[sequence].long()[:, None] * page_size + torch.arange(page_size)
+            page_table[row].long()[:, None] * page_size + torch.arange(page_size)
         ).flatten()[:num_keys]
         keys = keys_of_slots[slots].float()
-        for row in range(start, end):
-            if num_keys == 0:
-                out[row] = 0
-                continue
-            scores = q[row].float() @ keys.T * softmax_scale
-            out[row] = (torch.softmax(scores, dim=-1) @ keys).to(out.dtype)
+        scores = q[row, 0].float() @ keys.T * softmax_scale
+        out[row, 0] = (torch.softmax(scores, dim=-1) @ keys).to(out.dtype)
     return out
 
 
@@ -198,11 +189,14 @@ class _Files(CustomTestCase):
                     taps=taps,
                     kv_slots=self.req_to_token[row, :tap_len].long(),
                 )
-                parts.tap_cache.set_readings(
+                parts.tap_cache.set_generated_spans(
                     req_pool_indices=[row],
-                    readings=[
-                        FrankyTapReading(tap_len=tap_len, generation_start=tap_len)
+                    generated_spans=[
+                        FrankyGeneratedSpans(spans=(GeneratedSpan(start=tap_len),))
+                        if tap_len
+                        else None
                     ],
+                    num_input_tokens=[tap_len],
                 )
                 self.taps[encoder_id, row] = taps
         return parts
@@ -292,9 +286,12 @@ class TestReaders(_Files):
         parts = self._attach(
             model=model, config_path=config_path, weights_path=weights_path
         )
-        parts.tap_cache.set_readings(
+        parts.tap_cache.set_generated_spans(
             req_pool_indices=[4],
-            readings=[FrankyTapReading(tap_len=13, generation_start=5, block_size=4)],
+            generated_spans=[
+                FrankyGeneratedSpans(spans=(GeneratedSpan(start=5),), block_size=4)
+            ],
+            num_input_tokens=[13],
         )
         layer_output = torch.randn(10, _HIDDEN_SIZE)
 

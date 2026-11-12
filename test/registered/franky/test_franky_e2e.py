@@ -53,14 +53,13 @@ def _layer_output(output):
     return output[0] if isinstance(output, tuple) else output
 
 
-def _taps_read(position, *, tap_len, generation_start, block_size):
-    token = position + 1
+def _taps_to_read(token, *, generation_start, block_size):
     if token < generation_start:
         return 0
     if block_size is None:
-        return min(generation_start, tap_len)
+        return generation_start
     blocks = (token - generation_start) // block_size
-    return min(generation_start + blocks * block_size, tap_len)
+    return generation_start + blocks * block_size
 
 
 def _reader(weights, index, layer_output, taps, num_taps):
@@ -265,13 +264,12 @@ class TestFrankyEndToEnd(CustomTestCase):
         with torch.no_grad():
             for ids, (tokens, _) in zip(prompts, outputs):
                 num_taps = [
-                    _taps_read(
-                        position,
-                        tap_len=len(ids),
+                    _taps_to_read(
+                        row + 1,
                         generation_start=generation_start or len(ids),
                         block_size=block_size,
                     )
-                    for position in range(len(ids) + len(tokens) - 1)
+                    for row in range(len(ids) + len(tokens) - 1)
                 ]
                 state.update(
                     mode="taps",
