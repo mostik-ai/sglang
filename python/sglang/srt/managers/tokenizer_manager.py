@@ -71,7 +71,7 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
-from sglang.srt.franky.cache.tap_reading import check_earlier_answers
+from sglang.srt.franky.cache.generated_spans import checked_earlier_answers
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.layers.joint_schema_head import (
@@ -1694,7 +1694,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else None
             )
             franky_generated_spans = (
-                check_earlier_answers(
+                checked_earlier_answers(
                     obj.franky_generated_spans,
                     generation_start=len(input_ids_arr or ())
                     - (franky_chain.num_generated_before if franky_chain else 0),

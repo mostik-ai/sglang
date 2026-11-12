@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import nn
-from torch.nn import functional
 from typing_extensions import override
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
@@ -109,7 +108,7 @@ def attend_taps(
     *,
     view: TapView,
 ) -> None:
-    """Write each token's attended taps into ``attended``, and 1 or 0 into
+    """Write each row's attended taps into ``attended``, and 1 or 0 into
     ``has_taps`` by whether it read any.
     """
     padding = slice(view.num_tokens, None)
@@ -117,8 +116,11 @@ def attend_taps(
     has_taps[padding].zero_()
     if view.num_tokens == 0:
         return
-    found = _attend(queries, view, out=attended)
-    has_taps[: view.num_tokens, 0] = found.to(has_taps.dtype)
+    rows = slice(0, view.num_tokens)
+    reads = view.taps_to_read > 0
+    _attend(queries[rows], view, out=attended[rows])
+    attended[rows] = torch.where(reads[:, None, None], attended[rows], 0)
+    has_taps[rows, 0] = reads.to(has_taps.dtype)
 
 
 def attention_workspace(*, device: str) -> Optional[torch.Tensor]:
@@ -135,72 +137,43 @@ def attention_workspace(*, device: str) -> Optional[torch.Tensor]:
     return torch.zeros(256 << 20, dtype=torch.uint8, device=device)
 
 
-def _attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> torch.Tensor:
+def _attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
     if view.trtllm_workspace is None:
         _fa3_attend(queries, view, out=out)
     else:
         _trtllm_attend(queries, view, out=out)
-    found = torch.repeat_interleave(
-        view.lens > 0, view.cu_seqlens_q.diff(), output_size=view.num_tokens
-    )
-    tokens = slice(0, view.num_tokens)
-    # TRT-LLM leaves the rows of a sequence without keys as they were.
-    out[tokens] = torch.where(found[:, None, None], out[tokens], 0)
-    return found
 
 
 def _fa3_attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
     flash_attn_with_kvcache(
-        q=queries,
+        q=queries.unsqueeze(1),
         k_cache=view.taps,
         v_cache=view.taps,
         page_table=view.page_table,
-        cache_seqlens=view.lens,
-        cu_seqlens_q=view.cu_seqlens_q,
-        max_seqlen_q=view.max_seqlen_q,
+        cache_seqlens=view.taps_to_read,
         softmax_scale=queries.shape[-1] ** -0.5,
         causal=False,
-        out=out,
+        out=out.unsqueeze(1),
     )
 
 
 def _trtllm_attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
     # FA4 refuses paged KV with 256-wide heads; flashinfer exists only on GPU hosts.
-    from flashinfer import decode, prefill
+    from flashinfer import decode
 
     # With one head, [pages, page_size, 1, size] is also the HND layout.
     num_pages, page_size, _, tap_size = view.taps.shape
     taps = view.taps.view(num_pages, 1, page_size, tap_size)
-    max_kv_len = view.page_table.shape[1] * page_size
-    scale = tap_size**-0.5
-    if view.decode:
-        result = decode.trtllm_batch_decode_with_kv_cache(
-            query=queries,
-            kv_cache=(taps, taps),
-            workspace_buffer=view.trtllm_workspace,
-            block_tables=view.page_table,
-            seq_lens=view.lens,
-            max_seq_len=max_kv_len,
-            bmm1_scale=scale,
-            bmm2_scale=1.0,
-            out=out,
-        )
-    else:
-        result = prefill.trtllm_batch_context_with_kv_cache(
-            query=queries,
-            kv_cache=(taps, taps),
-            workspace_buffer=view.trtllm_workspace,
-            block_tables=view.page_table,
-            seq_lens=view.lens,
-            max_q_len=view.max_seqlen_q,
-            max_kv_len=max_kv_len,
-            bmm1_scale=scale,
-            bmm2_scale=1.0,
-            batch_size=view.cu_seqlens_q.shape[0] - 1,
-            cum_seq_lens_q=view.cu_seqlens_q,
-            cum_seq_lens_kv=functional.pad(view.lens.cumsum(0), (1, 0)).to(torch.int32),
-            causal=False,
-            out=out,
-        )
+    result = decode.trtllm_batch_decode_with_kv_cache(
+        query=queries,
+        kv_cache=(taps, taps),
+        workspace_buffer=view.trtllm_workspace,
+        block_tables=view.page_table,
+        seq_lens=view.taps_to_read,
+        max_seq_len=view.page_table.shape[1] * page_size,
+        bmm1_scale=tap_size**-0.5,
+        bmm2_scale=1.0,
+        out=out,
+    )
     if result is not out:
         out.copy_(result)

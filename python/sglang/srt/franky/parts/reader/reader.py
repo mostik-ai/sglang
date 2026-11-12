@@ -14,8 +14,8 @@ if TYPE_CHECKING:
 class Reader(nn.Module, ABC):
     """Runs on Ricky: turns one encoder's taps into what the injector adds.
 
-    A token reads the taps its request's ``FrankyTapReading`` gives it; a token
-    of a request without taps must get exactly zero.
+    A row reads the taps that its request's ``FrankyGeneratedSpans`` give the
+    token it makes; a row that reads none must get exactly zero.
 
     To add an implementation: make a folder here with its reader and its
     config, then add the config to ``ReaderConfig`` in ``config.py``.
