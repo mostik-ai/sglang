@@ -84,9 +84,9 @@ async fn errors_with_one_dead_worker(max_attempts: u32) -> usize {
     let registry = Arc::new(WorkerRegistry::default());
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
 
-    let (event_rx, _disc) = spawn_discovery(&cfg).await.unwrap();
+    let discovery = spawn_discovery(&cfg).await.unwrap();
     let _mgr = tokio::spawn(manager::run_with_config(
-        event_rx,
+        discovery.events,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
         None,

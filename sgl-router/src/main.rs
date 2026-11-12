@@ -9,7 +9,7 @@ use sgl_router::{
         CachePrefixProvider, ChatRoutingKind, Cli, Config, DiscoveryBackend,
         KvIndexerEndpointConfig, LogFormat, PolicyKind,
     },
-    discovery::{spawn_discovery_with_api, DiscoveryEvent, ModelId},
+    discovery::{spawn_discovery, ModelId},
     policies::{factory::build_registry as build_policy_registry, PolicyRegistry},
     policies_reorg::factory::{build_resolver as build_reorg_resolver, build_sandy_group},
     proxy::Proxy,
@@ -38,7 +38,6 @@ use tokio::{
     net::TcpListener,
     signal::unix::{signal, Signal, SignalKind},
     sync::{oneshot, watch},
-    task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -136,14 +135,14 @@ async fn main() -> Result<()> {
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
-    let (discovery_handle, worker_manager_handle, worker_events) =
-        start_worker_discovery_and_manager(
-            &config,
-            &worker_registry,
-            &engine_state,
-            &local_inflight_requests,
-        )
-        .await?;
+    let discovery = spawn_discovery(&config).await.context("spawn discovery")?;
+    let worker_manager_handle = tokio::spawn(manager::run_with_config(
+        discovery.events,
+        Arc::clone(&worker_registry),
+        Some(Arc::new(config.clone())),
+        Some(Arc::clone(&engine_state)),
+        Some(Arc::clone(&local_inflight_requests)),
+    ));
 
     // Share routing dependencies with HTTP handlers and mark startup complete.
     let mut app_context = build_app_context(
@@ -157,7 +156,7 @@ async fn main() -> Result<()> {
     )?;
     app_context.chat_routing = chat_routing;
     app_context.sandy = Some(sandy);
-    app_context.worker_events = worker_events;
+    app_context.worker_api_events = discovery.worker_api_events;
     let app_context = Arc::new(app_context);
     app_context.mark_ready();
 
@@ -181,7 +180,7 @@ async fn main() -> Result<()> {
     let outcome = serve(listener, grpc_listener, app_context, sigterm, sigint).await;
 
     // Stop background tasks once the HTTP server has finished draining.
-    discovery_handle.abort();
+    discovery.task.abort();
     worker_manager_handle.abort();
     inflight_cleanup.shutdown().await;
     if let Some(cleanup) = reorg_cleanup {
@@ -345,30 +344,6 @@ async fn start_peer_watch(config: &Config, engine_state: &Arc<KvEventIndex>) {
              config); the peer set stays unsynced",
         );
     }
-}
-
-async fn start_worker_discovery_and_manager(
-    config: &Config,
-    worker_registry: &Arc<WorkerRegistry>,
-    engine_state: &Arc<KvEventIndex>,
-    local_inflight_requests: &Arc<RouterInflightLoadRegistry>,
-) -> Result<(
-    JoinHandle<()>,
-    JoinHandle<()>,
-    Option<tokio::sync::mpsc::Sender<DiscoveryEvent>>,
-)> {
-    let (worker_events, discovery_handle, api_events) = spawn_discovery_with_api(config)
-        .await
-        .context("spawn discovery")?;
-    // Keep engine subscriptions and local request counters in sync with worker membership.
-    let worker_manager_handle = tokio::spawn(manager::run_with_config(
-        worker_events,
-        Arc::clone(worker_registry),
-        Some(Arc::new(config.clone())),
-        Some(Arc::clone(engine_state)),
-        Some(Arc::clone(local_inflight_requests)),
-    ));
-    Ok((discovery_handle, worker_manager_handle, api_events))
 }
 
 fn build_app_context(

@@ -95,7 +95,7 @@ pub struct AppContext {
     pub kv_index: Option<Arc<KvEventIndex>>,
     /// Where `/workers` sends the workers it adds and removes; `None` without
     /// `--worker-api`.
-    pub worker_events: Option<tokio::sync::mpsc::Sender<crate::discovery::DiscoveryEvent>>,
+    pub worker_api_events: Option<tokio::sync::mpsc::Sender<crate::discovery::DiscoveryEvent>>,
     readiness: AtomicU8,
 }
 
@@ -161,7 +161,7 @@ impl AppContext {
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
-            worker_events: None,
+            worker_api_events: None,
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
     }
@@ -272,7 +272,7 @@ impl AppContext {
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
-            worker_events: None,
+            worker_api_events: None,
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
     }

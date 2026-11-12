@@ -15,35 +15,33 @@ use tokio::sync::mpsc;
 /// growth under any pathological burst.
 pub const DISCOVERY_CHANNEL_CAP: usize = 128;
 
-/// Spawn the configured discovery backend.
-///
-/// Returns the consumer end of the event channel and a [`tokio::task::JoinHandle`]
-/// for the producer task.  The static_urls backend's task exits once the
-/// initial fan-out completes; the k8s backend's task runs for the lifetime
-/// of the watch.
-pub async fn spawn_discovery(
-    cfg: &Config,
-) -> Result<(mpsc::Receiver<DiscoveryEvent>, tokio::task::JoinHandle<()>)> {
-    let (rx, handle, _) = spawn_discovery_with_api(cfg).await?;
-    Ok((rx, handle))
+/// A running discovery backend.
+pub struct Discovery {
+    /// The workers the backend adds and removes, for the worker manager.
+    pub events: mpsc::Receiver<DiscoveryEvent>,
+    /// The backend's task. The static_urls backend's task exits once the
+    /// initial fan-out completes; the k8s backend's task runs for the lifetime
+    /// of the watch.
+    pub task: tokio::task::JoinHandle<()>,
+    /// Where `/workers` sends the workers it adds and removes under
+    /// [`DiscoveryBackend::WorkerApi`]; `None` otherwise.
+    pub worker_api_events: Option<mpsc::Sender<DiscoveryEvent>>,
 }
 
-/// As [`spawn_discovery`], plus the sender that `/workers` adds and removes
-/// workers through under [`DiscoveryBackend::WorkerApi`]; `None` otherwise.
-pub async fn spawn_discovery_with_api(
-    cfg: &Config,
-) -> Result<(
-    mpsc::Receiver<DiscoveryEvent>,
-    tokio::task::JoinHandle<()>,
-    Option<mpsc::Sender<DiscoveryEvent>>,
-)> {
-    let (tx, rx) = mpsc::channel(DISCOVERY_CHANNEL_CAP);
-    let api = matches!(cfg.discovery, DiscoveryBackend::WorkerApi(_)).then(|| tx.clone());
-    let handle = match &cfg.discovery {
+/// Spawn the configured discovery backend.
+pub async fn spawn_discovery(cfg: &Config) -> Result<Discovery> {
+    let (tx, events) = mpsc::channel(DISCOVERY_CHANNEL_CAP);
+    let worker_api_events =
+        matches!(cfg.discovery, DiscoveryBackend::WorkerApi(_)).then(|| tx.clone());
+    let task = match &cfg.discovery {
         DiscoveryBackend::StaticUrls(s) | DiscoveryBackend::WorkerApi(s) => {
             static_urls::spawn(s.clone(), tx).await?
         }
         DiscoveryBackend::K8s(k) => k8s::spawn(k.clone(), tx).await?,
     };
-    Ok((rx, handle, api))
+    Ok(Discovery {
+        events,
+        task,
+        worker_api_events,
+    })
 }

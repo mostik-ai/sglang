@@ -157,9 +157,9 @@ async fn static_urls_pd_role_resolved_end_to_end() {
     };
 
     let registry = Arc::new(WorkerRegistry::default());
-    let (event_rx, _disc) = spawn_discovery(&cfg).await.unwrap();
+    let discovery = spawn_discovery(&cfg).await.unwrap();
     let _mgr = tokio::spawn(manager::run_with_config(
-        event_rx,
+        discovery.events,
         registry.clone(),
         Some(Arc::new(cfg)),
         None,
