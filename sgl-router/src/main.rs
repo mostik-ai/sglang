@@ -24,7 +24,10 @@ use sgl_router::{
             spawn_janitor, JanitorHandle, RouterInflightLoadRegistry, SystemTimeClock,
         },
     },
-    tokenizer::TokenizerRegistry,
+    tokenizer::{
+        chat_template_adapter::{self, ChatTemplateAdapter},
+        TokenizerRegistry,
+    },
     workers::{introspect::worker_client, manager, WorkerRegistry},
 };
 use std::{
@@ -392,6 +395,7 @@ fn build_app_context(
         routing_policies,
         local_inflight_requests,
     );
+    app_context.franky_chat_adapter = franky_chat_adapter(config, &app_context.tokenizers)?;
     // An external indexer leaves the local tree empty.
     app_context.dp_rank_prefix_provider = (config.model.dp_aware
         && external_kv_indexer_client.is_none())
@@ -429,6 +433,21 @@ fn build_app_context(
     app_context.kv_metrics = engine_state.metrics_source();
     app_context.kv_index = engine_state.snapshot_source();
     Ok(app_context)
+}
+
+fn franky_chat_adapter(
+    config: &Config,
+    tokenizers: &TokenizerRegistry,
+) -> Result<Option<Arc<dyn ChatTemplateAdapter>>> {
+    let Some(kind) = config.proxy.franky_chat_adapter else {
+        return Ok(None);
+    };
+    let tokenizer = tokenizers.get(&config.model.id).context(
+        "--franky-chat-adapter reads the chats the router renders, so it needs the model's tokenizer",
+    )?;
+    let adapter =
+        chat_template_adapter::build(kind, &tokenizer).context("build --franky-chat-adapter")?;
+    Ok(Some(adapter))
 }
 
 /// How serving ended; `inflight_drain_secs` is `None` when the server stopped
@@ -663,6 +682,44 @@ mod tests {
         )
         .unwrap();
         assert!(ctx.dp_rank_prefix_provider.is_some());
+    }
+
+    fn franky_app_context(tokenizer_path: &str) -> Result<AppContext> {
+        let config = Cli::try_parse_from([
+            "sgl-router",
+            "--model-id=tiny",
+            &format!("--tokenizer-path={tokenizer_path}"),
+            "--worker-urls=http://127.0.0.1:1",
+            "--franky-chat-adapter=qwen3.5",
+        ])
+        .unwrap()
+        .into_config()
+        .unwrap();
+        build_app_context(
+            &config,
+            Arc::new(TokenizerRegistry::load_from_config(&config).unwrap()),
+            Default::default(),
+            Default::default(),
+            start_local_inflight_tracker(&config).0,
+            &start_engine_state_monitor(&config, false),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_franky_chat_adapter_reads_its_markers_from_the_served_tokenizer() {
+        let ctx = franky_app_context("tests/fixtures/tiny_qwen/tokenizer.json").unwrap();
+
+        assert!(ctx.franky_chat_adapter.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_tokenizer_without_the_chat_markers_fails_startup() {
+        let error = franky_app_context("tests/fixtures/tiny_tokenizer.json")
+            .err()
+            .unwrap();
+
+        assert!(format!("{error:#}").contains("<|im_start|>"), "{error:#}");
     }
 
     #[tokio::test]
