@@ -202,7 +202,12 @@ impl BlockChain {
         );
         body.insert(
             "franky_chain".into(),
-            json!({"id": self.id, "block": self.blocks_sent, "last_block": last_block}),
+            json!({
+                "id": self.id,
+                "block": self.blocks_sent,
+                "block_size": self.block_size,
+                "last_block": last_block,
+            }),
         );
         let sampling = body.entry("sampling_params").or_insert_with(|| json!({}));
         sampling["max_new_tokens"] = max_new_tokens.into();
