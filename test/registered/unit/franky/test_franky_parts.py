@@ -43,10 +43,10 @@ class _Parts(FrankyParts):
     def _weight_prefix(self):
         return "encoders"
 
-    def _parts(self):
+    def _parts_by_index(self):
         return {}
 
-    def _num_parts(self):
+    def _num_parts_on_all_stages(self):
         return 0
 
     def _tap_encoder_ids(self):

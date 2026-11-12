@@ -75,11 +75,11 @@ class RickyParts(FrankyParts):
         return "readers"
 
     @override
-    def _parts(self) -> dict[int, nn.Module]:
+    def _parts_by_index(self) -> dict[int, nn.Module]:
         return dict(self._readers)
 
     @override
-    def _num_parts(self) -> int:
+    def _num_parts_on_all_stages(self) -> int:
         return len(self.config.reader.layers)
 
     @override

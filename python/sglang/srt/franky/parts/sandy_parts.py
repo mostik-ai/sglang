@@ -101,11 +101,11 @@ class SandyParts(FrankyParts):
         return "encoders"
 
     @override
-    def _parts(self) -> dict[int, nn.Module]:
+    def _parts_by_index(self) -> dict[int, nn.Module]:
         return dict(self._encoders)
 
     @override
-    def _num_parts(self) -> int:
+    def _num_parts_on_all_stages(self) -> int:
         return len(self.config.encoder.layers)
 
     @override

@@ -166,12 +166,16 @@ class FrankyParts(ABC):
         Raises:
             ValueError: a name is not a weight of this side's parts.
         """
-        prefix, parts, num_parts = self._weight_prefix(), self._parts(), self._num_parts()
+        prefix = self._weight_prefix()
+        parts = self._parts_by_index()
+        num_parts = self._num_parts_on_all_stages()
         with torch.no_grad():
             for name, tensor in named_tensors:
                 side, index, weight = name.split(".", 2)
                 if side != prefix or not 0 <= int(index) < num_parts:
-                    raise ValueError(f"{name!r} is not a weight of this side's {prefix}")
+                    raise ValueError(
+                        f"{name!r} is not a weight of this side's {prefix}"
+                    )
                 part = parts.get(int(index))
                 if part is not None:
                     part.get_parameter(weight).copy_(tensor)
@@ -188,17 +192,14 @@ class FrankyParts(ABC):
 
     @abstractmethod
     def _weight_prefix(self) -> str:
-        """The first part of this side's weight names: encoders or readers."""
         raise NotImplementedError
 
     @abstractmethod
-    def _parts(self) -> dict[int, nn.Module]:
-        """This rank's encoders or readers, by index."""
+    def _parts_by_index(self) -> dict[int, nn.Module]:
         raise NotImplementedError
 
     @abstractmethod
-    def _num_parts(self) -> int:
-        """This side's encoders or readers on every PP stage."""
+    def _num_parts_on_all_stages(self) -> int:
         raise NotImplementedError
 
     @abstractmethod
