@@ -295,12 +295,14 @@ impl StreamOutcome {
 }
 
 /// Worker dispatch mode label — narrowed to the three modes the policy
-/// resolver distinguishes. The `Plain` variant covers the non-PD case.
+/// resolver distinguishes, plus a Franky request's Sandy. The `Plain` variant
+/// covers the non-PD case.
 #[derive(Debug, Clone, Copy)]
 pub enum WorkerModeLabel {
     Prefill,
     Decode,
     Plain,
+    Sandy,
 }
 
 impl WorkerModeLabel {
@@ -309,6 +311,7 @@ impl WorkerModeLabel {
             Self::Prefill => "prefill",
             Self::Decode => "decode",
             Self::Plain => "plain",
+            Self::Sandy => "sandy",
         }
     }
 }

@@ -43,6 +43,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
                     WorkerMode::Plain => "plain",
                     WorkerMode::Prefill => "prefill",
                     WorkerMode::Decode => "decode",
+                    WorkerMode::Sandy => "sandy",
                 },
                 healthy: cb.admit,
                 cb_state: cb.state_code,
@@ -450,6 +451,7 @@ mod tests {
                 },
                 peer_selector: Some("kubernetes.io/service-name=sgl-router".into()),
                 version_group_label: None,
+                sandy_selector: None,
             })
         };
 

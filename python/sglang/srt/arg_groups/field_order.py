@@ -552,5 +552,9 @@ POSITIONAL_FIELD_ORDER = (
     "enable_return_aux_hidden_states",
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
+    "franky_side",
+    "franky_config",
+    "franky_weights",
+    "franky_bootstrap_port",
 )
 # fmt: on

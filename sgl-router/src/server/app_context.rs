@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::buckets_reorg::BucketResolver;
+use crate::buckets_reorg::{BucketResolver, EngineGroup};
 use crate::config::Config;
 use crate::discovery::ModelId;
 
@@ -59,6 +59,8 @@ pub struct AppContext {
     pub bucket_selector: Arc<BucketSelector>,
     /// Select legacy policies or model-specific bucket-first routing.
     pub chat_routing: ChatRouting,
+    /// Where a Franky Ricky's Sandy is picked from, under either routing.
+    pub sandy: Option<EngineGroup>,
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub router_inflight_load: Arc<RouterInflightLoadRegistry>,
@@ -139,6 +141,7 @@ impl AppContext {
             policies,
             bucket_selector,
             chat_routing: ChatRouting::Legacy,
+            sandy: None,
             router_inflight_load,
             decode_gate,
             metrics,
@@ -247,6 +250,7 @@ impl AppContext {
             policies: Arc::new(PolicyRegistry::default()),
             bucket_selector: Arc::new(BucketSelector::new(None)),
             chat_routing: ChatRouting::Legacy,
+            sandy: None,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
             decode_gate: DecodeGate::new(None),
             metrics: MetricsRegistry::new(),

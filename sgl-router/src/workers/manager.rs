@@ -7,7 +7,7 @@ use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::state::kv_events::KvEventIndex;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::workers::introspect::{
-    worker_client, DisaggregationRole, WorkerIntrospector, SERVER_INFO_TIMEOUT,
+    worker_client, DisaggregationRole, FrankyRole, WorkerIntrospector, SERVER_INFO_TIMEOUT,
 };
 use crate::workers::{EngineProfile, WireProtocol, Worker, WorkerRegistry};
 use std::collections::HashMap;
@@ -565,6 +565,14 @@ async fn register_one(
             spec.bootstrap_port = new_port;
         }
     }
+    // A Sandy serves the router's model as its frozen half, whatever name it serves under.
+    if let Some(FrankyRole::Sandy { bootstrap_port }) = info.franky_role {
+        spec.mode = WorkerMode::Sandy;
+        spec.bootstrap_port = Some(bootstrap_port);
+        if let Some(cfg) = &cfg {
+            spec.model_ids = vec![ModelId(cfg.model.id.clone())];
+        }
+    }
     // `--decode-dispatch-limit` sends a request to decode only once earlier
     // KV has arrived, and a default prefill engine computes only once decode
     // has bootstrapped, so the two would wait on each other: at most N
@@ -609,6 +617,7 @@ async fn register_one(
         dp_ranks: info.dp_ranks,
         openai: info.openai.map(Arc::new),
         grpc_port: info.grpc_port,
+        needs_taps: info.franky_role == Some(FrankyRole::Ricky),
     };
     if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
@@ -620,7 +629,7 @@ async fn register_one(
         tracing::error!(
             worker_url = %worker_url,
             error = %e,
-            "worker manager: refused to register worker due to mixed PD/plain configuration",
+            "worker manager: refused to register worker due to mixed PD/plain or Franky/solo configuration",
         );
         return;
     }

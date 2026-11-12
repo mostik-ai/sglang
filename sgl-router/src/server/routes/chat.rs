@@ -14,6 +14,8 @@ use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
 use crate::policies::{Policy, PrefixLookupResult};
+use crate::policies_reorg::cache_aware::PrefixMemo;
+use crate::policies_reorg::{PickRequest, Stage};
 use crate::proxy::grpc::{EngineRpc, GrpcResponse, TypedRpc};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
@@ -130,7 +132,14 @@ pub async fn route_grpc<R: EngineRpc>(
     Option<RequestLogContext>,
 ) {
     let start = Instant::now();
-    match prepare(ctx, endpoint, &headers, body, true).await {
+    let prepared =
+        prepare(ctx, endpoint, &headers, body, true)
+            .await
+            .and_then(|(request, routing)| {
+                refuse_franky_over_grpc(ctx, &request.model)?;
+                Ok((request, routing))
+            });
+    match prepared {
         Ok((mut request, routing)) => {
             forward_request_grpc(rpc, ctx, &mut request, &routing, headers, start).await
         }
@@ -156,6 +165,7 @@ pub async fn route_typed<R: TypedRpc>(
         if path != GENERATE_PATH {
             require_plain_workers(ctx, &model, path)?;
         }
+        refuse_franky_over_grpc(ctx, &model)?;
         let prepared = PreparedRequest::typed(ctx, path, model, &request.view())?;
         Ok::<_, ApiError>((prepared, routing))
     };
@@ -242,8 +252,13 @@ async fn prepare<'a>(
     Ok((request, routing))
 }
 
-/// Prefill and decode engines serve generation only.
+/// Prefill and decode engines serve generation only, as do Franky pairs.
 fn require_plain_workers(ctx: &AppContext, model: &ModelId, path: &str) -> Result<(), ApiError> {
+    if serves_franky(ctx, model) {
+        return Err(ApiError::BadRequest(format!(
+            "{path} is not served by Franky workers"
+        )));
+    }
     let registered = ctx.registry.workers_for(model);
     if registered.iter().any(|w| w.mode() != WorkerMode::Plain) {
         return Err(ApiError::BadRequest(format!(
@@ -251,6 +266,21 @@ fn require_plain_workers(ctx: &AppContext, model: &ModelId, path: &str) -> Resul
         )));
     }
     Ok(())
+}
+
+/// Franky requests carry the room of their taps over HTTP only.
+fn refuse_franky_over_grpc(ctx: &AppContext, model: &ModelId) -> Result<(), ApiError> {
+    if serves_franky(ctx, model) {
+        return Err(ApiError::BadRequest(format!(
+            "model {model} is served by Franky workers, over HTTP only"
+        )));
+    }
+    Ok(())
+}
+
+fn serves_franky(ctx: &AppContext, model: &ModelId) -> bool {
+    (ctx.registry.workers_for(model).iter())
+        .any(|w| w.needs_taps() || w.mode() == WorkerMode::Sandy)
 }
 
 /// A model's routing state, resolved before the request is prepared.
@@ -343,7 +373,7 @@ impl<'a> ModelRouting<'a> {
     }
 
     /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,
-    /// never one in `excluded`.
+    /// and a Sandy when they read taps, never one in `excluded`.
     async fn select_workers(
         &self,
         ctx: &AppContext,
@@ -351,7 +381,8 @@ impl<'a> ModelRouting<'a> {
         headers: &HeaderMap,
         excluded: &[WorkerId],
     ) -> Result<SelectedWorkers, ApiError> {
-        match self {
+        let prefix = PrefixMemo::default();
+        let mut workers = match self {
             Self::Legacy(policy) => {
                 // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
                 let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry)).excluding(excluded);
@@ -366,13 +397,56 @@ impl<'a> ModelRouting<'a> {
                     &candidates,
                     &resolver,
                 )
-                .await
+                .await?
             }
             Self::Reorg(resolver) => {
-                reorg::select_workers(ctx, resolver, request, headers, excluded).await
+                reorg::select_workers(ctx, resolver, request, headers, excluded, &prefix).await?
             }
+        };
+        if workers.prefill.needs_taps() {
+            workers.sandy = Some(pick_sandy(ctx, request, headers, excluded, &prefix).await?);
         }
+        Ok(workers)
     }
+}
+
+/// The Sandy that sends a Franky request's taps: the model's Sandy group picks
+/// it, by prefix when its policy is cache-aware.
+async fn pick_sandy(
+    ctx: &AppContext,
+    request: &PreparedRequest,
+    headers: &HeaderMap,
+    excluded: &[WorkerId],
+    prefix: &PrefixMemo,
+) -> Result<Arc<Worker>, ApiError> {
+    let model = &request.model;
+    let group = ctx
+        .sandy
+        .as_ref()
+        .ok_or_else(|| ApiError::NoSandyWorkersAvailable {
+            model: model.0.clone(),
+        })?;
+    let session_key = (ctx.config.model.affinity.as_ref())
+        .and_then(|config| nonempty_header(headers, &config.session_id_header));
+    let routing_key = (ctx.config.model.sticky.as_ref())
+        .and_then(|config| nonempty_header(headers, &config.header_name));
+    let pick_request = PickRequest {
+        bucket: "sandy",
+        total_input_tokens: request.input_token_count as u64,
+        expected_peak_tokens: request.expected_peak_sequence_tokens,
+        prefix: Some(prefix),
+        token_ids: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        cache_namespace: &request.cache_namespace,
+        session_key,
+        routing_key,
+        ..PickRequest::new(model, Stage::Sandy, request.sequence_token_count as u64)
+    };
+    let pick = group
+        .pick_excluding(&ctx.registry, &pick_request, excluded)
+        .await
+        .map_err(|error| reorg::selection_error(error, model, Some(Stage::Sandy)))?;
+    record_prefill_route(ctx, prefix.local_signal().as_deref(), &pick.engine.url);
+    Ok(pick.engine)
 }
 
 fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
@@ -406,6 +480,7 @@ async fn select_workers(
     Ok(SelectedWorkers {
         prefill,
         decode,
+        sandy: None,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
     })
 }

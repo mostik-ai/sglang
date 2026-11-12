@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -487,7 +488,7 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen3Model(Qwen2Model):
+class Qwen3Model(FrankyMixin, Qwen2Model):
     def __init__(
         self,
         config: Qwen3Config,
@@ -520,6 +521,7 @@ class Qwen3Model(Qwen2Model):
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
+            self.franky_read_pp(pp_proxy_tensors=pp_proxy_tensors)
         aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[i](
@@ -530,8 +532,13 @@ class Qwen3Model(Qwen2Model):
                 if i in self.layers_to_capture
                 else None,
             )
+            hidden_states = self.franky_after_layer(
+                layer_idx=i, hidden_states=hidden_states, forward_batch=forward_batch
+            )
         if not self.pp_group.is_last_rank:
-            return residual_batch.to_pp(hidden_states, forward_batch)
+            pp_proxy_tensors = residual_batch.to_pp(hidden_states, forward_batch)
+            self.franky_write_pp(pp_proxy_tensors=pp_proxy_tensors)
+            return pp_proxy_tensors
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
         )

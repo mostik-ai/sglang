@@ -24,7 +24,7 @@ fn pd_ctx(prefill: &str, decode: &str, reorg: bool) -> Arc<AppContext> {
         let mutable = Arc::get_mut(&mut ctx).unwrap();
         mutable.config.model.policy = PolicyKind::PowerOfTwo;
         let state = sgl_router::state::kv_events::KvEventIndex::new();
-        let (resolver, _) = sgl_router::policies_reorg::factory::build_resolver(
+        let (resolver, _, _) = sgl_router::policies_reorg::factory::build_resolver(
             &mutable.config.model,
             &state,
             None,

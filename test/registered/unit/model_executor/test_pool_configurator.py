@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.franky.cache.kv_options import FrankyKvOptions
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
     make_page_shard_spec,
@@ -259,6 +260,31 @@ class TestDefaultConfigurator(CustomTestCase):
         available = 10_000_000
         _, _, config = self._run(available, page_size=128)
         self.assertEqual(config.max_total_num_tokens % 128, 0)
+
+    def test_franky_taps_share_the_kv_budget(self):
+        """tokens = budget / (KV bytes + tap bytes), so KV and taps hold as many."""
+        available = 10_000_000
+        tap_bytes = 2048
+        _, plain_cfg, plain = self._run(available)
+
+        mr = _make_model_runner(self)
+        mr.franky_kv_options = FrankyKvOptions(
+            tap_bytes_per_token=tap_bytes, paged_allocator_cls=object
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            config = create_memory_pool_configurator(mr).calculate_pool_sizes(
+                available, 1
+            )
+
+        self.assertEqual(
+            config.max_total_num_tokens,
+            available // (plain_cfg._cell_size + tap_bytes),
+        )
+        self.assertLess(config.max_total_num_tokens, plain.max_total_num_tokens)
 
     def test_eight_context_scratch_is_reserved_before_kv_pool_sizing(self):
         page_size = 16

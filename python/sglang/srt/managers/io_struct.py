@@ -52,6 +52,7 @@ from pydantic import PlainValidator
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
+from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
@@ -293,6 +294,9 @@ class GenerateReqInput:
     bootstrap_room: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_pair_key: Optional[Union[List[Optional[str]], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
+    # Franky: where the request's taps meet, as {"bootstrap_host", "bootstrap_port",
+    # "room"}. One room for a batch gives each request the next room.
+    franky_room: Optional[Union[List[Optional[Dict[str, Any]]], Dict[str, Any]]] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -946,6 +950,16 @@ class GenerateReqInput:
         elif isinstance(self.decode_tp_size, list):
             self.decode_tp_size = self.decode_tp_size * self.parallel_sample_num
 
+        if self.franky_room is None:
+            self.franky_room = [None] * num
+        elif not isinstance(self.franky_room, list):
+            self.franky_room = [
+                {**self.franky_room, "room": self.franky_room["room"] + i}
+                for i in range(num)
+            ]
+        else:
+            self.franky_room = self.franky_room * self.parallel_sample_num
+
     def _get_positional_embed_overrides_item(
         self, i: int
     ) -> Optional[PositionalEmbeds]:
@@ -1030,6 +1044,7 @@ class GenerateReqInput:
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
+            franky_room=self.franky_room[i] if self.franky_room is not None else None,
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
@@ -1119,6 +1134,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
+    franky_room: Optional[FrankyRoom] = None
 
     # For DP routing
     routed_dp_rank: Optional[int] = None

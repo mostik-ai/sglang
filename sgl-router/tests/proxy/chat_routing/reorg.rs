@@ -173,7 +173,7 @@ async fn bucket_config_limits_reject_before_dispatch_and_admit_after_load_drops(
         }]}))
         .unwrap(),
     );
-    let (resolver, _) = build_resolver(&ctx.config.model, &state, None).unwrap();
+    let (resolver, _, _) = build_resolver(&ctx.config.model, &state, None).unwrap();
     ctx.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
     let ctx = Arc::new(ctx);
     let engine = ctx.registry.get(&WorkerId("w".into())).unwrap();
@@ -728,7 +728,7 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
     mutable.config.model.policy = PolicyKind::PowerOfTwo;
     mutable.config.model.reorg_admission.max_inflight_requests = Some(1);
     let state = sgl_router::state::kv_events::KvEventIndex::new();
-    let (resolver, _) =
+    let (resolver, _, _) =
         sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None)
             .unwrap();
     mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
@@ -840,7 +840,7 @@ async fn load_only_routing_forwards_messages_without_a_tokenizer() {
             Arc::new(TokenizerRegistry::load_from_config(&mutable.config).unwrap());
         if reorg {
             let state = sgl_router::state::kv_events::KvEventIndex::new();
-            let (resolver, _) = sgl_router::policies_reorg::factory::build_resolver(
+            let (resolver, _, _) = sgl_router::policies_reorg::factory::build_resolver(
                 &mutable.config.model,
                 &state,
                 None,
@@ -883,7 +883,7 @@ async fn only_prefix_reading_routing_needs_request_tokens() {
             "legacy {policy:?}"
         );
         let state = sgl_router::state::kv_events::KvEventIndex::new();
-        let (resolver, _) =
+        let (resolver, _, _) =
             sgl_router::policies_reorg::factory::build_resolver(&cfg.model, &state, None).unwrap();
         let reorg = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
         assert_eq!(

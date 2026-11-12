@@ -153,6 +153,8 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.franky.cache.tap_cache import FrankyReqState
+    from sglang.srt.franky.transfer.messages import FrankyRoom
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
@@ -1063,6 +1065,7 @@ class Req(ReqDllmMixin):
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        franky_room: Optional[FrankyRoom] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1409,6 +1412,8 @@ class Req(ReqDllmMixin):
         # that forward's output is dropped and the request finishes with it.
         self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+        self.franky: Optional[FrankyReqState] = None
+        self.franky_room: Optional[FrankyRoom] = franky_room
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
@@ -1773,6 +1778,9 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.franky is not None:
+            # Ricky took KV pages past this prefix at arrival, and taps landed in them.
+            max_prefix_len = min(max_prefix_len, self.franky.taken_from)
         if self.is_dllm():
             # Appended masks and a partial prompt/output block are not reusable
             # KV: bidirectional attention depends on the rest of that block.

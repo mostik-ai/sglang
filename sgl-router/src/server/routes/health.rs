@@ -3,6 +3,7 @@
 
 use crate::discovery::ModelId;
 use crate::policies::registry::PdPoolResolver;
+use crate::policies_reorg::Stage;
 use crate::server::app_context::{AppContext, ChatRouting};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -15,7 +16,8 @@ pub async fn healthz() -> StatusCode {
 
 /// Ready after startup only when ALL hold:
 /// 1. `mark_ready()` was called.
-/// 2. The configured model has a usable plain or PD pool.
+/// 2. The configured model has a usable plain or PD pool, and a Sandy when
+///    its workers read taps.
 /// 3. Peer bootstrap has settled (`BootstrapTracker::settled`): every rank
 ///    resolved, or the `--kv-bootstrap-timeout-ms` deadline passed. Always
 ///    true without cache-aware and `--kv-peer-selector`.
@@ -42,7 +44,11 @@ pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
                 .any(|bucket| bucket.has_ready_workers(&ctx.registry, &model))
         }),
     };
-    if pool_ready && ctx.kv_bootstrap_admit_ready() {
+    // A Ricky that reads taps serves nothing until a Sandy can send them.
+    let sandy_ready = !(ctx.registry.workers_for(&model).iter()).any(|w| w.needs_taps())
+        || (ctx.sandy.as_ref())
+            .is_some_and(|group| group.has_members(&ctx.registry, &model, Stage::Sandy));
+    if pool_ready && sandy_ready && ctx.kv_bootstrap_admit_ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -301,6 +307,45 @@ mod tests {
             readyz_status(ctx_with_tracker(tracker)).await,
             StatusCode::SERVICE_UNAVAILABLE,
         );
+    }
+
+    /// A Ricky that reads taps leaves the router unready until a Sandy joins.
+    #[tokio::test]
+    async fn readiness_waits_for_a_sandy_when_ricky_reads_taps() {
+        use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+        use crate::state::kv_events::KvEventIndex;
+        use crate::workers::{EngineProfile, WireProtocol};
+
+        let mut ctx = AppContext::stub();
+        ctx.mark_ready();
+        let sandy_group = crate::policies_reorg::factory::build_sandy_group(
+            &ctx.config.model,
+            &KvEventIndex::new(),
+            None,
+        );
+        ctx.sandy = Some(sandy_group.unwrap().0);
+        let ctx = Arc::new(ctx);
+        let spec = |id: &str, mode| WorkerSpec {
+            id: WorkerId(id.into()),
+            url: format!("http://{id}:30000"),
+            mode,
+            model_ids: vec![ModelId(ctx.config.model.id.clone())],
+            bootstrap_port: (mode == WorkerMode::Sandy).then_some(8996),
+            ..Default::default()
+        };
+        let ricky = EngineProfile {
+            needs_taps: true,
+            ..EngineProfile::from(WireProtocol::default())
+        };
+        (ctx.registry)
+            .add_with_cb(spec("ricky", WorkerMode::Plain), None, ricky)
+            .unwrap();
+        assert_eq!(
+            readyz(State(Arc::clone(&ctx))).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        ctx.registry.add(spec("sandy", WorkerMode::Sandy)).unwrap();
+        assert_eq!(readyz(State(ctx)).await, StatusCode::OK);
     }
 
     fn test_ctx(ready: bool, with_worker: bool) -> Arc<AppContext> {

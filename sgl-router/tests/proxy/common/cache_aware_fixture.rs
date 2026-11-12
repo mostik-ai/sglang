@@ -152,7 +152,7 @@ pub fn reorg_radix_router(
     let cfg = radix_config();
     let oracle = state.block_size_oracle();
     oracle.try_set(1).unwrap();
-    let (resolver, _) = build_resolver(&cfg.model, state, None).unwrap();
+    let (resolver, _, _) = build_resolver(&cfg.model, state, None).unwrap();
     let mut ctx = AppContext::new(
         cfg.clone(),
         Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap()),

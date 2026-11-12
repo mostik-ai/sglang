@@ -1343,6 +1343,10 @@ def get_disagg() -> _ConfigBag:
     return _CONTEXT.config_bag("disagg")
 
 
+def get_franky() -> _ConfigBag:
+    return _CONTEXT.config_bag("franky")
+
+
 def get_serving() -> _ConfigBag:
     return _CONTEXT.config_bag("serving")
 
