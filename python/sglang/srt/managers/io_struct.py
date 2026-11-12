@@ -300,8 +300,6 @@ class GenerateReqInput:
     franky_room: Optional[Union[List[Optional[Dict[str, Any]]], Dict[str, Any]]] = None
     # Franky: the chain this request is a block of, as FrankyChain's fields.
     franky_chain: Optional[Dict[str, Any]] = None
-    # Franky: the [start, end) runs of input_ids that Ricky generated in earlier
-    # turns, so that their recompute reads the taps their decode read.
     franky_generated_spans: Optional[List[List[int]]] = None
 
     # For DP routing — external router assigns a specific DP worker
