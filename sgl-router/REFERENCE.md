@@ -451,6 +451,25 @@ in the next block:
   with a smaller `--chunked-prefill-size` (2048 in our runs) make a next block
   wait less behind other prefills, at a small cost in throughput.
 
+### Earlier answers
+
+A Franky request lists the answers Ricky generated in its earlier turns as
+`franky_generated_spans`: `[start, end)` runs of its `input_ids`. Ricky
+recomputes those tokens with the taps their decode read.
+
+- `/generate` clients, and chat clients that send `input_ids` (Miles' session
+  server), send their own spans; the router passes them on unchanged.
+- For a chat that sends only messages, `--franky-chat-adapter qwen3.5` names
+  the served model's chat template. The router renders the chat as usual, the
+  adapter finds the earlier answers in the rendered ids, and both engines get
+  those ids with the spans: in the `/generate` body when the router lowers the
+  chat, otherwise in the chat body. A Qwen3.5 answer starts after
+  `<|im_start|>assistant\n` and then `<think>\n\n</think>\n\n` or `<think>\n`
+  when one follows, and ends with its `<|im_end|>`.
+- A Franky chat gets `400` for `franky_generated_spans` without `input_ids`,
+  and for assistant messages without `--franky-chat-adapter` or in a chat the
+  router leaves to the engine to render (see [Chat rendering](#chat-rendering)).
+
 ## Chat rendering
 
 The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's
