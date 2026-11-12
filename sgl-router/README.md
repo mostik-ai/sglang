@@ -101,6 +101,7 @@ every flag.
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
 | `POST /flush_cache` | Fan out a cache flush to every worker |
+| `POST`/`GET /workers`, `DELETE /workers/{id}` | Add, list and remove workers with `--worker-api`, see [Workers added at run time](REFERENCE.md#workers-added-at-run-time) |
 | `GET /healthz`, `/readyz` | Liveness and readiness |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
@@ -113,7 +114,7 @@ engine's [native gRPC](#native-grpc) API.
 | Area | Flags |
 | --- | --- |
 | Model | `--model-id`, `--tokenizer-path`, `--no-tokenizer` |
-| Engines | `--worker-urls`, or `--service-discovery` with `--selector` (plain) or `--prefill-selector` + `--decode-selector` (P/D), plus `--sandy-selector` for Franky pairs |
+| Engines | `--worker-urls` and `--worker-api`, or `--service-discovery` with `--selector` (plain) or `--prefill-selector` + `--decode-selector` (P/D), plus `--sandy-selector` for Franky pairs |
 | Routing | `--chat-routing reorg`, `--policy`, `--bucket-config`, `--affinity-*`, `--session-id-header` |
 | Admission | `--max-inflight-requests`, `--max-waiting-requests`, `--max-pending-prefill-tokens`, `--max-running-usage`, `--max-kv-usage` |
 | Reliability | `--retry-max-attempts`, `--request-timeout-secs`, `--stale-request-timeout-secs` |
@@ -301,7 +302,8 @@ native gRPC port, so engines must run with `--grpc-port` too. See
 A Ricky engine's requests also go to a Sandy engine, which sends Ricky the
 prompt's taps; Sandy is picked by `--policy`, cache-aware by its own prefix.
 `--franky-block-size` runs each request as blocks, so generated tokens read
-their own taps in the next block. See [Franky pairs](REFERENCE.md#franky-pairs).
+their own taps in the next block. `--franky-chat-adapter` marks the earlier
+answers in the chats the router renders. See [Franky pairs](REFERENCE.md#franky-pairs).
 
 ### Bucket file
 

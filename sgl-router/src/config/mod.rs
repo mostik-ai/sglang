@@ -98,37 +98,43 @@ impl Config {
                     !s.urls.is_empty(),
                     "discovery.static_urls.urls must be a non-empty list"
                 );
-                // Normalize URLs before deduplication so trailing slashes cannot register a worker twice.
-                let mut seen = std::collections::HashSet::new();
-                for raw in &s.urls {
-                    let trimmed = raw.trim();
-                    ensure!(
-                        !trimmed.is_empty(),
-                        "discovery.static_urls.urls contains an empty or whitespace-only entry"
-                    );
-                    let parsed = url::Url::parse(trimmed).map_err(|e| {
-                        anyhow!("discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}")
-                    })?;
-                    match parsed.scheme() {
-                        "http" | "https" => {}
-                        other => {
-                            return Err(anyhow!(
-                                "discovery.static_urls.urls entry {raw:?} has unsupported scheme {other:?}; only http and https are supported"
-                            ));
-                        }
-                    }
-                    let normalized = parsed.as_str().trim_end_matches('/').to_string();
-                    ensure!(
-                        seen.insert(normalized.clone()),
-                        "discovery.static_urls.urls contains duplicate entry {raw:?} (normalized: {normalized:?})"
-                    );
-                }
+                validate_static_urls(&s.urls)?;
             }
+            DiscoveryBackend::WorkerApi(s) => validate_static_urls(&s.urls)?,
             // Kubernetes selector combinations are validated by `resolve_mode` during construction.
             DiscoveryBackend::K8s(_) => {}
         }
         Ok(())
     }
+}
+
+fn validate_static_urls(urls: &[String]) -> Result<()> {
+    // Normalize URLs before deduplication so trailing slashes cannot register a worker twice.
+    let mut seen = std::collections::HashSet::new();
+    for raw in urls {
+        let trimmed = raw.trim();
+        ensure!(
+            !trimmed.is_empty(),
+            "discovery.static_urls.urls contains an empty or whitespace-only entry"
+        );
+        let parsed = url::Url::parse(trimmed).map_err(|e| {
+            anyhow!("discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}")
+        })?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => {
+                return Err(anyhow!(
+                    "discovery.static_urls.urls entry {raw:?} has unsupported scheme {other:?}; only http and https are supported"
+                ));
+            }
+        }
+        let normalized = parsed.as_str().trim_end_matches('/').to_string();
+        ensure!(
+            seen.insert(normalized.clone()),
+            "discovery.static_urls.urls contains duplicate entry {raw:?} (normalized: {normalized:?})"
+        );
+    }
+    Ok(())
 }
 
 fn validate_bucket_config(bucket_config: &BucketConfig) -> Result<()> {

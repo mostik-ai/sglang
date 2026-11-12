@@ -38,6 +38,10 @@ pub struct ProxyConfig {
     /// so a block's tokens read their own taps in the next block. `None` runs
     /// it in one block.
     pub franky_block_size: Option<NonZeroU32>,
+    /// Franky: the chat template whose earlier answers the router marks in the
+    /// chats it renders. `None` refuses a Franky chat with earlier answers
+    /// unless it carries `input_ids`.
+    pub franky_chat_adapter: Option<ChatTemplateAdapterKind>,
 }
 
 impl ProxyConfig {
@@ -72,6 +76,7 @@ impl Default for ProxyConfig {
             decode_dispatch_limit: None,
             stream_after_prefill: false,
             franky_block_size: None,
+            franky_chat_adapter: None,
         }
     }
 }
@@ -112,6 +117,13 @@ pub enum TokenizerBackend {
     /// `fastokens` BPE encoding with Hugging Face decoding.
     #[value(name = "fast")]
     Fast,
+}
+
+/// Chat templates whose earlier answers the router can find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ChatTemplateAdapterKind {
+    #[value(name = "qwen3.5")]
+    Qwen35,
 }
 
 /// Router tokenizer encode settings.
@@ -772,6 +784,9 @@ pub fn default_cb_cool_down() -> u64 {
 #[derive(Debug, Clone)]
 pub enum DiscoveryBackend {
     StaticUrls(StaticUrlsDiscoveryConfig),
+    /// The static URLs, then the workers clients add and remove over `/workers`,
+    /// as Miles registers the engines it launches.
+    WorkerApi(StaticUrlsDiscoveryConfig),
     K8s(K8sDiscoveryConfig),
 }
 
@@ -781,7 +796,7 @@ impl DiscoveryBackend {
     pub fn peer_selector(&self) -> Option<&str> {
         match self {
             Self::K8s(k) => k.peer_selector.as_deref(),
-            Self::StaticUrls(_) => None,
+            Self::StaticUrls(_) | Self::WorkerApi(_) => None,
         }
     }
 }

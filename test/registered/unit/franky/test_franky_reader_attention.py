@@ -11,8 +11,11 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.franky.cache.generated_spans import (
+    FrankyGeneratedSpans,
+    GeneratedSpan,
+)
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
-from sglang.srt.franky.cache.tap_reading import FrankyTapReading
 from sglang.srt.franky.parts.reader.query.reader import (
     _attend_taps,
     attention_workspace,
@@ -29,13 +32,21 @@ _CONTEXT = 256
 _NUM_ROWS = 6
 
 
-def _taps_read(position, reading):
-    """The rule, token by token, from its definition."""
-    if reading.block_size is None or position < reading.generation_start:
-        return min(position + 1, reading.tap_len)
-    blocks = (position + 1 - reading.generation_start) // reading.block_size
-    block_start = reading.generation_start + blocks * reading.block_size
-    return min(block_start, reading.tap_len)
+def _taps_to_read(token, *, generation_start, block_size):
+    if generation_start is None or token < generation_start:
+        return 0
+    if block_size is None:
+        return generation_start
+    blocks = (token - generation_start) // block_size
+    return generation_start + blocks * block_size
+
+
+def _spans(generation_start, block_size):
+    if generation_start is None:
+        return None
+    return FrankyGeneratedSpans(
+        spans=(GeneratedSpan(start=generation_start),), block_size=block_size
+    )
 
 
 def _reference_token_by_token(*, tap_cache, queries, rows, num_taps):
@@ -115,35 +126,34 @@ class TestReaderAttention(CustomTestCase):
         # past it, as a retracted request does; row 4 has no taps; row 5 runs a
         # chunk inside its taps; row 6 is block 6 of a chain whose prompt is 40
         # tokens, in blocks of 32, recomputed from inside its prompt.
-        readings = {
-            1: FrankyTapReading(tap_len=70, generation_start=70),
-            2: FrankyTapReading(tap_len=40, generation_start=40),
-            3: FrankyTapReading(tap_len=30, generation_start=30),
-            4: FrankyTapReading(tap_len=0, generation_start=0),
-            5: FrankyTapReading(tap_len=200, generation_start=200),
-            6: FrankyTapReading(tap_len=200, generation_start=40, block_size=32),
-        }
+        answers = {1: (70, None), 2: (40, None), 3: (30, None), 4: (None, None)}
+        answers |= {5: (200, None), 6: (40, 32)}
+        num_input_tokens = [70, 40, 30, 0, 200, 200]
         prefix_lens, extend_lens = [0, 30, 35, 0, 120, 30], [70, 50, 9, 5, 64, 175]
-        self.tap_cache.set_readings(
-            req_pool_indices=list(readings), readings=list(readings.values())
+        self.tap_cache.set_generated_spans(
+            req_pool_indices=list(answers),
+            generated_spans=[_spans(*answer) for answer in answers.values()],
+            num_input_tokens=num_input_tokens,
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
-            req_pool_indices=torch.tensor(list(readings), device="cuda"),
-            req_pool_indices_cpu=torch.tensor(list(readings)),
+            req_pool_indices=torch.tensor(list(answers), device="cuda"),
+            req_pool_indices_cpu=torch.tensor(list(answers)),
             extend_prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32).cuda(),
             extend_prefix_lens_cpu=prefix_lens,
             extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32).cuda(),
             extend_seq_lens_cpu=extend_lens,
         )
         rows, num_taps = [], []
-        for (row, reading), prefix_len, extend_len in zip(
-            readings.items(), prefix_lens, extend_lens
+        for (row, (generation_start, block_size)), prefix_len, extend_len in zip(
+            answers.items(), prefix_lens, extend_lens
         ):
             rows += [row] * extend_len
             num_taps += [
-                _taps_read(position, reading)
-                for position in range(prefix_len, prefix_len + extend_len)
+                _taps_to_read(
+                    token, generation_start=generation_start, block_size=block_size
+                )
+                for token in range(prefix_len + 1, prefix_len + extend_len + 1)
             ]
         queries, attended, has_taps = self._run(batch=batch, num_tokens=len(rows) + 6)
         self._assert_matches(
@@ -155,19 +165,19 @@ class TestReaderAttention(CustomTestCase):
         )
 
     def test_a_decode_cuda_graph_replays_with_other_requests(self):
-        self.tap_cache.set_readings(
+        self.tap_cache.set_generated_spans(
             req_pool_indices=[1, 2, 3, 4],
-            readings=[
-                FrankyTapReading(tap_len=tap_len, generation_start=tap_len)
-                for tap_len in (70, 40, 0, 12)
+            generated_spans=[
+                _spans(70, None),
+                _spans(40, None),
+                None,
+                _spans(12, None),
             ],
+            num_input_tokens=[70, 40, 0, 12],
         )
         req_pool_indices = torch.tensor([1, 2, 3], device="cuda")
-        seq_lens = torch.tensor([90, 20, 5], device="cuda")
         batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
+            forward_mode=ForwardMode.DECODE, req_pool_indices=req_pool_indices
         )
         queries = torch.randn(3, _NUM_QUERIES, 256, dtype=TAP_DTYPE, device="cuda")
         attended = torch.empty_like(queries)
@@ -189,7 +199,6 @@ class TestReaderAttention(CustomTestCase):
         with torch.cuda.graph(graph):
             step()
         req_pool_indices.copy_(torch.tensor([4, 1, 3]))
-        seq_lens.copy_(torch.tensor([3, 200, 9]))
         queries.copy_(torch.randn_like(queries))
         graph.replay()
         torch.cuda.synchronize()
@@ -199,7 +208,7 @@ class TestReaderAttention(CustomTestCase):
             attended=attended,
             has_taps=has_taps,
             rows=[4, 1, 3],
-            num_taps=[3, 70, 0],
+            num_taps=[12, 70, 0],
         )
 
 

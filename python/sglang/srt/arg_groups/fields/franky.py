@@ -30,7 +30,9 @@ class Franky(msgspec.Struct):
     ] = None
     franky_weights: A[
         Optional[str],
-        "Path to this side's Franky weights: encoders on sandy, readers on ricky.",
+        "Path to this side's Franky weights: encoders on sandy, readers on ricky. "
+        "Without it the parts start at zero, for a trainer that sends them with "
+        "update_weights_from_distributed before the first request.",
     ] = None
     franky_bootstrap_port: A[
         int,

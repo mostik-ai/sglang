@@ -67,7 +67,7 @@ class SandyParts(FrankyParts):
         model: nn.Module,
         language_model: FrankyMixin,
         config: FrankyConfig,
-        weights: dict[str, torch.Tensor],
+        weights: Optional[dict[str, torch.Tensor]],
         dtype: torch.dtype,
         device: str,
     ) -> SandyParts:
@@ -95,6 +95,18 @@ class SandyParts(FrankyParts):
             end_layer=end_layer,
             device=device,
         )
+
+    @override
+    def _weight_prefix(self) -> str:
+        return "encoders"
+
+    @override
+    def _parts_by_index(self) -> dict[int, nn.Module]:
+        return dict(self._encoders)
+
+    @override
+    def _num_parts_on_all_stages(self) -> int:
+        return len(self.config.encoder.layers)
 
     @override
     def _tap_encoder_ids(self) -> tuple[int, ...]:

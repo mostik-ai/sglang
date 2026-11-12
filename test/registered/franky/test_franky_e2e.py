@@ -53,21 +53,25 @@ def _layer_output(output):
     return output[0] if isinstance(output, tuple) else output
 
 
-def _taps_read(position, *, tap_len, generation_start, block_size):
-    """The reader rule from its definition: up to the token in the prompt, then
-    the taps before the block of the token it predicts."""
-    if block_size is None or position < generation_start:
-        return min(position + 1, tap_len)
-    blocks = (position + 1 - generation_start) // block_size
-    return min(generation_start + blocks * block_size, tap_len)
+def _taps_to_read(token, *, generation_start, block_size):
+    if token < generation_start:
+        return 0
+    if block_size is None:
+        return generation_start
+    blocks = (token - generation_start) // block_size
+    return generation_start + blocks * block_size
 
 
 def _reader(weights, index, layer_output, taps, num_taps):
-    """The PR's fixed-query reader on one sequence, token ``p`` reading the first
-    ``num_taps[p]`` taps."""
     prefix = f"readers.{index}."
-    visible = torch.arange(taps.shape[0], device=taps.device)[None] < num_taps[:, None]
-    heads = weights[f"{prefix}queries"].expand(layer_output.shape[0], -1, -1)
+    reads = num_taps > 0
+    queries = functional.linear(
+        layer_output[reads], weights[f"{prefix}query_projection.weight"]
+    )
+    heads = queries.view(queries.shape[0], -1, taps.shape[-1])
+    visible = (
+        torch.arange(taps.shape[0], device=taps.device)[None] < num_taps[reads, None]
+    )
     attended = functional.scaled_dot_product_attention(
         heads.transpose(0, 1), taps[None], taps[None], attn_mask=visible
     )
@@ -77,9 +81,11 @@ def _reader(weights, index, layer_output, taps, num_taps):
             joined, weights[f"{prefix}mlp.0.weight"], weights[f"{prefix}mlp.0.bias"]
         )
     )
-    return functional.linear(
+    output = torch.zeros_like(layer_output)
+    output[reads] = functional.linear(
         hidden, weights[f"{prefix}mlp.2.weight"], weights[f"{prefix}mlp.2.bias"]
     )
+    return output
 
 
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")
@@ -155,7 +161,9 @@ class TestFrankyEndToEnd(CustomTestCase):
             sandy[f"encoders.{index}.projection.weight"] = randn(
                 _TAP_SIZE, hidden, std=1 / (rms[layer] * hidden**0.5)
             )
-            ricky[f"readers.{index}.queries"] = randn(1, _TAP_SIZE, std=1.0)
+            ricky[f"readers.{index}.query_projection.weight"] = randn(
+                _TAP_SIZE, hidden, std=1 / (rms[layer] * hidden**0.5)
+            )
             ricky[f"readers.{index}.mlp.0.weight"] = randn(
                 _MLP_SIZE, _TAP_SIZE, std=0.05
             )
@@ -173,7 +181,7 @@ class TestFrankyEndToEnd(CustomTestCase):
                 "output_size": _TAP_SIZE,
             },
             "reader": {
-                "type": "fixed_query",
+                "type": "residual_query",
                 "layers": _LAYERS,
                 "num_queries": 1,
                 "mlp_hidden_size": _MLP_SIZE,
@@ -256,13 +264,12 @@ class TestFrankyEndToEnd(CustomTestCase):
         with torch.no_grad():
             for ids, (tokens, _) in zip(prompts, outputs):
                 num_taps = [
-                    _taps_read(
-                        position,
-                        tap_len=len(ids),
+                    _taps_to_read(
+                        row + 1,
                         generation_start=generation_start or len(ids),
                         block_size=block_size,
                     )
-                    for position in range(len(ids) + len(tokens) - 1)
+                    for row in range(len(ids) + len(tokens) - 1)
                 ]
                 state.update(
                     mode="taps",

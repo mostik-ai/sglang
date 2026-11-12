@@ -44,7 +44,7 @@ class FrankyParts(ABC):
         model: nn.Module,
         side: str,
         config_path: str,
-        weights_path: str,
+        weights_path: Optional[str],
         dtype: torch.dtype,
         device: str,
     ) -> FrankyParts:
@@ -61,7 +61,7 @@ class FrankyParts(ABC):
             model=model,
             language_model=language_model,
             config=FrankyConfig.load(config_path),
-            weights=load_file(weights_path),
+            weights=None if weights_path is None else load_file(weights_path),
             dtype=dtype,
             device=device,
         )
@@ -76,11 +76,11 @@ class FrankyParts(ABC):
         model: nn.Module,
         language_model: FrankyMixin,
         config: FrankyConfig,
-        weights: dict[str, torch.Tensor],
+        weights: Optional[dict[str, torch.Tensor]],
         dtype: torch.dtype,
         device: str,
     ) -> FrankyParts:
-        """Build this rank's parts from the config and the weights file."""
+        """Build this rank's parts from the config and the weights file, or at zero without one."""
         raise NotImplementedError
 
     def kv_options(self) -> FrankyKvOptions:
@@ -159,6 +159,27 @@ class FrankyParts(ABC):
             return hidden_states, residual
         return hidden_states + extra, residual
 
+    def load_weights(self, named_tensors: list[tuple[str, torch.Tensor]]) -> None:
+        """Copy updated weights, named as in the --franky-weights file, into this
+        rank's parts; a part on another PP stage skips its weights.
+
+        Raises:
+            ValueError: a name is not a weight of this side's parts.
+        """
+        prefix = self._weight_prefix()
+        parts = self._parts_by_index()
+        num_parts = self._num_parts_on_all_stages()
+        with torch.no_grad():
+            for name, tensor in named_tensors:
+                side, index, weight = name.split(".", 2)
+                if side != prefix or not 0 <= int(index) < num_parts:
+                    raise ValueError(
+                        f"{name!r} is not a weight of this side's {prefix}"
+                    )
+                part = parts.get(int(index))
+                if part is not None:
+                    part.get_parameter(weight).copy_(tensor)
+
     def read_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         """Take what an earlier PP stage carried."""
 
@@ -168,6 +189,18 @@ class FrankyParts(ABC):
 
     def write_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         """Hand what the next PP stage needs."""
+
+    @abstractmethod
+    def _weight_prefix(self) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _parts_by_index(self) -> dict[int, nn.Module]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _num_parts_on_all_stages(self) -> int:
+        raise NotImplementedError
 
     @abstractmethod
     def _tap_encoder_ids(self) -> tuple[int, ...]:
@@ -198,12 +231,18 @@ def _franky_module_of(model: nn.Module) -> FrankyMixin:
 def load_part(
     *,
     part: nn.Module,
-    weights: dict[str, torch.Tensor],
+    weights: Optional[dict[str, torch.Tensor]],
     prefix: str,
     dtype: torch.dtype,
     device: str,
 ) -> nn.Module:
-    """Load one encoder or reader from the weights under ``prefix``, frozen."""
+    """Load one encoder or reader from the weights under ``prefix``, frozen;
+    without weights it starts at zero, until a weight update sends them."""
+    if weights is None:
+        with torch.no_grad():
+            for parameter in part.parameters():
+                parameter.zero_()
+        return part.to(device=device, dtype=dtype).requires_grad_(False)
     own = {
         name[len(prefix) :]: tensor
         for name, tensor in weights.items()

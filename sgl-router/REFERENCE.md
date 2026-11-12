@@ -19,6 +19,23 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 
 ## Discovery and KV signals
 
+### Workers added at run time
+
+With `--worker-api`, clients add and remove workers over HTTP, as Miles
+registers the engines it launches. The router may then start without
+`--worker-urls`; the flag conflicts with `--service-discovery`.
+
+- `POST /workers` takes `{"url", "worker_type", "bootstrap_port"}`, where
+  `worker_type` is `regular` (the default), `prefill` or `decode`. The worker's
+  role (Sandy included) and models come from its `/server_info`, as for a static
+  URL. The router answers `{"id", "url"}` once it routes to the worker, and
+  `500` when that takes over two minutes.
+- `GET /workers` lists every registered worker, static or added, with its `id`,
+  `url`, `mode` and `model_ids`.
+- `DELETE /workers/{id}` asks the router to remove that worker, and answers
+  before the worker leaves the registry.
+- Without `--worker-api`, `POST` and `DELETE` get `400`.
+
 ### PD version groups
 
 To run two engine versions side by side in PD mode (e.g. during a rollout),
@@ -450,6 +467,25 @@ in the next block:
   scheduling so a batch's taps leave right after its forward. Engines started
   with a smaller `--chunked-prefill-size` (2048 in our runs) make a next block
   wait less behind other prefills, at a small cost in throughput.
+
+### Earlier answers
+
+A Franky request lists the answers Ricky generated in its earlier turns as
+`franky_generated_spans`: `[start, end)` runs of its `input_ids`. Ricky
+recomputes those tokens with the taps their decode read.
+
+- `/generate` clients, and chat clients that send `input_ids` (Miles' session
+  server), send their own spans; the router passes them on unchanged.
+- For a chat that sends only messages, `--franky-chat-adapter qwen3.5` names
+  the served model's chat template. The router renders the chat as usual, the
+  adapter finds the earlier answers in the rendered ids, and both engines get
+  those ids with the spans: in the `/generate` body when the router lowers the
+  chat, otherwise in the chat body. A Qwen3.5 answer starts after
+  `<|im_start|>assistant\n` and then `<think>\n\n</think>\n\n` or `<think>\n`
+  when one follows, and ends with its `<|im_end|>`.
+- A Franky chat gets `400` for `franky_generated_spans` without `input_ids`,
+  and for assistant messages without `--franky-chat-adapter` or in a chat the
+  router leaves to the engine to render (see [Chat rendering](#chat-rendering)).
 
 ## Chat rendering
 

@@ -6,7 +6,17 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import msgspec
 import torch
@@ -54,6 +64,9 @@ from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
+if TYPE_CHECKING:
+    from sglang.srt.franky.parts.franky_parts import FrankyParts
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,6 +86,18 @@ def _split_lora_named_tensors(named_tensors):
             )
             base_tensors.append((name, tensor))
     return base_tensors, lora_tensors
+
+
+def _split_franky_named_tensors(
+    named_tensors: list[tuple[str, torch.Tensor]], franky_parts: Optional[FrankyParts]
+) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
+    if franky_parts is None:
+        return named_tensors, []
+    model_tensors, part_tensors = [], []
+    for name, tensor in named_tensors:
+        is_part = name.startswith(("encoders.", "readers."))
+        (part_tensors if is_part else model_tensors).append((name, tensor))
+    return model_tensors, part_tensors
 
 
 def _sha256_tensor(tensor: torch.Tensor) -> str:
@@ -286,11 +311,18 @@ class SchedulerWeightUpdaterManager:
                     load_format=recv_req.load_format,
                 )
                 base_tensors, lora_tensors = _split_lora_named_tensors(weights)
+                base_tensors, franky_tensors = _split_franky_named_tensors(
+                    base_tensors, self.tp_worker.model_runner.franky_parts
+                )
                 if base_tensors:
                     assert self._session.sync_base, (
                         "base tensors arrived in a sync_base=False weight-update session"
                     )
                 self._stash_lora_tensors(lora_tensors)
+                if franky_tensors:
+                    self.tp_worker.model_runner.franky_parts.load_weights(
+                        franky_tensors
+                    )
             except Exception as e:
                 success, message = False, f"Failed to receive weights: {e}"
                 logger.error(message)
