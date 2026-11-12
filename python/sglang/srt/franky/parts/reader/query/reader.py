@@ -117,13 +117,8 @@ def attend_taps(
     has_taps[padding].zero_()
     if view.num_tokens == 0:
         return
-    tokens = slice(0, view.num_tokens)
-    found = _attend(queries, view, out=attended, lens=view.causal_lens, causal=True)
-    if view.full_lens is not None:
-        past = torch.empty_like(attended)
-        found |= _attend(queries, view, out=past, lens=view.full_lens, causal=False)
-        attended[tokens] += past[tokens]
-    has_taps[tokens, 0] = found.to(has_taps.dtype)
+    found = _attend(queries, view, out=attended)
+    has_taps[: view.num_tokens, 0] = found.to(has_taps.dtype)
 
 
 def attention_workspace(*, device: str) -> Optional[torch.Tensor]:
@@ -140,20 +135,13 @@ def attention_workspace(*, device: str) -> Optional[torch.Tensor]:
     return torch.zeros(256 << 20, dtype=torch.uint8, device=device)
 
 
-def _attend(
-    queries: torch.Tensor,
-    view: TapView,
-    *,
-    out: torch.Tensor,
-    lens: torch.Tensor,
-    causal: bool,
-) -> torch.Tensor:
+def _attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> torch.Tensor:
     if view.trtllm_workspace is None:
-        _fa3_attend(queries, view, out=out, lens=lens, causal=causal)
+        _fa3_attend(queries, view, out=out)
     else:
-        _trtllm_attend(queries, view, out=out, lens=lens, causal=causal)
+        _trtllm_attend(queries, view, out=out)
     found = torch.repeat_interleave(
-        lens > 0, view.cu_seqlens_q.diff(), output_size=view.num_tokens
+        view.lens > 0, view.cu_seqlens_q.diff(), output_size=view.num_tokens
     )
     tokens = slice(0, view.num_tokens)
     # TRT-LLM leaves the rows of a sequence without keys as they were.
@@ -161,36 +149,22 @@ def _attend(
     return found
 
 
-def _fa3_attend(
-    queries: torch.Tensor,
-    view: TapView,
-    *,
-    out: torch.Tensor,
-    lens: torch.Tensor,
-    causal: bool,
-) -> None:
+def _fa3_attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
     flash_attn_with_kvcache(
         q=queries,
         k_cache=view.taps,
         v_cache=view.taps,
         page_table=view.page_table,
-        cache_seqlens=lens,
+        cache_seqlens=view.lens,
         cu_seqlens_q=view.cu_seqlens_q,
         max_seqlen_q=view.max_seqlen_q,
         softmax_scale=queries.shape[-1] ** -0.5,
-        causal=causal,
+        causal=False,
         out=out,
     )
 
 
-def _trtllm_attend(
-    queries: torch.Tensor,
-    view: TapView,
-    *,
-    out: torch.Tensor,
-    lens: torch.Tensor,
-    causal: bool,
-) -> None:
+def _trtllm_attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
     # FA4 refuses paged KV with 256-wide heads; flashinfer exists only on GPU hosts.
     from flashinfer import decode, prefill
 
@@ -199,13 +173,13 @@ def _trtllm_attend(
     taps = view.taps.view(num_pages, 1, page_size, tap_size)
     max_kv_len = view.page_table.shape[1] * page_size
     scale = tap_size**-0.5
-    if view.full_lens is None:
+    if view.decode:
         result = decode.trtllm_batch_decode_with_kv_cache(
             query=queries,
             kv_cache=(taps, taps),
             workspace_buffer=view.trtllm_workspace,
             block_tables=view.page_table,
-            seq_lens=lens,
+            seq_lens=view.lens,
             max_seq_len=max_kv_len,
             bmm1_scale=scale,
             bmm2_scale=1.0,
@@ -217,15 +191,15 @@ def _trtllm_attend(
             kv_cache=(taps, taps),
             workspace_buffer=view.trtllm_workspace,
             block_tables=view.page_table,
-            seq_lens=lens,
+            seq_lens=view.lens,
             max_q_len=view.max_seqlen_q,
             max_kv_len=max_kv_len,
             bmm1_scale=scale,
             bmm2_scale=1.0,
             batch_size=view.cu_seqlens_q.shape[0] - 1,
             cum_seq_lens_q=view.cu_seqlens_q,
-            cum_seq_lens_kv=functional.pad(lens.cumsum(0), (1, 0)).to(torch.int32),
-            causal=causal,
+            cum_seq_lens_kv=functional.pad(view.lens.cumsum(0), (1, 0)).to(torch.int32),
+            causal=False,
             out=out,
         )
     if result is not out:

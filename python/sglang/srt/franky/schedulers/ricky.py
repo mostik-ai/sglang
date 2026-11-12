@@ -203,14 +203,6 @@ class RickyScheduler(Scheduler):
                     for req in new_batch.reqs
                 ],
             )
-            if self.disaggregation_mode == DisaggregationMode.NULL:
-                franky_parts.keep_past_the_taps(
-                    req_pool_indices=[
-                        req.kv.req_pool_idx
-                        for req in new_batch.reqs
-                        if req is not self.chunked_req
-                    ]
-                )
         return new_batch, running_batch
 
     @override

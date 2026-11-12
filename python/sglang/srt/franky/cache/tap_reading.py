@@ -9,21 +9,19 @@ if TYPE_CHECKING:
 
 
 class TapRun(msgspec.Struct, frozen=True, kw_only=True):
-    """Consecutive tokens of one request that read their taps one way: each up to
-    its own position, the last at ``causal_len``; or all of the first ``full_len``.
+    """Consecutive tokens of one request that all read its first ``num_taps``
+    taps; with 0 they read nothing, and their reader output is zero.
     """
 
     num_tokens: int
-    causal_len: int
-    full_len: int
+    num_taps: int
 
 
 class FrankyTapReading(msgspec.Struct, frozen=True, kw_only=True):
     """Which taps each token of a request reads. The token at position ``p``
-    predicts token ``p + 1``. When token ``p + 1`` was generated, it reads the
-    taps before the block of token ``p + 1``, as that block's decode did, so a
-    later block or turn that computes generated tokens again repeats their decode.
-    Any other token reads taps ``0 .. p``.
+    predicts token ``p + 1``. When token ``p + 1`` was generated, it reads the taps
+    before the block of token ``p + 1``, in decode and in every later prefill.
+    Any other token reads nothing.
 
     Args:
         tap_len: the request's taps; no token reads past them.
@@ -67,37 +65,36 @@ class FrankyTapReading(msgspec.Struct, frozen=True, kw_only=True):
         end = first_position + num_tokens
         runs = []
         position = first_position
-        answers = (*self.earlier_answers, (self.generation_start, None))
+        answers = (*self.earlier_answers, (self.generation_start, end + 1))
         for answer_start, answer_end in answers:
-            causal_end = min(end, answer_start)
-            if position < causal_end:
+            reading_start = min(end, max(position, answer_start - 1))
+            if position < reading_start:
+                runs.append(TapRun(num_tokens=reading_start - position, num_taps=0))
+                position = reading_start
+            reading_end = min(end, answer_end - 1)
+            while position < reading_end:
+                block_start = self._block_start(position + 1, answer_start)
+                run_end = (
+                    reading_end
+                    if self.block_size is None
+                    else min(reading_end, block_start + self.block_size - 1)
+                )
                 runs.append(
                     TapRun(
-                        num_tokens=causal_end - position,
-                        causal_len=causal_end,
-                        full_len=0,
+                        num_tokens=run_end - position,
+                        num_taps=min(self.tap_len, block_start),
                     )
                 )
-                position = causal_end
-            predicting_end = end if answer_end is None else min(end, answer_end - 1)
-            while position < predicting_end:
-                limit = self._limit_at(position, answer_start)
-                run_end = (
-                    predicting_end
-                    if self.block_size is None or limit == self.tap_len
-                    else min(predicting_end, limit + self.block_size - 1)
-                )
-                runs.append(
-                    TapRun(num_tokens=run_end - position, causal_len=0, full_len=limit)
-                )
                 position = run_end
+        if position < end:
+            runs.append(TapRun(num_tokens=end - position, num_taps=0))
         return runs
 
-    def _limit_at(self, position: int, answer_start: int) -> int:
+    def _block_start(self, token: int, answer_start: int) -> int:
         if self.block_size is None:
-            return min(self.tap_len, answer_start)
-        block = (position + 1 - answer_start) // self.block_size
-        return min(self.tap_len, answer_start + block * self.block_size)
+            return answer_start
+        block = (token - answer_start) // self.block_size
+        return answer_start + block * self.block_size
 
 
 def check_earlier_answers(

@@ -20,7 +20,6 @@ from sglang.srt.franky.parts.injector.base_config import BaseInjectorConfig
 from sglang.srt.franky.parts.injector.residual.config import ResidualInjectorConfig
 from sglang.srt.franky.parts.injector.residual.injector import ResidualInjector
 from sglang.srt.franky.parts.reader.base_config import BaseReaderConfig
-from sglang.srt.franky.parts.reader.fixed_query.reader import FixedQueryReader
 from sglang.srt.franky.parts.reader.query.config import QueryReaderConfig
 from sglang.srt.franky.parts.reader.query.reader import QueryReader
 from sglang.srt.franky.parts.reader.residual_query.reader import ResidualQueryReader
@@ -64,7 +63,6 @@ _SUBCLASSES = (
     (AllEncoder, LinearEncoder),
     (MaskedEncoder, LinearEncoder),
     (SingularEncoder, LinearEncoder),
-    (FixedQueryReader, QueryReader),
     (ResidualQueryReader, QueryReader),
     (ResidualInjector, ResidualInjector.__mro__[1]),
     (SandyParts, SandyParts.__mro__[1]),
