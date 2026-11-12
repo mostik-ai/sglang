@@ -23,6 +23,7 @@ use sglang_processor::openai::{
     lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
 };
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
@@ -576,6 +577,34 @@ impl PreparedRequest {
             return None;
         }
         Some(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    /// The ids the router rendered from this chat, which the engine reads in
+    /// place of its messages: those of the `/generate` body it lowered the chat
+    /// to, or those it forwards with the chat. `None` when the engine renders it.
+    pub(super) fn rendered_chat_ids(&self) -> Option<&[u32]> {
+        let lowered = self.responder.is_some();
+        let forwarded = self.input_ids_forwarding == Some(InputIdsForwarding::Forwarded);
+        let tokens = self.tokens.as_ref().filter(|_| lowered || forwarded)?;
+        Some(&tokens.ids)
+    }
+
+    /// Adds `spans` to the engine body as `franky_generated_spans`.
+    pub(super) fn add_franky_generated_spans(
+        &mut self,
+        spans: &[Range<usize>],
+    ) -> Result<(), ApiError> {
+        let mut body = match self.parsed_body.take() {
+            Some(parsed_body) => parsed_body,
+            None => serde_json::from_slice(&self.body).map_err(|_| invalid_request())?,
+        };
+        let spans: Vec<[usize; 2]> = spans.iter().map(|span| [span.start, span.end]).collect();
+        body["franky_generated_spans"] = json!(spans);
+        self.body = serde_json::to_vec(&body)
+            .map_err(|error| ApiError::Internal(error.into()))?
+            .into();
+        self.parsed_body = Some(body);
+        Ok(())
     }
 
     /// The engine body for one dispatch attempt; each attempt brings its own
@@ -1584,7 +1613,7 @@ pub(super) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiErr
     Err(invalid_request())
 }
 
-fn invalid_request() -> ApiError {
+pub(super) fn invalid_request() -> ApiError {
     ApiError::BadRequest("invalid request: body must be a JSON object".into())
 }
 
@@ -1892,6 +1921,35 @@ mod tests {
                         .unwrap();
                 assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), expected);
             }
+        }
+    }
+
+    #[test]
+    fn franky_generated_spans_reach_every_outgoing_body() {
+        let ctx = AppContext::stub();
+        let body = Bytes::from(json!({"input_ids": [1, 2, 3, 4]}).to_string());
+        let model = ModelId("stub-model".into());
+        let mut request = PreparedRequest::generate(&ctx, model, body).unwrap();
+        let room = FrankyRoom {
+            host: "h".into(),
+            port: Some(9),
+            room: 42,
+        };
+
+        request
+            .add_franky_generated_spans(&[Range { start: 1, end: 3 }])
+            .unwrap();
+        let first = request
+            .outgoing_body(&ctx, None, Some(&room), None)
+            .unwrap();
+        let retry = request
+            .outgoing_body(&ctx, None, Some(&room), None)
+            .unwrap();
+
+        for body in [first, retry] {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["input_ids"], json!([1, 2, 3, 4]));
+            assert_eq!(body["franky_generated_spans"], json!([[1, 3]]));
         }
     }
 

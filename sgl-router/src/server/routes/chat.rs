@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod blocks;
+mod earlier_answers;
 mod forward;
 mod openai;
 mod preparation;
@@ -28,6 +29,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use blocks::BlockChain;
 use bytes::Bytes;
+use earlier_answers::prepare_franky_chat;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
     forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
@@ -229,6 +231,8 @@ async fn prepare<'a>(
                 PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
             } else if grpc {
                 PreparedRequest::openai_grpc(ctx, path, model, fields, headers, body, needs_tokens)?
+            } else if path == CHAT_PATH && serves_franky(ctx, &model) {
+                prepare_franky_chat(ctx, model, fields, headers, body, needs_tokens)?
             } else {
                 PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?
             };
