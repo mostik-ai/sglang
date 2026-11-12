@@ -15,6 +15,8 @@ import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+from sglang.srt.franky.chains.chain import FrankyChain
+from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.schedulers.sandy_batch_result_processor import (
     SandyBatchResultProcessor,
 )
@@ -61,6 +63,18 @@ class _Sender:
         self.closed = True
 
 
+class _LockTree:
+    def __init__(self):
+        self.locked = []
+
+    def lock(self, node):
+        self.locked.append(node)
+        return node
+
+    def unlock(self, lock):
+        self.locked.remove(lock)
+
+
 class _PPStore(dict):
     """Stage 0's view: other stages' reports, set by the test."""
 
@@ -72,9 +86,11 @@ class _PPStore(dict):
         return [self.get(key), self.other_stages.get(key)]
 
 
-def _req(rid="r", prompt_len=10):
+def _req(rid="r", prompt_len=10, chain=None):
     return SimpleNamespace(
         rid=rid,
+        franky_chain=chain,
+        last_node=f"node-{rid}",
         origin_input_ids=list(range(prompt_len)),
         extend_end=0,
         prefix_len=0,
@@ -115,6 +131,7 @@ class _Queue(CustomTestCase):
             (handle, outcome)
         )
         self.store = _PPStore()
+        self.lock_tree = _LockTree()
         release = patch.object(
             send_queue_module,
             "release_kv_cache",
@@ -140,6 +157,11 @@ class _Queue(CustomTestCase):
                 attn_tp_cpu_group=dist.group.WORLD,
                 attn_cp_cpu_group=dist.group.WORLD,
                 pp_store=self.store,
+            ),
+            chain_holds=FrankyChainHolds(
+                tree_cache=self.lock_tree,
+                max_held_tokens=1000,
+                hold_seconds=60,
             ),
             page_size=_PAGE_SIZE,
             open_room=lambda req: self.sender,
@@ -253,6 +275,39 @@ class TestRelease(_Queue):
         self.assertIsInstance(req.finished_reason, FINISH_LENGTH)
         self.assertTrue(self.queue.is_empty())
         self.assertNotIn("r", self.store)
+
+    def test_a_sent_block_of_a_chain_holds_its_prompt_for_the_next_block(self):
+        req = _req(chain=FrankyChain(id="chain"))
+        self._hold(req)
+        self.sender.state = KVPoll.Success
+        self.store.other_stages["r"] = KVPoll.Success
+
+        self._step()
+
+        self.assertEqual(self.lock_tree.locked, ["node-r"])
+
+    def _send_block(self, rid, chain, state):
+        req = _req(rid, chain=chain)
+        self._hold(req)
+        self.sender.state = state
+        self.store.other_stages[rid] = KVPoll.Success
+        self._step()
+
+    def test_a_last_block_releases_its_chains_hold(self):
+        self._send_block("c-1", FrankyChain(id="c"), KVPoll.Success)
+        self.assertEqual(self.lock_tree.locked, ["node-c-1"])
+
+        self._send_block("c-2", FrankyChain(id="c", last_block=True), KVPoll.Success)
+
+        self.assertEqual(self.released, ["c-1", "c-2"])
+        self.assertEqual(self.lock_tree.locked, [])
+
+    def test_a_failed_send_releases_its_chains_hold(self):
+        self._send_block("c-1", FrankyChain(id="c"), KVPoll.Success)
+
+        self._send_block("c-2", FrankyChain(id="c"), KVPoll.Failed)
+
+        self.assertEqual(self.lock_tree.locked, [])
 
     def test_a_failed_send_frees_the_request_and_answers_an_error(self):
         req = _req()

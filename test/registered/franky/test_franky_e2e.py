@@ -15,7 +15,9 @@ import requests
 import torch
 from safetensors.torch import save_file
 from torch.nn import functional
+from transformers import AutoTokenizer
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as _STATE_CHUNK
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -180,6 +182,11 @@ class TestFrankyEndToEnd(CustomTestCase):
     def _generate(self, ids, room):
         """Send the prompt to Sandy and to Ricky in one room; return Ricky's
         greedy tokens and their logprobs."""
+        answers = self._send(ids, room)
+        pairs = answers[self.ricky_url]["meta_info"]["output_token_logprobs"]
+        return [pair[1] for pair in pairs], torch.tensor([pair[0] for pair in pairs])
+
+    def _send(self, ids, room, **block):
         franky_room = {
             "bootstrap_host": "127.0.0.1",
             "bootstrap_port": self.bootstrap_port,
@@ -195,6 +202,7 @@ class TestFrankyEndToEnd(CustomTestCase):
                     "sampling_params": sampling_params,
                     "return_logprob": True,
                     "franky_room": franky_room,
+                    **block,
                 },
                 timeout=600,
             ).json()
@@ -207,8 +215,7 @@ class TestFrankyEndToEnd(CustomTestCase):
             thread.start()
         for thread in threads:
             thread.join()
-        pairs = answers[self.ricky_url]["meta_info"]["output_token_logprobs"]
-        return [pair[1] for pair in pairs], torch.tensor([pair[0] for pair in pairs])
+        return answers
 
     def _reference(self, prompts, outputs):
         """HF logprobs of Ricky's tokens, with the readers and without them."""
@@ -266,6 +273,40 @@ class TestFrankyEndToEnd(CustomTestCase):
             self.assertLess(error, 0.2)
             self.assertGreaterEqual(same_argmax, _NEW_TOKENS - 1)
             self.assertGreater(readers_effect, 4 * error)
+
+    def test_a_chains_next_block_reuses_its_held_prompt_and_reads_new_taps(self):
+        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(_TEXT * 6)
+        chain = "chain4200"
+        first = self._send(
+            prompt,
+            4200,
+            rid=f"{chain}-1",
+            franky_chain={"id": chain, "last_block": False},
+        )
+        pairs = first[self.ricky_url]["meta_info"]["output_token_logprobs"]
+        context = prompt + [pair[1] for pair in pairs]
+        second = self._send(
+            context,
+            4201,
+            rid=f"{chain}-2",
+            franky_chain={"id": chain, "block": 2, "last_block": True},
+        )
+
+        whole_chunks = len(prompt) - len(prompt) % _STATE_CHUNK
+        for url in (self.sandy_url, self.ricky_url):
+            self.assertGreaterEqual(
+                second[url]["meta_info"]["cached_tokens"], whole_chunks, url
+            )
+        pairs = second[self.ricky_url]["meta_info"]["output_token_logprobs"]
+        tokens = [pair[1] for pair in pairs]
+        logprobs = torch.tensor([pair[0] for pair in pairs])
+        [ref] = self._reference([context], [(tokens, logprobs)])
+        self.assertLess((logprobs - ref["readers"]).abs().max().item(), 0.2)
+        for url in (self.sandy_url, self.ricky_url):
+            ended = requests.post(
+                f"{url}/franky/end_chain", json={"chain_id": chain}, timeout=60
+            )
+            self.assertEqual(ended.status_code, 200, url)
 
 
 if __name__ == "__main__":

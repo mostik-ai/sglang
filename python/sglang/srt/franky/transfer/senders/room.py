@@ -25,6 +25,7 @@ class FrankyRoomSender(NixlKVSender):
         self.num_pages = num_pages
         self.waiting_pages: list[np.ndarray] = []
         self.receivers_arrived = False
+        self.unsent_prefix_pages = 0
 
     def land(self, *, tap_pages: np.ndarray) -> None:
         self.waiting_pages.append(tap_pages)
@@ -42,8 +43,28 @@ class FrankyRoomSender(NixlKVSender):
         if not self.receivers_arrived:
             if self.kv_mgr.check_status(self.bootstrap_room) != KVPoll.WaitingForInput:
                 return
-            self.init(self.num_pages, aux_index=0)
-            self.receivers_arrived = True
-        if self.waiting_pages:
-            self.send(np.concatenate(self.waiting_pages))
-            self.waiting_pages = []
+            self._start_past_the_receivers_prefix()
+        if not self.waiting_pages:
+            return
+        pages = self._drop_the_receivers_prefix(np.concatenate(self.waiting_pages))
+        self.waiting_pages = []
+        if len(pages) > 0:
+            self.send(pages)
+
+    def _start_past_the_receivers_prefix(self) -> None:
+        prefix_len = self.pop_decode_prefix_len()
+        page_size = self.kv_mgr.kv_args.page_size
+        if prefix_len % page_size != 0 or prefix_len >= self.num_pages * page_size:
+            raise ValueError(
+                f"Franky room {self.bootstrap_room}: the receivers' cached prefix "
+                f"of {prefix_len} tokens is not whole pages of {page_size} tokens "
+                f"inside the prompt's {self.num_pages} pages."
+            )
+        self.unsent_prefix_pages = prefix_len // page_size
+        self.init(self.num_pages - self.unsent_prefix_pages, aux_index=0)
+        self.receivers_arrived = True
+
+    def _drop_the_receivers_prefix(self, pages: np.ndarray) -> np.ndarray:
+        dropped = min(self.unsent_prefix_pages, len(pages))
+        self.unsent_prefix_pages -= dropped
+        return pages[dropped:]

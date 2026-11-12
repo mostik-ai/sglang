@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 
 if TYPE_CHECKING:
     from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+    from sglang.srt.franky.chains.holds import FrankyChainHolds
     from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
     from sglang.srt.franky.transfer.senders.sender import FrankyTapSender
     from sglang.srt.managers.io_struct import AbortReq
@@ -61,6 +62,7 @@ class FrankySendQueue:
         tree_cache: BasePrefixCache,
         output_streamer: SchedulerOutputStreamer,
         rank_reports: FrankyRankReports,
+        chain_holds: FrankyChainHolds,
         page_size: int,
         open_room: Callable[[Req], FrankyTapSender],
     ) -> None:
@@ -69,6 +71,7 @@ class FrankySendQueue:
         self._tree_cache = tree_cache
         self._output_streamer = output_streamer
         self._rank_reports = rank_reports
+        self._chain_holds = chain_holds
         self._page_size = page_size
         self._open_room = open_room
         self._sends: dict[str, _Send] = {}
@@ -138,6 +141,9 @@ class FrankySendQueue:
                 f"Franky taps of request {req.rid} were not sent.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+            self._chain_holds.release_chain_of(req)
+        else:
+            self._chain_holds.hold_for_next_block(req)
         self._output_streamer.stream_output([req], False)
         send.sender.close()
 
@@ -151,6 +157,7 @@ class FrankySendQueue:
         send.sender.abort()
         send.sender.close()
         del self._sends[req.rid]
+        self._chain_holds.release_chain_of(req)
 
     def abort(self, *, recv_req: AbortReq) -> None:
         """Stop the sends of the matching held requests; each is released when

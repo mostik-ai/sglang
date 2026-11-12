@@ -54,6 +54,8 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "data_parallel_rank",
         "encoder_urls",
         "external_trace_header",
+        "franky_chain",
+        "franky_room",
         "http_worker_ipc",
         "image_max_dynamic_patch",
         "input_embeds",

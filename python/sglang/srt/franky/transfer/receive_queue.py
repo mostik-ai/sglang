@@ -12,16 +12,19 @@ from sglang.srt.franky.cache.tap_cache import FrankyReqState
 from sglang.srt.franky.transfer.host_pages import FrankyHostPages
 from sglang.srt.franky.transfer.messages import FrankyRoomClosed, FrankyTapsReady
 from sglang.srt.franky.transfer.receiver import FrankyReceiver
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
+    from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
     from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+    from sglang.srt.franky.chains.holds import FrankyChainHolds
     from sglang.srt.franky.transfer.manager import FrankyTapManager
     from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, TreeLock
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +48,8 @@ class _Reception(msgspec.Struct, kw_only=True):
 class FrankyReceiveQueue:
     """Ricky's requests from arrival until they end. At arrival a request takes
     KV pages for its prompt past its cached prefix, as PD decode does, and its
-    taps land from Sandy in the tap pages of the whole prompt. Decisions reach
-    every rank and stage at one step as leader messages, as Sandy's releases do.
+    taps land from Sandy in the tap pages of those pages. Decisions reach every
+    rank and stage at one step as leader messages, as Sandy's releases do.
     """
 
     def __init__(
@@ -57,6 +60,8 @@ class FrankyReceiveQueue:
         tree_cache: BasePrefixCache,
         tap_manager: FrankyTapManager,
         rank_reports: FrankyRankReports,
+        chain_holds: FrankyChainHolds,
+        mamba_room: Optional[FrankyMambaRoom],
         page_size: int,
         reserved_decode_tokens: int,
         release_timeout_seconds: float,
@@ -67,6 +72,8 @@ class FrankyReceiveQueue:
         self.tree_cache = tree_cache
         self.tap_manager = tap_manager
         self.rank_reports = rank_reports
+        self.chain_holds = chain_holds
+        self.mamba_room = mamba_room
         self.page_size = page_size
         self.reserved_decode_tokens = reserved_decode_tokens
         self.release_timeout_seconds = release_timeout_seconds
@@ -98,21 +105,23 @@ class FrankyReceiveQueue:
         if req in self.arrivals:
             self.arrivals.remove(req)
         self.returning_tap_lens.pop(req.rid, None)
+        self.chain_holds.release_chain_of(req)
         if req.rid in self.receptions:
             self._end(self.receptions[req.rid])
 
     def poll(self) -> None:
-        """Every rank, at each step: take pages for arrivals in order, notice
-        ended requests, and agree on landings with ``FrankyRankReports``.
+        """Every rank, at each step: notice ended requests before an arrival can
+        evict their prompts, take pages for arrivals in order, and agree on
+        landings with ``FrankyRankReports``.
         """
-        self._take_pages_for_arrivals()
-        for reception in list(self.receptions.values()):
-            if reception.ended:
-                continue
+        for reception in self._live_receptions():
             if reception.req.finished():
+                self._hold_or_release_the_chain(reception.req)
                 self._end(reception)
-            else:
-                self._keep_kv_past_the_prompt_out_of_the_cache(reception.req)
+        self._release_holds_past_the_mamba_room()
+        self._take_pages_for_arrivals()
+        for reception in self._live_receptions():
+            self._keep_kv_past_the_prompt_out_of_the_cache(reception.req)
         self.agreed = self.rank_reports.report(numbers=self._rank_numbers())
 
     def ready_messages(self) -> list[FrankyTapsReady | FrankyRoomClosed]:
@@ -148,6 +157,26 @@ class FrankyReceiveQueue:
         if reception is not None and reception.ended:
             self._release(reception)
 
+    def on_started(self, *, reqs: list[Req]) -> None:
+        """The scheduler started ``reqs``; each now locks its cached prefix itself."""
+        for req in reqs:
+            reception = self.receptions.get(req.rid)
+            if reception is not None:
+                self.tree_cache.unlock(reception.prefix_lock)
+                reception.prefix_lock = None
+
+    def num_startable_requests(self) -> Optional[int]:
+        """
+        Returns:
+            How many requests may start beside the running ones as far as the
+            mamba state pool goes, or None without such a pool.
+        """
+        if self.mamba_room is None:
+            return None
+        return self.mamba_room.num_startable_requests(
+            num_pinned_states=len(self._pinned_nodes())
+        )
+
     def is_empty(self) -> bool:
         return not self.arrivals and not self.receptions
 
@@ -161,7 +190,7 @@ class FrankyReceiveQueue:
     def _take_pages(self, req: Req) -> bool:
         returning = req.rid in self.returning_tap_lens
         tap_len = self._tap_len_of(req)
-        req.init_next_round_input(self.tree_cache)
+        req.init_next_round_input(self.tree_cache, cow_mamba=False)
         num_tokens = len(req.full_untruncated_fill_ids)
         num_taken = num_tokens - req.prefix_len
         num_page_slots = ceil_div(num_taken, self.page_size) * self.page_size
@@ -175,28 +204,45 @@ class FrankyReceiveQueue:
                 req, f"The taps of request {req.rid} left the prefix cache."
             )
             return True
-        prefix_lock = self.tree_cache.lock(req.last_node)
-        if not self._fits(num_page_slots):
+        prefix_lock = (
+            self.tree_cache.lock(req.last_node) if req.prefix_len > 0 else None
+        )
+        if not self._fits_after_releasing_holds(
+            num_page_slots, prefix_lock=prefix_lock
+        ):
             self.tree_cache.unlock(prefix_lock)
             return False
+        self.chain_holds.release_chain_of(req)
         self.returning_tap_lens.pop(req.rid, None)
         taken = self._take_slots(num_page_slots)[:num_taken]
         receives_taps = not returning and tap_len > 0
         req.franky = FrankyReqState(
             tap_len=tap_len,
-            taps_ready=0 if receives_taps else num_tokens,
+            taps_ready=req.prefix_len if receives_taps else num_tokens,
             taken_kv_slots=taken,
             taken_from=req.prefix_len,
             used_end=req.prefix_len,
         )
         self.receptions[req.rid] = _Reception(
             req=req,
-            pages=self._tap_pages(req, taken) if receives_taps else None,
+            pages=self._tap_pages(taken) if receives_taps else None,
             receiver=None,
             prefix_lock=prefix_lock,
-            landed=0 if receives_taps else tap_len,
+            landed=req.prefix_len if receives_taps else tap_len,
+            announced_taps=req.prefix_len,
         )
         return True
+
+    def _live_receptions(self) -> list[_Reception]:
+        return [
+            reception for reception in self.receptions.values() if not reception.ended
+        ]
+
+    def _hold_or_release_the_chain(self, req: Req) -> None:
+        if isinstance(req.finished_reason, FINISH_LENGTH):
+            self.chain_holds.hold_for_next_block(req)
+        else:
+            self.chain_holds.release_chain_of(req)
 
     def _keep_kv_past_the_prompt_out_of_the_cache(self, req: Req) -> None:
         if req.franky.tap_len > 0 and req.prefix_len >= req.franky.tap_len:
@@ -207,10 +253,45 @@ class FrankyReceiveQueue:
             return self.returning_tap_lens[req.rid]
         return len(req.origin_input_ids) if req.franky_room is not None else 0
 
-    def _fits(self, num_page_slots: int) -> bool:
+    def _fits_after_releasing_holds(
+        self, num_page_slots: int, *, prefix_lock: Optional[TreeLock]
+    ) -> bool:
+        if self._free_slots() + self.chain_holds.held_tokens < num_page_slots:
+            return False
+        while not self._fits(num_page_slots, prefix_lock=prefix_lock):
+            if not self.chain_holds.release_oldest():
+                return False
+        return True
+
+    def _fits(self, num_page_slots: int, *, prefix_lock: Optional[TreeLock]) -> bool:
+        return self._free_slots() >= num_page_slots and self._fits_mamba_room(
+            arriving_prefix_lock=prefix_lock
+        )
+
+    def _release_holds_past_the_mamba_room(self) -> None:
+        while not self._fits_mamba_room():
+            if not self.chain_holds.release_oldest():
+                return
+
+    def _fits_mamba_room(
+        self, *, arriving_prefix_lock: Optional[TreeLock] = None
+    ) -> bool:
+        if self.mamba_room is None:
+            return True
+        pinned_nodes = self._pinned_nodes(arriving_prefix_lock=arriving_prefix_lock)
+        return self.mamba_room.fits_pinned_states(num_pinned_states=len(pinned_nodes))
+
+    def _pinned_nodes(
+        self, *, arriving_prefix_lock: Optional[TreeLock] = None
+    ) -> set[Any]:
+        locks = [reception.prefix_lock for reception in self.receptions.values()]
+        locks.append(arriving_prefix_lock)
+        nodes = {lock.node for lock in locks if lock is not None}
+        return nodes | self.chain_holds.locked_nodes()
+
+    def _free_slots(self) -> int:
         free = self.kv_allocator.available_size() + self.tree_cache.evictable_size()
-        reserved = self.reserved_decode_tokens * (len(self.receptions) + 1)
-        return free - reserved >= num_page_slots
+        return free - self.reserved_decode_tokens * (len(self.receptions) + 1)
 
     def _take_slots(self, num_page_slots: int) -> torch.Tensor:
         if self.kv_allocator.available_size() < num_page_slots:
@@ -223,10 +304,8 @@ class FrankyReceiveQueue:
             )
         return slots
 
-    def _tap_pages(self, req: Req, taken: torch.Tensor) -> FrankyHostPages:
-        prefix = self.tree_cache.prefix_device_indices(req).to(taken.device)
-        slots = torch.cat([prefix, taken])
-        kv_pages = slots[:: self.page_size] // self.page_size
+    def _tap_pages(self, taken: torch.Tensor) -> FrankyHostPages:
+        kv_pages = taken[:: self.page_size] // self.page_size
         tap_pages = self.tap_cache.pages_of(kv_pages=kv_pages)
         return FrankyHostPages(tap_pages.to(torch.int32))
 
@@ -248,6 +327,7 @@ class FrankyReceiveQueue:
                 franky_room=reception.req.franky_room,
                 tap_pages=reception.pages.numpy(),
                 num_tokens=reception.req.franky.tap_len,
+                prefix_len=reception.req.franky.taken_from,
             )
             reception.pages = None
         receiver = reception.receiver

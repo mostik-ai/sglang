@@ -45,6 +45,8 @@ def handle_franky(server_args: ServerArgs) -> None:
             "handle_franky",
             disaggregation_decode_retraction_backup="none",
         )
+    if cfg.franky_side == "sandy":
+        declare_resolution(server_args, "handle_franky", disable_overlap_schedule=True)
 
 
 def _shared_checks(*, cfg: Any, model_config: ModelConfig) -> dict[str, bool]:
@@ -61,6 +63,12 @@ def _shared_checks(*, cfg: Any, model_config: ModelConfig) -> dict[str, bool]:
         # KV loaded from outside the forward would have no taps.
         "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
         "--enable-lmcache": cfg.enable_lmcache,
+        f"--franky-chain-hold-seconds {cfg.franky_chain_hold_seconds}": (
+            cfg.franky_chain_hold_seconds <= 0
+        ),
+        f"--franky-chain-hold-ratio {cfg.franky_chain_hold_ratio}, it is a share": (
+            not 0 <= cfg.franky_chain_hold_ratio <= 1
+        ),
     }
 
 

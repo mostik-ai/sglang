@@ -42,6 +42,7 @@ type LoadGuards = (LoadGuard, RouterInflightLoadGuard, Option<DpRankGuard>);
 
 /// A plain worker, or a prefill worker paired with a decode worker for PD, and
 /// the Sandy that sends their taps when they read taps.
+#[derive(Clone)]
 pub(super) struct SelectedWorkers {
     pub(super) prefill: Arc<Worker>,
     pub(super) decode: Option<Arc<Worker>>,

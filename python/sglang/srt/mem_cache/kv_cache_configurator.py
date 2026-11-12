@@ -3065,7 +3065,7 @@ class KVCacheConfigurator:
 
         return int(rest_memory * (1 << 30))  # return in bytes
 
-    def _calculate_mamba_ratio(self) -> int:
+    def calculate_mamba_ratio(self) -> int:
         if get_memory().disable_radix_cache:
             return 1
 
@@ -3139,7 +3139,7 @@ class KVCacheConfigurator:
 
         capped_by_mamba = False
         if self.mambaish_config is not None:
-            ratio = self._calculate_mamba_ratio()
+            ratio = self.calculate_mamba_ratio()
             mamba_cap = get_schedule().max_mamba_cache_size // ratio
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
@@ -3317,7 +3317,7 @@ class KVCacheConfigurator:
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
             # and on PD prefill (no intermediate_ssm allocated).
             if reserves_spec_state:
-                ratio = self._calculate_mamba_ratio()
+                ratio = self.calculate_mamba_ratio()
                 capped_reqs = min(
                     max(1, get_schedule().max_running_requests // self.attn_dp_size),
                     get_schedule().max_mamba_cache_size // ratio,
@@ -3363,7 +3363,7 @@ class KVCacheConfigurator:
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
             if reserves_spec_state:
-                ratio = self._calculate_mamba_ratio()
+                ratio = self.calculate_mamba_ratio()
                 D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 get_context().override(

@@ -172,7 +172,7 @@ class MlxModelRunnerStub(ModelRunner):
     def _aux_state_slots_per_request(self) -> int:
         """Auxiliary-state slots to reserve per concurrently running request.
 
-        Mirrors ``ModelRunnerKVCacheMixin._calculate_mamba_ratio``: with the
+        Mirrors ``KVCacheConfigurator.calculate_mamba_ratio``: with the
         radix cache disabled there are no radix-held snapshots (the MLX
         prefill path returns before any tracked-state store), so each live
         request holds exactly one slot. No extra-buffer ratio term applies on

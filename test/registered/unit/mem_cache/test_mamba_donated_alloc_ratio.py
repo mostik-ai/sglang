@@ -131,7 +131,7 @@ class TestMambaRatioEnvGate(unittest.TestCase):
                 disable_overlap_schedule=disable_overlap,
                 mamba_radix_cache_strategy=strategy,
             ):
-                return KVCacheConfigurator._calculate_mamba_ratio(fake)
+                return KVCacheConfigurator.calculate_mamba_ratio(fake)
 
     def test_flag_off_restores_original_ratios(self):
         def r(**kwargs):
@@ -430,7 +430,7 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
             attn_dp_size=dp_size,
             pp_size=pp_size,
             model_config=SimpleNamespace(num_hidden_layers=4),
-            _calculate_mamba_ratio=lambda: 2,
+            calculate_mamba_ratio=lambda: 2,
         )
         args = dict(
             disable_radix_cache=False,
