@@ -114,6 +114,13 @@ pub enum TokenizerBackend {
     Fast,
 }
 
+/// Chat templates whose earlier answers the router can find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ChatTemplateAdapterKind {
+    #[value(name = "qwen3.5")]
+    Qwen35,
+}
+
 /// Router tokenizer encode settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TokenizerConfig {
