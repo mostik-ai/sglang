@@ -40,19 +40,17 @@ class TapView(msgspec.Struct, frozen=True, kw_only=True):
     """One encoder's taps for the tokens of one forward, as FlashAttention's paged
     KV cache with one head: the taps are both keys and values.
 
-    The tokens are in the sequences of ``cu_seqlens_q``. A causal pass lets each
-    sequence attend to the first ``causal_lens`` taps of its page table row, with
-    its last token at the last of them. With ``full_lens``, a second pass lets
-    every token of a sequence attend to all of its first ``full_lens`` taps: a
-    request's tokens past its last tap form a sequence of their own for it.
+    The tokens are in the sequences of ``cu_seqlens_q``. Every token of a sequence
+    attends to the first ``lens[sequence]`` taps of its page table row, an int32
+    count; a sequence with 0 reads nothing. In decode, each sequence is one token.
     """
 
     taps: torch.Tensor  # [pages, page_size, 1, output_size]
     page_table: torch.Tensor  # [sequences, pages], int32
     cu_seqlens_q: torch.Tensor  # [sequences + 1], int32
     max_seqlen_q: int
-    causal_lens: torch.Tensor  # [sequences], int32
-    full_lens: Optional[torch.Tensor]  # [sequences], int32; None in decode
+    lens: torch.Tensor
+    decode: bool
     num_tokens: int
     # The TRT-LLM kernels' workspace on Blackwell; None where FA3 runs.
     trtllm_workspace: Optional[torch.Tensor]
@@ -138,20 +136,10 @@ class FrankyTapCache:
     def view(self, *, encoder_id: int, forward_batch: ForwardBatch) -> TapView:
         """Each token reads the taps its request's ``FrankyTapReading`` gives it."""
         if forward_batch.forward_mode.is_decode_or_idle():
-            return self._one_token_view(
-                encoder_id=encoder_id,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
+            return self._decode_view(
+                encoder_id=encoder_id, req_pool_indices=forward_batch.req_pool_indices
             )
         return self._extend_view(encoder_id=encoder_id, forward_batch=forward_batch)
-
-    def view_past_the_taps(
-        self, *, encoder_id: int, req_pool_indices: torch.Tensor
-    ) -> TapView:
-        """One token per request, at or past its last tap: it reads all taps."""
-        return self._one_token_view(
-            encoder_id=encoder_id, req_pool_indices=req_pool_indices, seq_lens=None
-        )
 
     def _extend_view(self, *, encoder_id: int, forward_batch: ForwardBatch) -> TapView:
         runs, run_requests = [], []
@@ -186,26 +174,19 @@ class FrankyTapCache:
                 [0, *itertools.accumulate(run_lens)], dtype=torch.int32, device=device
             ),
             max_seqlen_q=max(run_lens, default=0),
-            causal_lens=async_h2d(
-                [run.causal_len for run in runs], dtype=torch.int32, device=device
+            lens=async_h2d(
+                [run.num_taps for run in runs], dtype=torch.int32, device=device
             ),
-            full_lens=async_h2d(
-                [run.full_len for run in runs], dtype=torch.int32, device=device
-            ),
+            decode=False,
             num_tokens=sum(run_lens),
             trtllm_workspace=self._attention_workspace,
         )
 
-    def _one_token_view(
-        self,
-        *,
-        encoder_id: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: Optional[torch.Tensor],
+    def _decode_view(
+        self, *, encoder_id: int, req_pool_indices: torch.Tensor
     ) -> TapView:
         tap_lens = self._tap_lens[req_pool_indices]
         num_requests = req_pool_indices.shape[0]
-        num_keys = tap_lens if seq_lens is None else torch.minimum(seq_lens, tap_lens)
         return TapView(
             taps=self._buffers[encoder_id].view(
                 -1, self.page_size, 1, self._output_size
@@ -215,8 +196,8 @@ class FrankyTapCache:
                 num_requests + 1, dtype=torch.int32, device=tap_lens.device
             ),
             max_seqlen_q=1,
-            causal_lens=num_keys.to(torch.int32),
-            full_lens=None,
+            lens=tap_lens,
+            decode=True,
             num_tokens=num_requests,
             trtllm_workspace=self._attention_workspace,
         )

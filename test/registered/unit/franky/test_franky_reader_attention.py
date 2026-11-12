@@ -31,9 +31,12 @@ _NUM_ROWS = 6
 
 def _taps_read(position, reading):
     """The rule, token by token, from its definition."""
-    if reading.block_size is None or position < reading.generation_start:
-        return min(position + 1, reading.tap_len)
-    blocks = (position + 1 - reading.generation_start) // reading.block_size
+    token = position + 1
+    if token < reading.generation_start:
+        return 0
+    if reading.block_size is None:
+        return min(reading.generation_start, reading.tap_len)
+    blocks = (token - reading.generation_start) // reading.block_size
     block_start = reading.generation_start + blocks * reading.block_size
     return min(block_start, reading.tap_len)
 
@@ -163,11 +166,8 @@ class TestReaderAttention(CustomTestCase):
             ],
         )
         req_pool_indices = torch.tensor([1, 2, 3], device="cuda")
-        seq_lens = torch.tensor([90, 20, 5], device="cuda")
         batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
+            forward_mode=ForwardMode.DECODE, req_pool_indices=req_pool_indices
         )
         queries = torch.randn(3, _NUM_QUERIES, 256, dtype=TAP_DTYPE, device="cuda")
         attended = torch.empty_like(queries)
@@ -189,7 +189,6 @@ class TestReaderAttention(CustomTestCase):
         with torch.cuda.graph(graph):
             step()
         req_pool_indices.copy_(torch.tensor([4, 1, 3]))
-        seq_lens.copy_(torch.tensor([3, 200, 9]))
         queries.copy_(torch.randn_like(queries))
         graph.replay()
         torch.cuda.synchronize()
@@ -199,7 +198,7 @@ class TestReaderAttention(CustomTestCase):
             attended=attended,
             has_taps=has_taps,
             rows=[4, 1, 3],
-            num_taps=[3, 70, 0],
+            num_taps=[12, 70, 0],
         )
 
 

@@ -22,7 +22,6 @@ from sglang.srt.franky.parts.encoder.all.encoder import AllEncoder
 from sglang.srt.franky.parts.encoder.masked.encoder import MaskedEncoder
 from sglang.srt.franky.parts.encoder.singular.encoder import SingularEncoder
 from sglang.srt.franky.parts.injector.residual.config import ResidualInjectorConfig
-from sglang.srt.franky.parts.reader.fixed_query.reader import FixedQueryReader
 from sglang.srt.franky.parts.reader.residual_query.reader import ResidualQueryReader
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -39,7 +38,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 _CONFIG = {
     "encoder": {"type": "masked", "layers": [4, 8, 12], "output_size": 256},
     "reader": {
-        "type": "fixed_query",
+        "type": "residual_query",
         "layers": [1, 4, 9],
         "num_queries": 1,
         "mlp_hidden_size": 1024,
@@ -63,10 +62,9 @@ class _WithFiles(CustomTestCase):
 
 
 class TestFrankyConfig(_WithFiles):
-    def _load(self, *, encoder_type="masked", reader_type="fixed_query"):
+    def _load(self, *, encoder_type="masked"):
         config = copy.deepcopy(_CONFIG)
         config["encoder"]["type"] = encoder_type
-        config["reader"]["type"] = reader_type
         return FrankyConfig.load(self._write_config(config))
 
     def test_each_encoder_type_reads_its_layers(self):
@@ -92,13 +90,7 @@ class TestFrankyConfig(_WithFiles):
             with self.subTest(encoder_type):
                 loaded = self._load(encoder_type=encoder_type)
                 self.assertIs(loaded.encoder.encoder_cls, encoder_cls)
-        for reader_type, reader_cls in {
-            "fixed_query": FixedQueryReader,
-            "residual_query": ResidualQueryReader,
-        }.items():
-            with self.subTest(reader_type):
-                loaded = self._load(reader_type=reader_type)
-                self.assertIs(loaded.reader.reader_cls, reader_cls)
+        self.assertIs(self._load().reader.reader_cls, ResidualQueryReader)
         self.assertIsInstance(self._load().injector, ResidualInjectorConfig)
 
     def test_bad_configs_are_refused(self):

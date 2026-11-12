@@ -69,8 +69,8 @@ def _flash_attention_on_cpu(
     out,
 ):
     """FlashAttention's paged KV cache call needs a GPU, so this does what it does,
-    sequence by sequence: a causal mask puts a sequence's last token at its last
-    key, a token with no key gets zero, and only the sequences' rows are written.
+    sequence by sequence: every token of a sequence attends to all its keys, a
+    token with no key gets zero, and only the sequences' rows are written.
     """
     page_size = k_cache.shape[1]
     keys_of_slots = k_cache.reshape(-1, k_cache.shape[-1])
@@ -82,12 +82,11 @@ def _flash_attention_on_cpu(
         ).flatten()[:num_keys]
         keys = keys_of_slots[slots].float()
         for row in range(start, end):
-            visible = num_keys - (end - 1 - row) if causal else num_keys
-            if visible <= 0:
+            if num_keys == 0:
                 out[row] = 0
                 continue
-            scores = q[row].float() @ keys[:visible].T * softmax_scale
-            out[row] = (torch.softmax(scores, dim=-1) @ keys[:visible]).to(out.dtype)
+            scores = q[row].float() @ keys.T * softmax_scale
+            out[row] = (torch.softmax(scores, dim=-1) @ keys).to(out.dtype)
     return out
 
 
@@ -136,10 +135,10 @@ class _Files(CustomTestCase):
         for row in _TAP_LENS:
             self.req_to_token[row] = torch.arange(8 * row, 8 * row + _CONTEXT)
 
-    def _write(self, *, reader_type):
+    def _write(self):
         config_path = os.path.join(self.directory, "franky.json")
         reader = {
-            "type": reader_type,
+            "type": "residual_query",
             "layers": _READER_LAYERS,
             "num_queries": _NUM_QUERIES,
             "mlp_hidden_size": _MLP_HIDDEN_SIZE,
@@ -161,12 +160,9 @@ class _Files(CustomTestCase):
         weights = {}
         for index in range(len(_READER_LAYERS)):
             prefix = f"readers.{index}."
-            if reader_type == "fixed_query":
-                weights[f"{prefix}queries"] = torch.randn(_NUM_QUERIES, _TAP_SIZE)
-            else:
-                weights[f"{prefix}query_projection.weight"] = torch.randn(
-                    _NUM_QUERIES * _TAP_SIZE, _HIDDEN_SIZE
-                )
+            weights[f"{prefix}query_projection.weight"] = torch.randn(
+                _NUM_QUERIES * _TAP_SIZE, _HIDDEN_SIZE
+            )
             weights[f"{prefix}mlp.0.weight"] = torch.randn(
                 _MLP_HIDDEN_SIZE, _NUM_QUERIES * _TAP_SIZE
             )
@@ -225,29 +221,29 @@ def _extend_batch(*, rows, prefix_lens, extend_lens):
 
 
 class TestReaders(_Files):
-    def _expected(self, *, encoder_id, row, positions, queries, weights):
-        """What the PR adds to one request's tokens at ``positions``."""
-        tap_len = _TAP_LENS[row]
-        if tap_len == 0:
-            return torch.zeros(len(positions), _HIDDEN_SIZE)
-        visible = torch.arange(tap_len)[None, :] <= torch.tensor(positions)[:, None]
-        return _pr_query_reader(
-            queries=queries,
-            taps=self.taps[encoder_id, row],
-            visible=visible,
-            weights=weights,
-            prefix=f"readers.{encoder_id}.",
-        )
+    def _expected(self, *, encoder_id, row, num_taps, queries, weights):
+        num_taps = torch.tensor(num_taps)
+        reads = num_taps > 0
+        expected = torch.zeros(len(num_taps), _HIDDEN_SIZE)
+        if reads.any():
+            expected[reads] = _pr_query_reader(
+                queries=queries[reads],
+                taps=self.taps[encoder_id, row],
+                visible=torch.arange(_TAP_LENS[row])[None, :] < num_taps[reads, None],
+                weights=weights,
+                prefix=f"readers.{encoder_id}.",
+            )
+        return expected
 
-    def _check_extend(self, *, reader_type):
-        config_path, weights_path, weights = self._write(reader_type=reader_type)
+    def test_residual_queries_add_the_pr_result(self):
+        config_path, weights_path, weights = self._write()
         model = _Model()
         self._attach(model=model, config_path=config_path, weights_path=weights_path)
         # Row 1 runs its whole prompt; row 2 runs past its taps; row 3 has none.
         batch = _extend_batch(
             rows=[1, 2, 3], prefix_lens=[0, 2, 0], extend_lens=[5, 4, 2]
         )
-        positions = {1: [0, 1, 2, 3, 4], 2: [2, 3, 4, 5], 3: [0, 1]}
+        num_taps = {1: [0, 0, 0, 0, 5], 2: [3, 3, 3, 3], 3: [0, 0]}
         layer_output = torch.randn(11, _HIDDEN_SIZE)
         residual = torch.randn(11, _HIDDEN_SIZE)
 
@@ -259,21 +255,21 @@ class TestReaders(_Files):
                 forward_batch=batch,
             )
             self.assertIs(residual_out, residual)
-            whole = layer_output + residual
-            if reader_type == "fixed_query":
-                queries = weights[f"readers.{encoder_id}.queries"].expand(11, -1, -1)
-            else:
-                queries = functional.linear(
-                    whole, weights[f"readers.{encoder_id}.query_projection.weight"]
-                ).view(11, _NUM_QUERIES, _TAP_SIZE)
-            queries = queries.to(TAP_DTYPE)
+            queries = (
+                functional.linear(
+                    layer_output + residual,
+                    weights[f"readers.{encoder_id}.query_projection.weight"],
+                )
+                .view(11, _NUM_QUERIES, _TAP_SIZE)
+                .to(TAP_DTYPE)
+            )
             start = 0
-            for row, row_positions in positions.items():
-                end = start + len(row_positions)
+            for row, row_num_taps in num_taps.items():
+                end = start + len(row_num_taps)
                 expected = self._expected(
                     encoder_id=encoder_id,
                     row=row,
-                    positions=row_positions,
+                    num_taps=row_num_taps,
                     queries=queries[start:end],
                     weights=weights,
                 )
@@ -285,15 +281,13 @@ class TestReaders(_Files):
                 )
                 start = end
 
-    def test_fixed_queries_add_the_pr_result(self):
-        self._check_extend(reader_type="fixed_query")
-
     def test_a_later_blocks_tokens_read_the_taps_before_their_block(self):
         """Row 4's tokens 5..8 came from block 1 and 9..12 from block 2. Each
         token reads the taps before the block of the token it predicts, as that
-        block's decode did; token 12 predicts block 3's first token.
+        block's decode did; token 3 predicts a prompt token and reads nothing, and
+        token 12 predicts block 3's first token.
         """
-        config_path, weights_path, weights = self._write(reader_type="residual_query")
+        config_path, weights_path, weights = self._write()
         model = _Model()
         parts = self._attach(
             model=model, config_path=config_path, weights_path=weights_path
@@ -314,27 +308,20 @@ class TestReaders(_Files):
         queries = functional.linear(
             layer_output, weights["readers.0.query_projection.weight"]
         ).view(10, _NUM_QUERIES, _TAP_SIZE)
-        visible = (
-            torch.arange(13)[None, :]
-            < torch.tensor([4, 5, 5, 5, 5, 9, 9, 9, 9, 13])[:, None]
-        )
-        expected = _pr_query_reader(
+        expected = self._expected(
+            encoder_id=0,
+            row=4,
+            num_taps=[0, 5, 5, 5, 5, 9, 9, 9, 9, 13],
             queries=queries.to(TAP_DTYPE),
-            taps=self.taps[0, 4],
-            visible=visible,
             weights=weights,
-            prefix="readers.0.",
         )
         torch.testing.assert_close(
             hidden_states - layer_output, expected, atol=2e-3, rtol=2e-3
         )
 
-    def test_residual_queries_add_the_pr_result(self):
-        self._check_extend(reader_type="residual_query")
-
     def test_tokens_without_taps_and_padded_tokens_get_exactly_zero(self):
         """A CUDA graph pads the batch with tokens of no request."""
-        config_path, weights_path, _ = self._write(reader_type="fixed_query")
+        config_path, weights_path, _ = self._write()
         model = _Model()
         self._attach(model=model, config_path=config_path, weights_path=weights_path)
         layer_output = torch.randn(4, _HIDDEN_SIZE)
@@ -349,11 +336,9 @@ class TestReaders(_Files):
 
         self.assertTrue(torch.equal(hidden_states, layer_output))
 
-    def _decode(self, *, model, rows, seq_lens):
+    def _decode(self, *, model, rows):
         batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE,
-            req_pool_indices=torch.tensor(rows),
-            seq_lens=torch.tensor(seq_lens),
+            forward_mode=ForwardMode.DECODE, req_pool_indices=torch.tensor(rows)
         )
         layer_output = torch.randn(len(rows), _HIDDEN_SIZE)
         hidden_states, _ = model.model.franky_after_layer_with_residual(
@@ -361,56 +346,21 @@ class TestReaders(_Files):
         )
         return hidden_states - layer_output, layer_output
 
-    def test_a_fixed_reader_reads_once_for_each_requests_decoded_tokens(self):
-        """Every decoded token is past its request's last tap, so with fixed
-        queries it gets what the request's last prompt token got; a request
-        without taps gets zero.
-        """
-        config_path, weights_path, weights = self._write(reader_type="fixed_query")
+    def test_a_decoded_token_reads_all_its_requests_taps(self):
+        config_path, weights_path, weights = self._write()
         model = _Model()
-        parts = self._attach(
-            model=model, config_path=config_path, weights_path=weights_path
-        )
-        parts.keep_past_the_taps(req_pool_indices=[1, 2, 3])
+        self._attach(model=model, config_path=config_path, weights_path=weights_path)
 
-        with patch.object(
-            query_reader, "flash_attn_with_kvcache", side_effect=AssertionError
-        ):
-            added, _ = self._decode(model=model, rows=[1, 2, 3], seq_lens=[9, 7, 4])
-
-        queries = weights["readers.0.queries"].expand(1, -1, -1).to(TAP_DTYPE)
-        for token, (row, position) in enumerate(((1, 8), (2, 6), (3, 3))):
-            expected = self._expected(
-                encoder_id=0,
-                row=row,
-                positions=[position],
-                queries=queries,
-                weights=weights,
-            )
-            torch.testing.assert_close(
-                added[token : token + 1], expected, atol=2e-3, rtol=2e-3
-            )
-
-    def test_a_residual_reader_reads_every_tap_it_may_for_each_token(self):
-        config_path, weights_path, weights = self._write(reader_type="residual_query")
-        model = _Model()
-        parts = self._attach(
-            model=model, config_path=config_path, weights_path=weights_path
-        )
-        parts.keep_past_the_taps(req_pool_indices=[1, 2, 3])
-
-        added, layer_output = self._decode(
-            model=model, rows=[1, 2, 3], seq_lens=[9, 2, 4]
-        )
+        added, layer_output = self._decode(model=model, rows=[1, 2, 3])
 
         queries = functional.linear(
             layer_output, weights["readers.0.query_projection.weight"]
         ).view(3, _NUM_QUERIES, _TAP_SIZE)
-        for token, (row, position) in enumerate(((1, 8), (2, 1), (3, 3))):
+        for token, row in enumerate((1, 2, 3)):
             expected = self._expected(
                 encoder_id=0,
                 row=row,
-                positions=[position],
+                num_taps=[_TAP_LENS[row]],
                 queries=queries[token : token + 1].to(TAP_DTYPE),
                 weights=weights,
             )
@@ -419,7 +369,7 @@ class TestReaders(_Files):
             )
 
     def test_layers_without_a_reader_are_left_alone(self):
-        config_path, weights_path, _ = self._write(reader_type="fixed_query")
+        config_path, weights_path, _ = self._write()
         model = _Model()
         self._attach(model=model, config_path=config_path, weights_path=weights_path)
         layer_output = torch.randn(5, _HIDDEN_SIZE)
@@ -440,7 +390,7 @@ class TestRickyParts(_Files):
         so it belongs to the stage that ends at ``L``. Every stage holds all
         encoders' taps, since PD's transfer pairs entries by id.
         """
-        config_path, weights_path, _ = self._write(reader_type="fixed_query")
+        config_path, weights_path, _ = self._write()
         edges = (0, 1, 3, _NUM_LAYERS)
         stages = [
             self._attach(

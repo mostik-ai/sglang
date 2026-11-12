@@ -77,8 +77,6 @@ class RickyDecodeScheduler(Scheduler):
                     for req in batch.reqs
                 ],
             )
-            # PD hands a request over once its taps landed; it only decodes here.
-            franky_parts.keep_past_the_taps(req_pool_indices=req_pool_indices)
         return batch
 
     def _handle_end_chain(self, recv_req: FrankyEndChainReq) -> None:
