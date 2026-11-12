@@ -15,6 +15,7 @@ use crate::state::kv_events::{
 };
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
+use crate::tokenizer::chat_template_adapter::ChatTemplateAdapter;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::{DecodeGate, WorkerRegistry};
 use std::collections::HashMap;
@@ -61,6 +62,9 @@ pub struct AppContext {
     pub chat_routing: ChatRouting,
     /// Where a Franky Ricky's Sandy is picked from, under either routing.
     pub sandy: Option<EngineGroup>,
+    /// Finds the earlier answers in the chats the router renders for Franky
+    /// workers; `None` without `--franky-chat-adapter`.
+    pub franky_chat_adapter: Option<Arc<dyn ChatTemplateAdapter>>,
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub router_inflight_load: Arc<RouterInflightLoadRegistry>,
@@ -142,6 +146,7 @@ impl AppContext {
             bucket_selector,
             chat_routing: ChatRouting::Legacy,
             sandy: None,
+            franky_chat_adapter: None,
             router_inflight_load,
             decode_gate,
             metrics,
@@ -251,6 +256,7 @@ impl AppContext {
             bucket_selector: Arc::new(BucketSelector::new(None)),
             chat_routing: ChatRouting::Legacy,
             sandy: None,
+            franky_chat_adapter: None,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
             decode_gate: DecodeGate::new(None),
             metrics: MetricsRegistry::new(),
