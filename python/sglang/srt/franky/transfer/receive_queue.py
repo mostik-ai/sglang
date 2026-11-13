@@ -8,6 +8,7 @@ import msgspec
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.tap_cache import FrankyReqState
 from sglang.srt.franky.transfer.host_pages import FrankyHostPages
 from sglang.srt.franky.transfer.messages import FrankyRoomClosed, FrankyTapsReady
@@ -31,6 +32,13 @@ logger = logging.getLogger(__name__)
 _NO_TAPS_NAMESPACE = "franky=no-taps"
 
 
+class _Returning(msgspec.Struct, frozen=True, kw_only=True):
+    """What a request retracted after its taps landed keeps for its return."""
+
+    tap_len: int
+    own_tap_pages: Optional[torch.Tensor]
+
+
 class _Reception(msgspec.Struct, kw_only=True):
     req: Any
     # The prompt's tap pages on their way to the host; the receiver opens on arrival.
@@ -48,7 +56,8 @@ class _Reception(msgspec.Struct, kw_only=True):
 class FrankyReceiveQueue:
     """Ricky's requests from arrival until they end. At arrival a request takes
     KV pages for its prompt past its cached prefix, as PD decode does, and its
-    taps land from Sandy in the tap pages of those pages. Decisions reach every
+    taps land from Sandy in the tap pages of those pages; when Sandy tokenizes on
+    its own, in tap pages the request owns, all of its taps. Decisions reach every
     rank and stage at one step as leader messages, as Sandy's releases do.
     """
 
@@ -79,7 +88,7 @@ class FrankyReceiveQueue:
         self.release_timeout_seconds = release_timeout_seconds
         self.fail_request = fail_request
         self.arrivals: list[Req] = []
-        self.returning_tap_lens: dict[str, int] = {}
+        self.returning: dict[str, _Returning] = {}
         self.receptions: dict[str, _Reception] = {}
         self.agreed: dict[str, int] = {}
 
@@ -89,8 +98,10 @@ class FrankyReceiveQueue:
         KV is cached apart from KV that read taps.
         """
         if req.rid in self.receptions:
-            self.returning_tap_lens[req.rid] = req.franky.tap_len
-            self._release(self.receptions[req.rid])
+            self.returning[req.rid] = _Returning(
+                tap_len=req.franky.tap_len, own_tap_pages=req.franky.own_tap_pages
+            )
+            self._release(self.receptions[req.rid], keep_own_tap_pages=True)
             req.franky = None
         elif req.franky_room is None:
             req.extra_key = (
@@ -104,7 +115,9 @@ class FrankyReceiveQueue:
         """The scheduler aborted ``req``; its pages wait for its room to close."""
         if req in self.arrivals:
             self.arrivals.remove(req)
-        self.returning_tap_lens.pop(req.rid, None)
+        returning = self.returning.pop(req.rid, None)
+        if returning is not None and returning.own_tap_pages is not None:
+            self.tap_cache.own_pages.free(returning.own_tap_pages)
         self.chain_holds.release_chain_of(req)
         if req.rid in self.receptions:
             self._end(self.receptions[req.rid])
@@ -188,7 +201,10 @@ class FrankyReceiveQueue:
                 return
 
     def _take_pages(self, req: Req) -> bool:
-        returning = req.rid in self.returning_tap_lens
+        returning = self.returning.get(req.rid)
+        if (problem := self._tokenization_problem(req)) is not None:
+            self.fail_request(req, problem)
+            return True
         tap_len = self._tap_len_of(req)
         req.init_next_round_input(self.tree_cache, cow_mamba=False)
         num_tokens = len(req.full_untruncated_fill_ids)
@@ -202,11 +218,26 @@ class FrankyReceiveQueue:
                 req, f"Request {req.rid} does not fit in Ricky's KV memory."
             )
             return True
-        if returning and req.prefix_len < tap_len:
+        own_pages = self.tap_cache.own_pages
+        num_own_pages = (
+            ceil_div(tap_len, self.tap_cache.page_size)
+            if own_pages is not None and returning is None
+            else 0
+        )
+        if own_pages is not None and num_own_pages > own_pages.max_pages_per_request:
+            self.fail_request(
+                req,
+                f"Sandy's {tap_len} tokens of request {req.rid} are past Ricky's "
+                "context length.",
+            )
+            return True
+        if own_pages is None and returning is not None and req.prefix_len < tap_len:
             self.fail_request(
                 req, f"The taps of request {req.rid} left the prefix cache."
             )
             return True
+        if own_pages is not None and num_own_pages > own_pages.num_free():
+            return False
         prefix_lock = (
             self.tree_cache.lock(req.last_node) if req.prefix_len > 0 else None
         )
@@ -216,25 +247,65 @@ class FrankyReceiveQueue:
             self.tree_cache.unlock(prefix_lock)
             return False
         self.chain_holds.release_chain_of(req)
-        self.returning_tap_lens.pop(req.rid, None)
+        self.returning.pop(req.rid, None)
         taken = self._take_slots(num_page_slots)[:num_taken]
-        receives_taps = not returning and tap_len > 0
+        receives_taps = returning is None and tap_len > 0
+        own_tap_pages = (
+            own_pages.take(num_pages=num_own_pages)
+            if receives_taps and own_pages is not None
+            else returning.own_tap_pages
+            if returning is not None
+            else None
+        )
+        taps_held = req.prefix_len if own_tap_pages is None else 0
+        all_taps_ready = num_tokens if own_tap_pages is None else tap_len
         req.franky = FrankyReqState(
             tap_len=tap_len,
-            taps_ready=req.prefix_len if receives_taps else num_tokens,
+            taps_ready=taps_held if receives_taps else all_taps_ready,
             taken_kv_slots=taken,
             taken_from=req.prefix_len,
             used_end=req.prefix_len,
+            generated_spans=(
+                FrankyGeneratedSpans.of(
+                    earlier_answers=req.franky_generated_spans,
+                    num_input_tokens=len(req.origin_input_ids),
+                    chain=req.franky_chain,
+                    sandy_input_len=req.franky_sandy_input_len,
+                )
+                if tap_len > 0
+                else None
+            ),
+            own_tap_pages=own_tap_pages,
         )
         self.receptions[req.rid] = _Reception(
             req=req,
-            pages=self._tap_pages(taken) if receives_taps else None,
+            pages=(
+                self._tap_pages(taken, own_tap_pages=own_tap_pages)
+                if receives_taps
+                else None
+            ),
             receiver=None,
             prefix_lock=prefix_lock,
-            landed=req.prefix_len if receives_taps else tap_len,
-            announced_taps=req.prefix_len,
+            landed=taps_held if receives_taps else tap_len,
+            announced_taps=taps_held,
         )
         return True
+
+    def _tokenization_problem(self, req: Req) -> Optional[str]:
+        if req.franky_room is None:
+            return None
+        sandy_own = self.tap_cache.own_pages is not None
+        if sandy_own and req.franky_sandy_input_len is None:
+            return (
+                f"Request {req.rid} reads taps of a Sandy that tokenizes on its own, "
+                "so it needs franky_sandy_input_len."
+            )
+        if not sandy_own and req.franky_sandy_input_len is not None:
+            return (
+                f"Request {req.rid} sends franky_sandy_input_len, but this Ricky's "
+                "Sandy reads its tokens."
+            )
+        return None
 
     def _live_receptions(self) -> list[_Reception]:
         return [
@@ -248,13 +319,17 @@ class FrankyReceiveQueue:
             self.chain_holds.release_chain_of(req)
 
     def _keep_kv_past_the_prompt_out_of_the_cache(self, req: Req) -> None:
-        if req.franky.tap_len > 0 and req.prefix_len >= req.franky.tap_len:
+        if req.franky.tap_len > 0 and req.prefix_len >= len(req.origin_input_ids):
             req.skip_radix_cache_insert = True
 
     def _tap_len_of(self, req: Req) -> int:
-        if req.rid in self.returning_tap_lens:
-            return self.returning_tap_lens[req.rid]
-        return len(req.origin_input_ids) if req.franky_room is not None else 0
+        if req.rid in self.returning:
+            return self.returning[req.rid].tap_len
+        if req.franky_room is None:
+            return 0
+        if req.franky_sandy_input_len is not None:
+            return req.franky_sandy_input_len
+        return len(req.origin_input_ids)
 
     def _fits_after_releasing_holds(
         self, num_page_slots: int, *, prefix_lock: Optional[TreeLock]
@@ -308,7 +383,11 @@ class FrankyReceiveQueue:
             )
         return slots
 
-    def _tap_pages(self, taken: torch.Tensor) -> FrankyHostPages:
+    def _tap_pages(
+        self, taken: torch.Tensor, *, own_tap_pages: Optional[torch.Tensor]
+    ) -> FrankyHostPages:
+        if own_tap_pages is not None:
+            return FrankyHostPages(own_tap_pages)
         tap_pages = self.tap_cache.pages_of(slots=taken)
         return FrankyHostPages(tap_pages.to(torch.int32))
 
@@ -324,13 +403,14 @@ class FrankyReceiveQueue:
         return numbers
 
     def _poll_receiver(self, reception: _Reception) -> bool:
+        franky = reception.req.franky
         if reception.pages is not None and reception.pages.ready():
             reception.receiver = FrankyReceiver(
                 manager=self.tap_manager,
                 franky_room=reception.req.franky_room,
                 tap_pages=reception.pages.numpy(),
-                num_tokens=reception.req.franky.tap_len,
-                prefix_len=reception.req.franky.taken_from,
+                num_tokens=franky.tap_len,
+                prefix_len=franky.taken_from if franky.own_tap_pages is None else 0,
             )
             reception.pages = None
         receiver = reception.receiver
@@ -395,11 +475,15 @@ class FrankyReceiveQueue:
         )
         return True
 
-    def _release(self, reception: _Reception) -> None:
+    def _release(
+        self, reception: _Reception, *, keep_own_tap_pages: bool = False
+    ) -> None:
         req = reception.req
         state = req.franky
         unused_from = ceil_div(state.used_end - state.taken_from, self.page_size)
         self.kv_allocator.free(state.taken_kv_slots[unused_from * self.page_size :])
+        if state.own_tap_pages is not None and not keep_own_tap_pages:
+            self.tap_cache.own_pages.free(state.own_tap_pages)
         self.tree_cache.unlock(reception.prefix_lock)
         if reception.receiver is not None:
             self.tap_manager.clear_deferred_abort_state(

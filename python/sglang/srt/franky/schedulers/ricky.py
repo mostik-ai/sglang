@@ -10,7 +10,6 @@ from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
-from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
@@ -147,6 +146,20 @@ class RickyScheduler(Scheduler):
         )
 
     @override
+    def send_kv_chunk(
+        self, req: Req, last_chunk: bool = False, end_idx: Optional[int] = None
+    ) -> None:
+        if (
+            last_chunk
+            and req.franky is not None
+            and req.franky.own_tap_pages is not None
+        ):
+            req.disagg_kv_sender.relay_own_taps(
+                tap_pages=req.franky.own_tap_pages.numpy()
+            )
+        super().send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+
+    @override
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
         return FrankyPrefillAdder
 
@@ -191,23 +204,20 @@ class RickyScheduler(Scheduler):
         )
         if new_batch is not None:
             self.franky_receive_queue.on_started(reqs=new_batch.reqs)
-            franky_parts = self.tp_worker.model_runner.franky_parts
-            franky_parts.tap_cache.set_generated_spans(
+            tap_cache = self.tp_worker.model_runner.franky_parts.tap_cache
+            tap_cache.set_generated_spans(
                 req_pool_indices=[req.kv.req_pool_idx for req in new_batch.reqs],
-                generated_spans=[
-                    (
-                        FrankyGeneratedSpans.of(
-                            earlier_answers=req.franky_generated_spans,
-                            num_input_tokens=len(req.origin_input_ids),
-                            chain=req.franky_chain,
-                        )
-                        if req.franky.tap_len > 0
-                        else None
-                    )
-                    for req in new_batch.reqs
-                ],
+                generated_spans=[req.franky.generated_spans for req in new_batch.reqs],
                 num_input_tokens=[len(req.origin_input_ids) for req in new_batch.reqs],
             )
+            owning = [
+                req for req in new_batch.reqs if req.franky.own_tap_pages is not None
+            ]
+            if owning:
+                tap_cache.own_pages.bind(
+                    req_pool_indices=[req.kv.req_pool_idx for req in owning],
+                    pages=[req.franky.own_tap_pages for req in owning],
+                )
         return new_batch, running_batch
 
     @override

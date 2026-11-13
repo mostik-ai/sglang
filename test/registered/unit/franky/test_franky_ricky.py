@@ -212,7 +212,9 @@ class _Files(CustomTestCase):
                 parts.tap_cache.set_generated_spans(
                     req_pool_indices=[row],
                     generated_spans=[
-                        FrankyGeneratedSpans(spans=(GeneratedSpan(start=tap_len),))
+                        FrankyGeneratedSpans(
+                            spans=(GeneratedSpan(start=tap_len, sandy_start=tap_len),)
+                        )
                         if tap_len
                         else None
                     ],
@@ -315,7 +317,9 @@ class TestReaders(_Files):
         parts.tap_cache.set_generated_spans(
             req_pool_indices=[4],
             generated_spans=[
-                FrankyGeneratedSpans(spans=(GeneratedSpan(start=5),), block_size=4)
+                FrankyGeneratedSpans(
+                    spans=(GeneratedSpan(start=5, sandy_start=5),), block_size=4
+                )
             ],
             num_input_tokens=[13],
         )

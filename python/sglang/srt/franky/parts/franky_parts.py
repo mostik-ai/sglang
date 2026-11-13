@@ -127,6 +127,7 @@ class FrankyParts(ABC):
             num_tokens=num_tokens,
             req_to_token=req_to_token_pool.req_to_token,
             device=self.device,
+            own_pages=self._owns_tap_pages(),
             attention_workspace=self._attention_workspace(),
         )
 
@@ -151,6 +152,10 @@ class FrankyParts(ABC):
     def _attention_workspace(self) -> Optional[torch.Tensor]:
         """The buffer the readers' attention kernel needs, if any."""
         return None
+
+    def _owns_tap_pages(self) -> bool:
+        """Whether this side's requests keep their taps in pages of their own."""
+        return False
 
     def write_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         """Hand what the next PP stage needs."""
