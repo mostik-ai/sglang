@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 import msgspec
 import torch
@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 _NO_TAPS_NAMESPACE = "franky=no-taps"
 
 
+def _prompt_key(req: Req) -> tuple[Any, ...]:
+    prompt = req.origin_input_ids
+    return (req.extra_key, len(prompt), hash(tuple(prompt)))
+
+
 class _Reception(msgspec.Struct, kw_only=True):
     req: Any
     # The prompt's tap pages on their way to the host; the receiver opens on arrival.
@@ -48,8 +53,10 @@ class _Reception(msgspec.Struct, kw_only=True):
 class FrankyReceiveQueue:
     """Ricky's requests from arrival until they end. At arrival a request takes
     KV pages for its prompt past its cached prefix, as PD decode does, and its
-    taps land from Sandy in the tap pages of those pages. Decisions reach every
-    rank and stage at one step as leader messages, as Sandy's releases do.
+    taps land from Sandy in the tap pages of those pages. A copy of a prompt
+    that an earlier request still prefills waits until that prompt is cached,
+    then takes pages only past it. Decisions reach every rank and stage at one
+    step as leader messages, as Sandy's releases do.
     """
 
     def __init__(
@@ -81,6 +88,7 @@ class FrankyReceiveQueue:
         self.arrivals: list[Req] = []
         self.returning_tap_lens: dict[str, int] = {}
         self.receptions: dict[str, _Reception] = {}
+        self.prompt_keys: dict[str, tuple[Any, ...]] = {}
         self.agreed: dict[str, int] = {}
 
     def add(self, *, req: Req) -> None:
@@ -98,12 +106,15 @@ class FrankyReceiveQueue:
                 if req.extra_key
                 else _NO_TAPS_NAMESPACE
             )
+        else:
+            self.prompt_keys[req.rid] = _prompt_key(req)
         self.arrivals.append(req)
 
     def forget(self, *, req: Req) -> None:
         """The scheduler aborted ``req``; its pages wait for its room to close."""
         if req in self.arrivals:
             self.arrivals.remove(req)
+        self.prompt_keys.pop(req.rid, None)
         self.returning_tap_lens.pop(req.rid, None)
         self.chain_holds.release_chain_of(req)
         if req.rid in self.receptions:
@@ -111,8 +122,9 @@ class FrankyReceiveQueue:
 
     def poll(self) -> None:
         """Every rank, at each step: notice ended requests before an arrival can
-        evict their prompts, take pages for arrivals in order, and agree on
-        landings with ``FrankyRankReports``.
+        evict their prompts, take pages for arrivals in order, past the copies
+        that wait for a prompt in prefill, and agree on landings with
+        ``FrankyRankReports``.
         """
         for reception in self._live_receptions():
             if reception.req.finished():
@@ -181,11 +193,32 @@ class FrankyReceiveQueue:
         return not self.arrivals and not self.receptions
 
     def _take_pages_for_arrivals(self) -> None:
-        while self.arrivals:
-            req = self.arrivals.pop(0)
-            if not self._take_pages(req):
-                self.arrivals.insert(0, req)
-                return
+        prompts_in_prefill = self._prompts_in_prefill(self.receptions)
+        waiting = []
+        for index, req in enumerate(self.arrivals):
+            if self.prompt_keys.get(req.rid) in prompts_in_prefill:
+                waiting.append(req)
+            elif self._take_pages(req):
+                prompts_in_prefill |= self._prompts_in_prefill((req.rid,))
+            else:
+                waiting.extend(self.arrivals[index:])
+                break
+        self.arrivals = waiting
+
+    def _prompts_in_prefill(self, rids: Iterable[str]) -> set[tuple[Any, ...]]:
+        return {
+            self.prompt_keys[rid]
+            for rid in rids
+            if self._prefills_a_prompt_to_share(rid)
+        }
+
+    def _prefills_a_prompt_to_share(self, rid: str) -> bool:
+        reception = self.receptions.get(rid)
+        if reception is None or reception.ended or rid not in self.prompt_keys:
+            return False
+        state = reception.req.franky
+        in_prefill = reception.req.prefix_len < state.tap_len
+        return in_prefill and state.taken_from + self.page_size < state.tap_len
 
     def _take_pages(self, req: Req) -> bool:
         returning = req.rid in self.returning_tap_lens
@@ -404,6 +437,7 @@ class FrankyReceiveQueue:
             )
             reception.receiver.close()
         self._forget_keys(req.rid, "landed", "ok", "closed")
+        self.prompt_keys.pop(req.rid, None)
         del self.receptions[req.rid]
 
     def _taps_complete(self, reception: _Reception) -> bool:

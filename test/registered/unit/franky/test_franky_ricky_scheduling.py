@@ -98,11 +98,22 @@ class _Tree:
 
 
 class _Req:
-    def __init__(self, rid, *, prompt_len, cached_prefix_len=0, room=True, chain=None):
+    def __init__(
+        self,
+        rid,
+        *,
+        prompt_len,
+        cached_prefix_len=0,
+        room=True,
+        chain=None,
+        prompt=None,
+    ):
         self.rid = rid
         self.franky_chain = chain
         self.finished_reason = None
-        self.origin_input_ids = list(range(prompt_len))
+        self.origin_input_ids = (
+            list(prompt) if prompt is not None else [rid] * prompt_len
+        )
         self.output_ids = []
         self.cached_prefix_len = cached_prefix_len
         self.franky = None
@@ -276,6 +287,48 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.assertIsNone(second.franky)
         self.assertIsNone(third.franky)
         self.assertEqual(self.failed, [])
+
+    def test_a_copy_of_a_prompt_in_prefill_waits_then_takes_pages_past_it(self):
+        prompt = list(range(64))
+        first = self._arrive(_Req("a", prompt_len=64, prompt=prompt))
+        copy = self._arrive(_Req("b", prompt_len=64, prompt=prompt))
+
+        self.assertIsNone(copy.franky)
+
+        first.prefix_len = 64
+        copy.cached_prefix_len = 48
+        self.queue.poll()
+
+        self.assertEqual(copy.franky.taken_from, 48)
+        self.assertEqual(self.receivers[-1].prefix_len, 48)
+
+    def test_a_copy_waits_no_longer_once_the_first_request_ends(self):
+        prompt = list(range(64))
+        first = self._arrive(_Req("a", prompt_len=64, prompt=prompt))
+        copy = self._arrive(_Req("b", prompt_len=64, prompt=prompt))
+
+        self.queue.forget(req=first)
+        self.queue.poll()
+
+        self.assertIsNotNone(copy.franky)
+
+    def test_a_waiting_copy_lets_the_arrivals_behind_it_take_pages(self):
+        prompt = list(range(64))
+        self._arrive(_Req("a", prompt_len=64, prompt=prompt))
+        copy = self._arrive(_Req("b", prompt_len=64, prompt=prompt))
+        other = self._arrive(_Req("c", prompt_len=64))
+
+        self.assertIsNone(copy.franky)
+        self.assertIsNotNone(other.franky)
+
+    def test_a_copy_of_a_prompt_cached_up_to_its_last_page_does_not_wait(self):
+        prompt = list(range(64))
+        self._arrive(_Req("a", prompt_len=64, cached_prefix_len=48, prompt=prompt))
+        copy = self._arrive(
+            _Req("b", prompt_len=64, cached_prefix_len=48, prompt=prompt)
+        )
+
+        self.assertIsNotNone(copy.franky)
 
     def test_taps_are_ready_up_to_the_lowest_landing_of_every_stage(self):
         req = self._arrive(_Req("r", prompt_len=64))
