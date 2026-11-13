@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.franky.cache.generated_spans import GeneratedSpan
     from sglang.srt.franky.cache.tap_cache import FrankyReqState
     from sglang.srt.franky.chains.chain import FrankyChain
     from sglang.srt.franky.transfer.messages import FrankyRoom
@@ -1068,6 +1069,7 @@ class Req(ReqDllmMixin):
         bootstrap_room: Optional[int] = None,
         franky_room: Optional[FrankyRoom] = None,
         franky_chain: Optional[FrankyChain] = None,
+        franky_generated_spans: tuple[GeneratedSpan, ...] = (),
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1417,6 +1419,7 @@ class Req(ReqDllmMixin):
         self.franky: Optional[FrankyReqState] = None
         self.franky_room: Optional[FrankyRoom] = franky_room
         self.franky_chain: Optional[FrankyChain] = franky_chain
+        self.franky_generated_spans = franky_generated_spans
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank

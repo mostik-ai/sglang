@@ -52,6 +52,7 @@ from pydantic import PlainValidator
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
+from sglang.srt.franky.cache.generated_spans import GeneratedSpan
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.lora.lora_registry import LoRARef
@@ -300,6 +301,7 @@ class GenerateReqInput:
     franky_room: Optional[Union[List[Optional[Dict[str, Any]]], Dict[str, Any]]] = None
     # Franky: the chain this request is a block of, as FrankyChain's fields.
     franky_chain: Optional[Dict[str, Any]] = None
+    franky_generated_spans: Optional[List[List[int]]] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -965,6 +967,8 @@ class GenerateReqInput:
 
         if self.franky_chain is not None:
             raise ValueError("franky_chain takes a single request with n=1.")
+        if self.franky_generated_spans is not None:
+            raise ValueError("franky_generated_spans takes a single request with n=1.")
 
     def _get_positional_embed_overrides_item(
         self, i: int
@@ -1200,6 +1204,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     lora_name: Optional[str] = None
     franky_room: Optional[FrankyRoom] = None
     franky_chain: Optional[FrankyChain] = None
+    franky_generated_spans: tuple[GeneratedSpan, ...] = ()
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

@@ -82,7 +82,7 @@ class _Files(CustomTestCase):
                         "output_size": _OUTPUT_SIZE,
                     },
                     "reader": {
-                        "type": "fixed_query",
+                        "type": "residual_query",
                         "layers": list(range(1, len(layers) + 1)),
                         "num_queries": 1,
                         "mlp_hidden_size": 4,

@@ -38,6 +38,10 @@ pub struct ProxyConfig {
     /// so a block's tokens read their own taps in the next block. `None` runs
     /// it in one block.
     pub franky_block_size: Option<NonZeroU32>,
+    /// Franky: the chat template whose earlier answers the router marks in the
+    /// chats it renders. `None` refuses a Franky chat with earlier answers
+    /// unless it carries `input_ids`.
+    pub franky_chat_adapter: Option<ChatTemplateAdapterKind>,
 }
 
 impl ProxyConfig {
@@ -72,6 +76,7 @@ impl Default for ProxyConfig {
             decode_dispatch_limit: None,
             stream_after_prefill: false,
             franky_block_size: None,
+            franky_chat_adapter: None,
         }
     }
 }
@@ -112,6 +117,13 @@ pub enum TokenizerBackend {
     /// `fastokens` BPE encoding with Hugging Face decoding.
     #[value(name = "fast")]
     Fast,
+}
+
+/// Chat templates whose earlier answers the router can find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ChatTemplateAdapterKind {
+    #[value(name = "qwen3.5")]
+    Qwen35,
 }
 
 /// Router tokenizer encode settings.

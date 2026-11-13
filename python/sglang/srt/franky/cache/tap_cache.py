@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import itertools
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
 
-from sglang.srt.franky.cache.tap_reading import FrankyTapReading
+from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
@@ -37,24 +36,21 @@ class FrankyReqState(msgspec.Struct, kw_only=True):
 
 
 class TapView(msgspec.Struct, frozen=True, kw_only=True):
-    """One encoder's taps for the tokens of one forward, as FlashAttention's paged
-    KV cache with one head: the taps are both keys and values.
+    """One encoder's taps for the rows of one forward, as the paged attention
+    kernels take them.
 
-    The tokens are in the sequences of ``cu_seqlens_q``. A causal pass lets each
-    sequence attend to the first ``causal_lens`` taps of its page table row, with
-    its last token at the last of them. With ``full_lens``, a second pass lets
-    every token of a sequence attend to all of its first ``full_lens`` taps: a
-    request's tokens past its last tap form a sequence of their own for it.
+    Attributes:
+        taps: [pages, page_size, 1, output_size], both the keys and the values.
+        page_table: [rows, pages] int32, the pages of each row's request.
+        taps_to_read: [rows] int32, the taps each row's query reads, from tap 0.
+        num_tokens: the real rows; a CUDA graph pads after them.
+        trtllm_workspace: TRT-LLM's workspace on Blackwell; None where FA3 runs.
     """
 
-    taps: torch.Tensor  # [pages, page_size, 1, output_size]
-    page_table: torch.Tensor  # [sequences, pages], int32
-    cu_seqlens_q: torch.Tensor  # [sequences + 1], int32
-    max_seqlen_q: int
-    causal_lens: torch.Tensor  # [sequences], int32
-    full_lens: Optional[torch.Tensor]  # [sequences], int32; None in decode
+    taps: torch.Tensor
+    page_table: torch.Tensor
+    taps_to_read: torch.Tensor
     num_tokens: int
-    # The TRT-LLM kernels' workspace on Blackwell; None where FA3 runs.
     trtllm_workspace: Optional[torch.Tensor]
 
 
@@ -83,13 +79,11 @@ class FrankyTapCache:
         self._output_size = output_size
         self._req_to_token = req_to_token
         self._attention_workspace = attention_workspace
-        # Taps per request row; 0 for rows without taps, such as row 0, which
-        # padded requests use.
-        self._tap_lens = torch.zeros(
+        self._decode_taps_to_read = torch.zeros(
             req_to_token.shape[0], dtype=torch.int32, device=device
         )
-        self._readings = [
-            FrankyTapReading(tap_len=0, generation_start=0)
+        self._generated_spans: list[Optional[FrankyGeneratedSpans]] = [
+            None
         ] * req_to_token.shape[0]
         # One more page, as in the KV pool: padded tokens write to page 0, and
         # padded requests read its zeros.
@@ -124,102 +118,96 @@ class FrankyTapCache:
     ) -> None:
         self._buffers[encoder_id][self.slots_of(kv_slots=kv_slots)] = taps
 
-    def set_readings(
-        self, *, req_pool_indices: list[int], readings: list[FrankyTapReading]
+    def set_generated_spans(
+        self,
+        *,
+        req_pool_indices: list[int],
+        generated_spans: list[Optional[FrankyGeneratedSpans]],
+        num_input_tokens: list[int],
     ) -> None:
-        device = self._tap_lens.device
+        """Which taps the forward of each token of these requests reads; a request
+        with None reads none.
+
+        Args:
+            num_input_tokens: per request, its input length: its decoded block's start.
+        """
+        device = self._decode_taps_to_read.device
+        decoded = [
+            0 if spans is None else int(spans.taps_to_read(torch.tensor([first]))[0])
+            for spans, first in zip(generated_spans, num_input_tokens)
+        ]
         rows = async_h2d(req_pool_indices, dtype=torch.int64, device=device)
-        self._tap_lens[rows] = async_h2d(
-            [reading.tap_len for reading in readings], dtype=torch.int32, device=device
+        self._decode_taps_to_read[rows] = async_h2d(
+            decoded, dtype=torch.int32, device=device
         )
-        for row, reading in zip(req_pool_indices, readings):
-            self._readings[row] = reading
+        for req_pool_index, spans in zip(req_pool_indices, generated_spans):
+            self._generated_spans[req_pool_index] = spans
 
     def view(self, *, encoder_id: int, forward_batch: ForwardBatch) -> TapView:
-        """Each token reads the taps its request's ``FrankyTapReading`` gives it."""
+        """Each row's query reads the taps that its request's spans give the token
+        the row makes."""
         if forward_batch.forward_mode.is_decode_or_idle():
-            return self._one_token_view(
-                encoder_id=encoder_id,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
+            return self._decode_view(
+                encoder_id=encoder_id, req_pool_indices=forward_batch.req_pool_indices
             )
         return self._extend_view(encoder_id=encoder_id, forward_batch=forward_batch)
 
-    def view_past_the_taps(
-        self, *, encoder_id: int, req_pool_indices: torch.Tensor
-    ) -> TapView:
-        """One token per request, at or past its last tap: it reads all taps."""
-        return self._one_token_view(
-            encoder_id=encoder_id, req_pool_indices=req_pool_indices, seq_lens=None
-        )
-
     def _extend_view(self, *, encoder_id: int, forward_batch: ForwardBatch) -> TapView:
-        runs, run_requests = [], []
-        for index, (row, first_position, num_tokens) in enumerate(
-            zip(
-                _on_host(
-                    forward_batch.req_pool_indices_cpu, forward_batch.req_pool_indices
-                ),
-                _on_host(
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.extend_prefix_lens,
-                ),
-                forward_batch.extend_seq_lens_cpu,
+        req_pool_indices = _on_host(
+            forward_batch.req_pool_indices_cpu, forward_batch.req_pool_indices
+        )
+        first_rows = _on_host(
+            forward_batch.extend_prefix_lens_cpu, forward_batch.extend_prefix_lens
+        )
+        num_rows = list(forward_batch.extend_seq_lens_cpu)
+        taps_to_read = [
+            self._taps_to_read(req_pool_index, first_row=first_row, num_rows=count)
+            for req_pool_index, first_row, count in zip(
+                req_pool_indices, first_rows, num_rows
             )
-        ):
-            request_runs = self._readings[row].runs(
-                first_position=first_position, num_tokens=num_tokens
-            )
-            runs += request_runs
-            run_requests += [index] * len(request_runs)
-        device = self._tap_lens.device
-        run_lens = [run.num_tokens for run in runs]
+        ]
+        device = self._decode_taps_to_read.device
+        row_requests = [
+            request for request, count in enumerate(num_rows) for _ in range(count)
+        ]
         page_table = self._page_table(forward_batch.req_pool_indices)
         return TapView(
-            taps=self._buffers[encoder_id].view(
-                -1, self.page_size, 1, self._output_size
-            ),
+            taps=self._paged_taps(encoder_id),
             page_table=page_table[
-                async_h2d(run_requests, dtype=torch.int64, device=device)
+                async_h2d(row_requests, dtype=torch.int64, device=device)
             ],
-            cu_seqlens_q=async_h2d(
-                [0, *itertools.accumulate(run_lens)], dtype=torch.int32, device=device
+            taps_to_read=async_h2d(
+                [taps for request in taps_to_read for taps in request.tolist()],
+                dtype=torch.int32,
+                device=device,
             ),
-            max_seqlen_q=max(run_lens, default=0),
-            causal_lens=async_h2d(
-                [run.causal_len for run in runs], dtype=torch.int32, device=device
-            ),
-            full_lens=async_h2d(
-                [run.full_len for run in runs], dtype=torch.int32, device=device
-            ),
-            num_tokens=sum(run_lens),
+            num_tokens=len(row_requests),
             trtllm_workspace=self._attention_workspace,
         )
 
-    def _one_token_view(
-        self,
-        *,
-        encoder_id: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: Optional[torch.Tensor],
+    def _taps_to_read(
+        self, req_pool_index: int, *, first_row: int, num_rows: int
+    ) -> torch.Tensor:
+        rows = torch.arange(first_row, first_row + num_rows)
+        spans = self._generated_spans[req_pool_index]
+        if spans is None:
+            return torch.zeros_like(rows)
+        made_tokens = rows + 1
+        return spans.taps_to_read(made_tokens)
+
+    def _decode_view(
+        self, *, encoder_id: int, req_pool_indices: torch.Tensor
     ) -> TapView:
-        tap_lens = self._tap_lens[req_pool_indices]
-        num_requests = req_pool_indices.shape[0]
-        num_keys = tap_lens if seq_lens is None else torch.minimum(seq_lens, tap_lens)
         return TapView(
-            taps=self._buffers[encoder_id].view(
-                -1, self.page_size, 1, self._output_size
-            ),
+            taps=self._paged_taps(encoder_id),
             page_table=self._page_table(req_pool_indices),
-            cu_seqlens_q=torch.arange(
-                num_requests + 1, dtype=torch.int32, device=tap_lens.device
-            ),
-            max_seqlen_q=1,
-            causal_lens=num_keys.to(torch.int32),
-            full_lens=None,
-            num_tokens=num_requests,
+            taps_to_read=self._decode_taps_to_read[req_pool_indices],
+            num_tokens=req_pool_indices.shape[0],
             trtllm_workspace=self._attention_workspace,
         )
+
+    def _paged_taps(self, encoder_id: int) -> torch.Tensor:
+        return self._buffers[encoder_id].view(-1, self.page_size, 1, self._output_size)
 
     def _page_table(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
         return (
