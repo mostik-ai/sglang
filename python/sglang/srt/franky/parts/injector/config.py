@@ -4,9 +4,12 @@ from typing import Union
 
 import msgspec
 
+from sglang.srt.franky.parts.injector.attention_bank.config import (
+    AttentionBankInjectorConfig,
+)
 from sglang.srt.franky.parts.injector.residual.config import ResidualInjectorConfig
 
-InjectorConfig = Union[ResidualInjectorConfig]
+InjectorConfig = Union[AttentionBankInjectorConfig, ResidualInjectorConfig]
 
 
 class InjectorsConfig(

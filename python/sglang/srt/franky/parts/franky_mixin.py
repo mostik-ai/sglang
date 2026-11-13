@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 import torch
 
+from sglang.srt.franky.parts.injector.attention_bank.output import (
+    AttentionBankOutput,
+    AttentionBankRead,
+)
 from sglang.srt.franky.parts.injector.residual.output import StreamOutput
 
 if TYPE_CHECKING:
@@ -43,6 +48,33 @@ class FrankyMixin:
             layer_idx=layer_idx,
             output=StreamOutput(
                 hidden_states=hidden_states, forward_batch=forward_batch
+            ),
+        )
+        return output.hidden_states
+
+    def franky_after_attention_bank_layer(
+        self,
+        *,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        next_read: Callable[[int], AttentionBankRead],
+    ) -> torch.Tensor:
+        """For models with attention residuals, whose layers read a mix of a bank
+        of block sums and the running sum that ``residual_batch`` keeps.
+
+        Args:
+            next_read: how the consumer after layer ``layer_idx`` mixes the bank;
+                called only after layers that run parts.
+        """
+        if not self._franky_runs_after(layer_idx):
+            return hidden_states
+        output = self.franky_parts.after_layer(
+            layer_idx=layer_idx,
+            output=AttentionBankOutput(
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                next_read=next_read(layer_idx),
             ),
         )
         return output.hidden_states

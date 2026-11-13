@@ -17,6 +17,7 @@ themselves. A side whose injector does not take the model's form is refused at s
 | Form | Residual | Injector | Read | Inject |
 | --- | --- | --- | --- | --- |
 | `StreamOutput` | one stream that `residual_batch` keeps in `forward_batch` | `residual` | the stream's sum | add to the layer's output |
+| `AttentionBankOutput` | attention residuals (Kimi K3): a bank of block sums and the running sum | `attention_bank` | the mix the next layer reads, as DSpark's capture | add to every row of that mix |
 
 **2. In the layer loop, right after the layer runs,** call the method of the model's form:
 
@@ -25,6 +26,9 @@ hidden_states = self.franky_after_layer(
     layer_idx=layer_idx, hidden_states=hidden_states, forward_batch=forward_batch
 )
 ```
+
+`franky_after_attention_bank_layer` also takes `next_read`, which says how the consumer after a layer mixes the bank
+(`KimiK3LinearModel._next_attention_bank_read`).
 
 **3. For Sandy under PP, at the stage edges:**
 
