@@ -144,6 +144,7 @@ class _Queue(CustomTestCase):
                 encoder_ids=(0,),
                 output_size=2,
                 page_size=_PAGE_SIZE,
+                kv_page_size=_PAGE_SIZE,
                 num_tokens=32,
                 req_to_token=req_to_token,
                 device="cpu",
@@ -246,6 +247,28 @@ class TestLanding(_Queue):
         self._step()
 
         self.assertEqual(self.sender.landed, [_pages(0, 8), _pages(8, 10)])
+
+
+class TestLandingInTapPages(_Queue):
+    def test_a_kv_page_lands_as_its_tap_pages(self):
+        """With tap pages smaller than Sandy's KV pages, each KV page lands as the
+        tap pages it holds, in prompt order."""
+        self.queue._tap_cache = FrankyTapCache(
+            encoder_ids=(0,),
+            output_size=2,
+            page_size=_PAGE_SIZE // 2,
+            kv_page_size=_PAGE_SIZE,
+            num_tokens=32,
+            req_to_token=self.queue._req_to_token,
+            device="cpu",
+        )
+        req = _req()
+        self.queue.add(req=req)
+        req.prefix_len = 10
+
+        self.queue.after_chunk(req=req, end=10, last=True)
+
+        self.assertEqual(self.sender.landed, [[10, 11, 4, 5, 14]])
 
 
 class TestRelease(_Queue):

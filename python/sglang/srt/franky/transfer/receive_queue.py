@@ -305,8 +305,7 @@ class FrankyReceiveQueue:
         return slots
 
     def _tap_pages(self, taken: torch.Tensor) -> FrankyHostPages:
-        kv_pages = taken[:: self.page_size] // self.page_size
-        tap_pages = self.tap_cache.pages_of(kv_pages=kv_pages)
+        tap_pages = self.tap_cache.pages_of(slots=taken)
         return FrankyHostPages(tap_pages.to(torch.int32))
 
     def _rank_numbers(self) -> dict[str, int]:

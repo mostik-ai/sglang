@@ -243,5 +243,8 @@ class SandyScheduler(Scheduler):
         return FrankyRoomSender(
             manager=self.franky_tap_manager,
             franky_room=req.franky_room,
-            num_pages=ceil_div(len(req.origin_input_ids), self.page_size),
+            num_pages=ceil_div(
+                len(req.origin_input_ids),
+                self.tp_worker.model_runner.franky_parts.tap_cache.page_size,
+            ),
         )

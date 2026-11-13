@@ -208,9 +208,12 @@ class TestHandleFranky(_WithFiles):
         wide_taps["encoder"]["output_size"] = 512
         odd_taps = copy.deepcopy(_CONFIG)
         odd_taps["encoder"]["output_size"] = 100
+        large_tap_pages = copy.deepcopy(_CONFIG)
+        large_tap_pages["tap_page_size"] = 256
         for reason, fields in {
             "encoder output_size 512": {"config": wide_taps},
             "encoder output_size 100": {"config": odd_taps},
+            "tap_page_size 256": {"config": large_tap_pages, "page_size": 256},
             "--chunked-prefill-size": {"chunked_prefill_size": -1},
             "--disable-radix-cache": {"disable_radix_cache": True},
             "reader layer 9": {"config": shallow_encoders, "num_hidden_layers": 8},
@@ -225,6 +228,11 @@ class TestHandleFranky(_WithFiles):
                 with self.assertRaisesRegex(ValueError, reason):
                     handle_franky(server_args)
                 handle_franky(self._server_args(side="sandy", **fields))
+
+    def test_kv_pages_may_be_any_multiple_of_the_tap_page(self):
+        for side in ("sandy", "ricky"):
+            with self.subTest(side=side):
+                handle_franky(self._server_args(side=side, page_size=256))
 
     def test_ricky_pd_refusals(self):
         pd = {

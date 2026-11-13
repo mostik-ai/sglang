@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
@@ -55,12 +56,16 @@ class TapView(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class FrankyTapCache:
-    """This rank's taps: one tensor per encoder, in pages like KV.
+    """This rank's taps: one tensor per encoder, a tap at each KV slot.
 
-    Each KV page is paired with one tap page, once, at start. So a pair is taken
-    and freed together, one memory budget covers both, and neither needs an
-    allocator of its own. KV never reads taps, and other code goes through
-    ``slots_of`` and ``pages_of``.
+    A token's tap lives at its KV slot, so taps are taken and freed with KV, one
+    memory budget covers both, and neither needs an allocator of its own. KV
+    never reads taps, and other code goes through ``slots_of`` and ``pages_of``.
+
+    Outside the KV allocator taps are seen in tap pages of ``page_size`` tokens:
+    the transfer moves them and the readers attend over them. A tap page is a view
+    of the slots of a KV page, so KV pages may be any multiple of it and two
+    engines with different KV pages still exchange taps page to page, in place.
     """
 
     def __init__(
@@ -69,13 +74,25 @@ class FrankyTapCache:
         encoder_ids: tuple[int, ...],
         output_size: int,
         page_size: int,
+        kv_page_size: int,
         num_tokens: int,
         req_to_token: torch.Tensor,
         device: str,
         attention_workspace: Optional[torch.Tensor] = None,
     ) -> None:
+        """
+        Args:
+            page_size: tokens of a tap page; it divides ``kv_page_size``.
+            num_tokens: KV slots past the KV pool's first page.
+        """
+        if kv_page_size % page_size != 0:
+            raise ValueError(
+                f"A KV page of {kv_page_size} tokens is not whole tap pages of "
+                f"{page_size} tokens."
+            )
         self.page_size = page_size
         self.page_bytes = page_size * output_size * TAP_DTYPE.itemsize
+        self.pages_per_kv_page = kv_page_size // page_size
         self._output_size = output_size
         self._req_to_token = req_to_token
         self._attention_workspace = attention_workspace
@@ -85,11 +102,13 @@ class FrankyTapCache:
         self._generated_spans: list[Optional[FrankyGeneratedSpans]] = [
             None
         ] * req_to_token.shape[0]
-        # One more page, as in the KV pool: padded tokens write to page 0, and
+        # One more KV page, as in the KV pool: padded tokens write to page 0, and
         # padded requests read its zeros.
         self._buffers = {
             encoder_id: torch.zeros(
-                (num_tokens + page_size, output_size), dtype=TAP_DTYPE, device=device
+                (num_tokens + kv_page_size, output_size),
+                dtype=TAP_DTYPE,
+                device=device,
             )
             for encoder_id in encoder_ids
         }
@@ -99,16 +118,31 @@ class FrankyTapCache:
         return tuple(self._buffers)
 
     def transfer_buffers(self) -> dict[int, tuple[int, int]]:
-        """Encoder id to the address and bytes of its tap buffer; page ``p`` is at
-        ``address + p * page_bytes``.
+        """Encoder id to the address and bytes of its tap buffer; tap page ``p``
+        is at ``address + p * page_bytes``.
         """
         return {
             encoder_id: (buffer.data_ptr(), buffer.nbytes)
             for encoder_id, buffer in self._buffers.items()
         }
 
-    def pages_of(self, *, kv_pages: torch.Tensor) -> torch.Tensor:
-        return kv_pages
+    def pages_of(self, *, slots: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            slots: consecutive tokens' KV slots, from a tap page's start.
+        Returns:
+            The tap pages that hold them, in order.
+        """
+        return slots[:: self.page_size] // self.page_size
+
+    def pages_of_kv_pages(self, *, kv_pages: np.ndarray) -> np.ndarray:
+        """
+        Returns:
+            int32, the tap pages of ``kv_pages``, in order.
+        """
+        first_pages = np.asarray(kv_pages, dtype=np.int64) * self.pages_per_kv_page
+        offsets = np.arange(self.pages_per_kv_page, dtype=np.int64)
+        return (first_pages[:, None] + offsets).reshape(-1).astype(np.int32)
 
     def slots_of(self, *, kv_slots: torch.Tensor) -> torch.Tensor:
         return kv_slots

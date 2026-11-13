@@ -206,6 +206,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
                 encoder_ids=(0,),
                 output_size=2,
                 page_size=_PAGE_SIZE,
+                kv_page_size=_PAGE_SIZE,
                 num_tokens=_NUM_TOKENS,
                 req_to_token=torch.zeros((2, 16), dtype=torch.int32),
                 device="cpu",

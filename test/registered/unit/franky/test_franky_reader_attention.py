@@ -83,6 +83,7 @@ class TestReaderAttention(CustomTestCase):
             encoder_ids=(0,),
             output_size=256,
             page_size=_PAGE_SIZE,
+            kv_page_size=_PAGE_SIZE,
             num_tokens=num_pages * _PAGE_SIZE + _PAGE_SIZE,
             req_to_token=req_to_token,
             device="cuda",

@@ -38,7 +38,7 @@ class FrankyRelaySender(NixlKVSender):
         self.tap_sender = FrankyRoomSender(
             manager=self.kv_mgr.tap_relay,
             franky_room=self._relay_room(),
-            num_pages=num_kv_indices,
+            num_pages=num_kv_indices * self.kv_mgr.tap_cache.pages_per_kv_page,
         )
 
     @override
@@ -56,7 +56,7 @@ class FrankyRelaySender(NixlKVSender):
             indices_event=indices_event,
         )
         self.tap_sender.land(
-            tap_pages=self.kv_mgr.tap_cache.pages_of(kv_pages=kv_indices)
+            tap_pages=self.kv_mgr.tap_cache.pages_of_kv_pages(kv_pages=kv_indices)
         )
 
     @override
