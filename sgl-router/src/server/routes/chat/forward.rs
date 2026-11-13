@@ -257,7 +257,7 @@ async fn dispatch<T: Transport>(
     // Sandy computes the same prompt, outside PD.
     let sandy_leg = match (sandy, &franky_room) {
         (Some(sandy), Some(room)) => {
-            let body = request.outgoing_body(ctx, None, Some(room), engine_rid.as_deref())?;
+            let body = request.sandy_outgoing_body(ctx, room, engine_rid.as_deref())?;
             let rank = dp_aware
                 .then(|| prompt_dp_rank(ctx, request, &headers, &sandy))
                 .flatten();

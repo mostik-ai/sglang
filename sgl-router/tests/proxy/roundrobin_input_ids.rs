@@ -438,8 +438,7 @@ async fn role_rewrites_preserve_messages_without_forwarding_ids() {
     assert!(captured(&mock).get("input_ids").is_some());
 }
 
-#[path = "../fixtures/kimi_k3.rs"]
-mod kimi_fixture;
+use crate::common::kimi_k3_fixture as kimi_fixture;
 
 #[tokio::test]
 async fn generate_kimi_ids_preserve_engine_chunk_boundaries() {

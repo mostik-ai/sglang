@@ -16,6 +16,7 @@ use crate::state::kv_events::{
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::chat_template_adapter::ChatTemplateAdapter;
+use crate::tokenizer::franky_sandy::FrankySandyTokens;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::{DecodeGate, WorkerRegistry};
 use std::collections::HashMap;
@@ -65,6 +66,9 @@ pub struct AppContext {
     /// Finds the earlier answers in the chats the router renders for Franky
     /// workers; `None` without `--franky-chat-adapter`.
     pub franky_chat_adapter: Option<Arc<dyn ChatTemplateAdapter>>,
+    /// Renders the chats of Franky workers for a Sandy that tokenizes on its
+    /// own; `None` without `--franky-sandy-tokenizer-path`.
+    pub franky_sandy: Option<Arc<FrankySandyTokens>>,
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub router_inflight_load: Arc<RouterInflightLoadRegistry>,
@@ -147,6 +151,7 @@ impl AppContext {
             chat_routing: ChatRouting::Legacy,
             sandy: None,
             franky_chat_adapter: None,
+            franky_sandy: None,
             router_inflight_load,
             decode_gate,
             metrics,
@@ -257,6 +262,7 @@ impl AppContext {
             chat_routing: ChatRouting::Legacy,
             sandy: None,
             franky_chat_adapter: None,
+            franky_sandy: None,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
             decode_gate: DecodeGate::new(None),
             metrics: MetricsRegistry::new(),
