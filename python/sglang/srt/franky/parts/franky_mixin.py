@@ -9,6 +9,9 @@ from sglang.srt.franky.parts.injector.attention_bank.output import (
     AttentionBankOutput,
     AttentionBankRead,
 )
+from sglang.srt.franky.parts.injector.hyper_connection.output import (
+    HyperConnectionOutput,
+)
 from sglang.srt.franky.parts.injector.residual.output import StreamOutput
 
 if TYPE_CHECKING:
@@ -18,6 +21,7 @@ if TYPE_CHECKING:
         ForwardBatch,
         PPProxyTensors,
     )
+    from sglang.srt.models.deepseek_v4_mhc import HcState
 
 
 class FrankyMixin:
@@ -78,6 +82,31 @@ class FrankyMixin:
             ),
         )
         return output.hidden_states
+
+    def franky_after_hyper_connection_layer(
+        self,
+        *,
+        layer_idx: int,
+        state: HcState,
+        forward_batch: ForwardBatch,
+        rows: Optional[torch.Tensor],
+    ) -> HcState:
+        """For models with manifold hyper-connections. ``state`` must be complete;
+        the model hands the returned state to the next layer.
+
+        Args:
+            rows: the rows of ``forward_batch`` that ``state`` holds, as indices
+                into them; None when it holds all of them.
+        """
+        if not self._franky_runs_after(layer_idx):
+            return state
+        output = self.franky_parts.after_layer(
+            layer_idx=layer_idx,
+            output=HyperConnectionOutput(
+                state=state, forward_batch=forward_batch, rows=rows
+            ),
+        )
+        return output.state
 
     def franky_read_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         if self.franky_parts is not None:

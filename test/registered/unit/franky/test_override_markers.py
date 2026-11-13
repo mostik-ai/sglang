@@ -12,11 +12,23 @@ from sglang.srt.disaggregation.nixl.conn import (
     NixlKVSender,
 )
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
+from sglang.srt.franky.cache.prefill_budget import (
+    FrankyPrefillBudget,
+    FrankySwaPrefillBudget,
+)
+from sglang.srt.franky.cache.swa_kv_allocator import FrankySwaKvAllocator
 from sglang.srt.franky.parts.encoder.all.encoder import AllEncoder
 from sglang.srt.franky.parts.encoder.linear.encoder import LinearEncoder
 from sglang.srt.franky.parts.encoder.masked.encoder import MaskedEncoder
 from sglang.srt.franky.parts.encoder.singular.encoder import SingularEncoder
+from sglang.srt.franky.parts.injector.attention_bank.config import (
+    AttentionBankInjectorConfig,
+)
+from sglang.srt.franky.parts.injector.attention_bank.injector import (
+    AttentionBankInjector,
+)
 from sglang.srt.franky.parts.injector.base_config import BaseInjectorConfig
+from sglang.srt.franky.parts.injector.injector import Injector
 from sglang.srt.franky.parts.injector.residual.config import ResidualInjectorConfig
 from sglang.srt.franky.parts.injector.residual.injector import ResidualInjector
 from sglang.srt.franky.parts.reader.base_config import BaseReaderConfig
@@ -25,10 +37,7 @@ from sglang.srt.franky.parts.reader.query.reader import QueryReader
 from sglang.srt.franky.parts.reader.residual_query.reader import ResidualQueryReader
 from sglang.srt.franky.parts.ricky_parts import RickyParts
 from sglang.srt.franky.parts.sandy_parts import SandyParts
-from sglang.srt.franky.schedulers.prefill_adder import (
-    FrankyPrefillAdder,
-    FrankyPrefillBudget,
-)
+from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder
 from sglang.srt.franky.schedulers.ricky import RickyScheduler
 from sglang.srt.franky.schedulers.ricky_decode import RickyDecodeScheduler
 from sglang.srt.franky.schedulers.sandy import SandyScheduler
@@ -47,7 +56,8 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget, SWAPrefillBudget
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -60,15 +70,19 @@ _SUBCLASSES = (
     (FrankyPrefillAdder, PrefillAdder),
     (FrankyPrefillBudget, PrefillBudget),
     (FrankyKvAllocator, PagedTokenToKVPoolAllocator),
+    (FrankySwaKvAllocator, SWATokenToKVPoolAllocator),
+    (FrankySwaPrefillBudget, SWAPrefillBudget),
     (AllEncoder, LinearEncoder),
     (MaskedEncoder, LinearEncoder),
     (SingularEncoder, LinearEncoder),
     (ResidualQueryReader, QueryReader),
-    (ResidualInjector, ResidualInjector.__mro__[1]),
+    (ResidualInjector, Injector),
+    (AttentionBankInjector, Injector),
     (SandyParts, SandyParts.__mro__[1]),
     (RickyParts, RickyParts.__mro__[1]),
     (QueryReaderConfig, BaseReaderConfig),
     (ResidualInjectorConfig, BaseInjectorConfig),
+    (AttentionBankInjectorConfig, BaseInjectorConfig),
     (FrankyTapManager, NixlKVManager),
     (FrankyRoomSender, NixlKVSender),
     (FrankyReceiver, NixlKVReceiver),

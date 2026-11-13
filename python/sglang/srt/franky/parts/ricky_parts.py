@@ -88,5 +88,6 @@ class RickyParts(FrankyParts):
             encoder_id=index,
             residual=self.injector.read(output=output),
             forward_batch=output.forward_batch,
+            rows=output.rows,
         )
         return self.injector.inject(output=output, addition=reader_output)

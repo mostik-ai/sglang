@@ -343,6 +343,38 @@ class TestReaders(_Files):
             hidden_states - layer_output, expected, atol=2e-3, rtol=2e-3
         )
 
+    def test_a_reader_on_some_rows_reads_each_rows_own_taps(self):
+        """DeepSeek V4.1 runs its late layers only on each request's last rows; a
+        reader there gets those rows and must read what they would read in a
+        forward of every row. An index past the last row reads nothing."""
+        config_path, weights_path, _ = self._write()
+        model = _Model()
+        parts = self._attach(
+            model=model, config_path=config_path, weights_path=weights_path
+        )
+        batch = _extend_batch(rows=[1, 2], prefix_lens=[0, 2], extend_lens=[5, 4])
+        residual = torch.randn(9, _HIDDEN_SIZE)
+        reader = parts._readers[0]
+        everything = reader(
+            tap_cache=parts.tap_cache,
+            encoder_id=0,
+            residual=residual,
+            forward_batch=batch,
+            rows=None,
+        )
+        rows = torch.tensor([4, 8, 9])
+
+        some = reader(
+            tap_cache=parts.tap_cache,
+            encoder_id=0,
+            residual=torch.cat([residual[[4, 8]], residual[:1]]),
+            forward_batch=batch,
+            rows=rows,
+        )
+
+        torch.testing.assert_close(some[:2], everything[[4, 8]])
+        self.assertTrue(torch.equal(some[2], torch.zeros(_HIDDEN_SIZE)))
+
     def test_tokens_without_taps_and_padded_tokens_get_exactly_zero(self):
         """A CUDA graph pads the batch with tokens of no request."""
         config_path, weights_path, _ = self._write()

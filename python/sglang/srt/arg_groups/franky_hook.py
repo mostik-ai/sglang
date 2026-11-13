@@ -33,7 +33,7 @@ def handle_franky(server_args: ServerArgs) -> None:
     side_checks = _sandy_checks if cfg.franky_side == "sandy" else _ricky_checks
     checks = {
         **_shared_checks(cfg=cfg, model_config=model_config),
-        **_kv_allocator_checks(cfg=cfg, config=config, model_config=model_config),
+        **_kv_allocator_checks(cfg=cfg, config=config),
         **side_checks(cfg=cfg, config=config, model_config=model_config),
     }
     refusals = [reason for reason, is_refused in checks.items() if is_refused]
@@ -75,11 +75,10 @@ def _shared_checks(*, cfg: Any, model_config: ModelConfig) -> dict[str, bool]:
     }
 
 
-def _kv_allocator_checks(
-    *, cfg: Any, config: FrankyConfig, model_config: ModelConfig
-) -> dict[str, bool]:
-    """What leaves the plain paged branch of the KV allocator choice, the only
-    one that builds ``FrankyKvAllocator``.
+def _kv_allocator_checks(*, cfg: Any, config: FrankyConfig) -> dict[str, bool]:
+    """What leaves the paged and sliding-window branches of the KV allocator
+    choice, the only ones that build Franky's allocators; an allocator without a
+    full pool is refused when the tap cache starts.
     """
     return {
         f"page size {cfg.page_size} after model and backend rules, it must be a "
@@ -90,7 +89,6 @@ def _kv_allocator_checks(
         "--enable-hisparse": cfg.enable_hisparse,
         "--enable-kv-cache-sharding": cfg.enable_kv_cache_sharding,
         "--dcp-size above 1": cfg.dcp_size > 1,
-        "hybrid SWA models": model_config.is_hybrid_swa,
     }
 
 

@@ -5,49 +5,9 @@ from typing import TYPE_CHECKING, Optional
 from typing_extensions import override
 
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-
-
-class FrankyPrefillBudget(PrefillBudget):
-    """Ricky's prefill takes no KV memory, since each request took its pages at
-    arrival, so only chunk sizes bound a batch.
-    """
-
-    @override
-    def has_capacity(self) -> bool:
-        return True
-
-    @override
-    def check_prefill(
-        self,
-        *,
-        extend_input_len: int,
-        total_tokens: int,
-        max_new_tokens: int,
-        input_tokens: int,
-        swa_host_hit_length: int,
-        chunk_limit: Optional[int],
-        auxiliary_swa_host_hit_length: int = 0,
-    ) -> tuple[bool, Optional[int]]:
-        return True, chunk_limit
-
-    @override
-    def can_allocate_prefill(
-        self,
-        *,
-        paged_input: int,
-        extend_input_len: int,
-        max_new_tokens: int,
-        chunk_limit: Optional[int],
-    ) -> bool:
-        return True
-
-    @override
-    def available_chunk_tokens(self, chunk_limit: int) -> int:
-        return chunk_limit
 
 
 class FrankyPrefillAdder(PrefillAdder):
@@ -59,8 +19,8 @@ class FrankyPrefillAdder(PrefillAdder):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.memory_budget = FrankyPrefillBudget(
-            self.token_to_kv_pool_allocator, self.tree_cache
+        self.memory_budget = self.token_to_kv_pool_allocator.prefill_budget(
+            tree_cache=self.tree_cache, num_mixed_decode_tokens=0
         )
 
     @override

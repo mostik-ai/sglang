@@ -2856,7 +2856,12 @@ class KVCacheConfigurator:
                     isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
                     and not token_to_kv_pool.needs_paged_swa_allocator
                 ):
-                    token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                    paged_allocator_cls = (
+                        PagedTokenToKVPoolAllocator
+                        if self.franky_kv_options is None
+                        else self.franky_kv_options.paged_allocator_cls
+                    )
+                    token_to_kv_pool_allocator = paged_allocator_cls(
                         sizes.full_max_total_num_tokens,
                         page_size=get_schedule().page_size,
                         dtype=self.kv_cache_dtype,
@@ -2874,7 +2879,12 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 elif self.is_hybrid_swa:
-                    token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                    swa_allocator_cls = (
+                        SWATokenToKVPoolAllocator
+                        if self.franky_kv_options is None
+                        else self.franky_kv_options.swa_allocator_cls
+                    )
+                    token_to_kv_pool_allocator = swa_allocator_cls(
                         sizes.full_max_total_num_tokens,
                         sizes.swa_max_total_num_tokens,
                         page_size=get_schedule().page_size,

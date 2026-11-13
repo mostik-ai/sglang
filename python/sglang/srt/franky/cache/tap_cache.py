@@ -102,6 +102,7 @@ class FrankyTapCache:
         self._generated_spans: list[Optional[FrankyGeneratedSpans]] = [
             None
         ] * req_to_token.shape[0]
+        self._plan: Optional[_RowPlan] = None
         # One more KV page, as in the KV pool: padded tokens write to page 0, and
         # padded requests read its zeros.
         self._buffers = {
@@ -177,16 +178,54 @@ class FrankyTapCache:
         for req_pool_index, spans in zip(req_pool_indices, generated_spans):
             self._generated_spans[req_pool_index] = spans
 
-    def view(self, *, encoder_id: int, forward_batch: ForwardBatch) -> TapView:
+    def view(
+        self,
+        *,
+        encoder_id: int,
+        forward_batch: ForwardBatch,
+        rows: Optional[torch.Tensor] = None,
+    ) -> TapView:
         """Each row's query reads the taps that its request's spans give the token
-        the row makes."""
-        if forward_batch.forward_mode.is_decode_or_idle():
-            return self._decode_view(
-                encoder_id=encoder_id, req_pool_indices=forward_batch.req_pool_indices
-            )
-        return self._extend_view(encoder_id=encoder_id, forward_batch=forward_batch)
+        the row makes.
 
-    def _extend_view(self, *, encoder_id: int, forward_batch: ForwardBatch) -> TapView:
+        Args:
+            rows: the rows of ``forward_batch`` the queries belong to, as indices
+                into them; None for all of them. An index past the last row reads
+                nothing.
+        """
+        plan = self._plan_of(forward_batch)
+        if rows is None:
+            page_table = plan.page_table[: plan.num_rows]
+            taps_to_read = plan.taps_to_read[: plan.num_rows]
+            num_tokens = plan.num_rows
+        else:
+            selected = rows.clamp(max=plan.num_rows)
+            page_table = plan.page_table[selected]
+            taps_to_read = plan.taps_to_read[selected]
+            num_tokens = rows.shape[0]
+        return TapView(
+            taps=self._paged_taps(encoder_id),
+            page_table=page_table,
+            taps_to_read=taps_to_read,
+            num_tokens=num_tokens,
+            trtllm_workspace=self._attention_workspace,
+        )
+
+    def _plan_of(self, forward_batch: ForwardBatch) -> _RowPlan:
+        """The rows' pages and tap counts of one forward, built once for all of
+        its readers."""
+        is_decode = forward_batch.forward_mode.is_decode_or_idle()
+        # A decode CUDA graph replays one index tensor, so its plan is captured once.
+        source = forward_batch.req_pool_indices if is_decode else forward_batch
+        if self._plan is None or self._plan.source is not source:
+            self._plan = (
+                self._decode_plan(forward_batch)
+                if is_decode
+                else self._extend_plan(forward_batch)
+            )
+        return self._plan
+
+    def _extend_plan(self, forward_batch: ForwardBatch) -> _RowPlan:
         req_pool_indices = _on_host(
             forward_batch.req_pool_indices_cpu, forward_batch.req_pool_indices
         )
@@ -194,29 +233,47 @@ class FrankyTapCache:
             forward_batch.extend_prefix_lens_cpu, forward_batch.extend_prefix_lens
         )
         num_rows = list(forward_batch.extend_seq_lens_cpu)
-        taps_to_read = [
-            self._taps_to_read(req_pool_index, first_row=first_row, num_rows=count)
-            for req_pool_index, first_row, count in zip(
-                req_pool_indices, first_rows, num_rows
-            )
-        ]
+        taps_to_read = torch.cat(
+            [
+                self._taps_to_read(req_pool_index, first_row=first_row, num_rows=count)
+                for req_pool_index, first_row, count in zip(
+                    req_pool_indices, first_rows, num_rows
+                )
+            ]
+            + [torch.zeros(1, dtype=torch.int64)]
+        )
+        row_requests = torch.repeat_interleave(
+            torch.arange(len(num_rows)), torch.tensor(num_rows, dtype=torch.int64)
+        )
         device = self._decode_taps_to_read.device
-        row_requests = [
-            request for request, count in enumerate(num_rows) for _ in range(count)
-        ]
-        page_table = self._page_table(forward_batch.req_pool_indices)
-        return TapView(
-            taps=self._paged_taps(encoder_id),
-            page_table=page_table[
-                async_h2d(row_requests, dtype=torch.int64, device=device)
-            ],
-            taps_to_read=async_h2d(
-                [taps for request in taps_to_read for taps in request.tolist()],
-                dtype=torch.int32,
-                device=device,
+        num_pages = max(1, -(-int(taps_to_read.max()) // self.page_size))
+        page_table = self._page_table(
+            forward_batch.req_pool_indices, num_pages=num_pages
+        )
+        return _RowPlan(
+            source=forward_batch,
+            page_table=torch.cat(
+                [
+                    page_table[_to_device(row_requests, device=device)],
+                    page_table.new_zeros((1, num_pages)),
+                ]
             ),
-            num_tokens=len(row_requests),
-            trtllm_workspace=self._attention_workspace,
+            taps_to_read=_to_device(taps_to_read.to(torch.int32), device=device),
+            num_rows=int(row_requests.shape[0]),
+        )
+
+    def _decode_plan(self, forward_batch: ForwardBatch) -> _RowPlan:
+        req_pool_indices = forward_batch.req_pool_indices
+        page_table = self._page_table(
+            req_pool_indices,
+            num_pages=-(-self._req_to_token.shape[1] // self.page_size),
+        )
+        taps_to_read = self._decode_taps_to_read[req_pool_indices]
+        return _RowPlan(
+            source=req_pool_indices,
+            page_table=torch.cat([page_table, page_table[:1] * 0]),
+            taps_to_read=torch.cat([taps_to_read, taps_to_read[:1] * 0]),
+            num_rows=req_pool_indices.shape[0],
         )
 
     def _taps_to_read(
@@ -229,24 +286,34 @@ class FrankyTapCache:
         made_tokens = rows + 1
         return spans.taps_to_read(made_tokens)
 
-    def _decode_view(
-        self, *, encoder_id: int, req_pool_indices: torch.Tensor
-    ) -> TapView:
-        return TapView(
-            taps=self._paged_taps(encoder_id),
-            page_table=self._page_table(req_pool_indices),
-            taps_to_read=self._decode_taps_to_read[req_pool_indices],
-            num_tokens=req_pool_indices.shape[0],
-            trtllm_workspace=self._attention_workspace,
-        )
-
     def _paged_taps(self, encoder_id: int) -> torch.Tensor:
         return self._buffers[encoder_id].view(-1, self.page_size, 1, self._output_size)
 
-    def _page_table(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
-        return (
-            self._req_to_token[req_pool_indices, :: self.page_size] // self.page_size
-        ).to(torch.int32)
+    def _page_table(
+        self, req_pool_indices: torch.Tensor, *, num_pages: int
+    ) -> torch.Tensor:
+        first_slots = self._req_to_token[
+            req_pool_indices, : num_pages * self.page_size : self.page_size
+        ]
+        return (first_slots // self.page_size).to(torch.int32)
+
+
+class _RowPlan(msgspec.Struct, frozen=True, kw_only=True):
+    """Per row of one forward: its request's tap pages and how many taps its query
+    reads, with one more row that reads nothing. Holding ``source``, what the plan
+    was built from, keeps its identity from being reused by a later forward.
+    """
+
+    source: object
+    page_table: torch.Tensor
+    taps_to_read: torch.Tensor
+    num_rows: int
+
+
+def _to_device(host: torch.Tensor, *, device: torch.device) -> torch.Tensor:
+    if device.type == "cpu":
+        return host
+    return host.pin_memory().to(device, non_blocking=True)
 
 
 def _on_host(
