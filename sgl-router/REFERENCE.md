@@ -457,8 +457,9 @@ A Franky request lists the answers Ricky generated in its earlier turns as
 `franky_generated_spans`: `[start, end)` runs of its `input_ids`. Ricky
 recomputes those tokens with the taps their decode read.
 
-- `/generate` clients, and chat clients that send `input_ids` (Miles' session
-  server), send their own spans; the router passes them on unchanged.
+- `/generate` and `/v1/completions` clients, and chat clients that send
+  `input_ids` (Miles' session server), send their own spans; the router passes
+  them on unchanged, also in the `/generate` body it lowers a request to.
 - For a chat that sends only messages, `--franky-chat-adapter qwen3.5` names
   the served model's chat template. The router renders the chat as usual, the
   adapter finds the earlier answers in the rendered ids, and both engines get

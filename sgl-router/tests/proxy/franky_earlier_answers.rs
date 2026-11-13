@@ -252,6 +252,30 @@ async fn the_spans_a_generate_request_sends_pass_through() {
 }
 
 #[tokio::test]
+async fn the_spans_a_completion_sends_reach_its_generate_body() {
+    let FrankyPair { ricky, sandy, ctx } =
+        FrankyPair::start(config(QWEN, TINY_QWEN_TOKENIZER)).await;
+    let completion = json!({
+        "model": QWEN,
+        "prompt": [1, 2, 3, 4, 5, 6],
+        "max_tokens": 8,
+        "franky_generated_spans": [[2, 4]],
+    });
+
+    let (status, _) = post(Arc::new(ctx), "/v1/completions", &completion).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let ricky_body = ricky.captured_json().await;
+    assert_eq!(ricky_body["input_ids"], completion["prompt"]);
+    assert_eq!(
+        ricky_body["franky_generated_spans"],
+        completion["franky_generated_spans"]
+    );
+    assert!(ricky_body["sampling_params"].is_object(), "{ricky_body}");
+    assert_eq!(sandy.captured_json().await, ricky_body);
+}
+
+#[tokio::test]
 async fn franky_chats_whose_answers_the_router_cannot_mark_are_refused() {
     let mut spans_without_input_ids = chat_with_an_answer(QWEN);
     spans_without_input_ids["franky_generated_spans"] = json!([[3, 5]]);
