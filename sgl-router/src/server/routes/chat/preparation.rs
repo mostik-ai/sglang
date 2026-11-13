@@ -199,6 +199,9 @@ impl PreparedRequest {
             if let Value::Object(fields) = &mut generate {
                 fields.retain(|_, value| !value.is_null());
             }
+            if let Some(spans) = fields.franky_generated_spans {
+                generate["franky_generated_spans"] = spans;
+            }
             if path == CHAT_PATH {
                 ctx.metrics
                     .record_input_ids_forwarding(&model.0, InputIdsForwarding::Forwarded);
@@ -909,6 +912,9 @@ pub(super) struct RoutingFields {
     caller_set_rid: bool,
     /// A completions `prompt` listing several prompts, as strings or id lists.
     prompt_batch: bool,
+    /// The client's `franky_generated_spans`, which the v1 `GenerateRequest` that
+    /// lowering builds has no field for.
+    franky_generated_spans: Option<Value>,
 }
 
 impl RoutingFields {
@@ -1061,6 +1067,7 @@ enum RequestKey {
     Sampling(SamplingField),
     Rid,
     Prompt,
+    FrankyGeneratedSpans,
     Other,
 }
 
@@ -1082,6 +1089,7 @@ impl<'de> Deserialize<'de> for RequestKey {
                     "max_completion_tokens" => RequestKey::Routing(RoutingKey::MaxCompletionTokens),
                     "rid" => RequestKey::Rid,
                     "prompt" => RequestKey::Prompt,
+                    "franky_generated_spans" => RequestKey::FrankyGeneratedSpans,
                     other => match SamplingField::from_wire_name(other) {
                         Some(field) => RequestKey::Sampling(field),
                         None => RequestKey::Other,
@@ -1146,6 +1154,9 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                     let prompt = map.next_value::<Value>()?;
                     fields.prompt_batch =
                         prompt.get(0).is_some_and(|p| p.is_string() || p.is_array());
+                }
+                RequestKey::FrankyGeneratedSpans => {
+                    fields.franky_generated_spans = map.next_value()?;
                 }
                 RequestKey::Other => {
                     // Validate unrelated JSON without retaining its contents.
