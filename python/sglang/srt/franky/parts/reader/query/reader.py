@@ -151,10 +151,28 @@ def attention_workspace(*, device: str) -> Optional[TrtllmWorkspace]:
 
 
 def _attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
-    if view.trtllm_workspace is None:
+    if view.row_blocks is not None and queries.shape[1] == 1 and queries.is_cuda:
+        _prefill_attend(queries, view, out=out)
+    elif view.trtllm_workspace is None:
         _fa3_attend(queries, view, out=out)
     else:
         _trtllm_attend(queries, view, out=out)
+
+
+def _prefill_attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
+    from sglang.kernels.ops.attention.franky_reader_prefill import (
+        franky_reader_prefill,
+    )
+
+    num_pages, page_size, _, tap_size = view.taps.shape
+    franky_reader_prefill(
+        queries.view(-1, tap_size),
+        view.taps.view(num_pages, page_size, tap_size),
+        view.request_pages,
+        view.taps_to_read,
+        view.row_blocks,
+        out=out.view(-1, tap_size),
+    )
 
 
 def _fa3_attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:

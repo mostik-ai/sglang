@@ -7,6 +7,9 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.kernels.ops.attention.franky_reader_blocks import (
+    franky_reader_row_blocks,
+)
 from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.own_tap_pages import FrankyOwnTapPages
 from sglang.srt.utils.common import async_h2d
@@ -77,17 +80,30 @@ class TapView(msgspec.Struct, frozen=True, kw_only=True):
 
     Attributes:
         taps: [pages, page_size, 1, output_size], both the keys and the values.
-        page_table: [rows, pages] int32, the pages of each row's request.
+        request_pages: [requests, pages] int32, the tap pages of each request.
+        row_requests: [rows], the request of each row; None when row i is
+            request i.
         taps_to_read: [rows] int32, the taps each row's query reads, from tap 0.
         num_tokens: the real rows; a CUDA graph pads after them.
         trtllm_workspace: TRT-LLM's workspace on Blackwell; None where FA3 runs.
+        row_blocks: the prefill kernel's row blocks when the rows are every
+            row of the forward, whole requests one after another; else None.
     """
 
     taps: torch.Tensor
-    page_table: torch.Tensor
+    request_pages: torch.Tensor
+    row_requests: Optional[torch.Tensor]
     taps_to_read: torch.Tensor
     num_tokens: int
     trtllm_workspace: Optional[TrtllmWorkspace]
+    row_blocks: Optional[torch.Tensor] = None
+
+    @property
+    def page_table(self) -> torch.Tensor:
+        """[rows, pages] int32, the pages of each row's request."""
+        if self.row_requests is None:
+            return self.request_pages
+        return self.request_pages[self.row_requests]
 
 
 class FrankyTapCache:
@@ -249,19 +265,36 @@ class FrankyTapCache:
         """
         plan = self._plan_of(forward_batch, encoder_id=encoder_id)
         if rows is None:
-            page_table = plan.page_table[: plan.num_rows]
-            taps_to_read = plan.taps_to_read[: plan.num_rows]
-            num_tokens = plan.num_rows
-        else:
-            selected = rows.clamp(max=plan.num_rows)
-            page_table = plan.page_table[selected]
-            taps_to_read = plan.taps_to_read[selected]
-            num_tokens = rows.shape[0]
+            return TapView(
+                taps=self._paged_taps(encoder_id),
+                request_pages=(
+                    plan.request_pages[: plan.num_rows]
+                    if plan.row_requests is None
+                    else plan.request_pages
+                ),
+                row_requests=(
+                    None
+                    if plan.row_requests is None
+                    else plan.row_requests[: plan.num_rows]
+                ),
+                taps_to_read=plan.taps_to_read[: plan.num_rows],
+                num_tokens=plan.num_rows,
+                trtllm_workspace=self._attention_workspace,
+                row_blocks=plan.row_blocks,
+            )
+        selected = rows.clamp(max=plan.num_rows)
         return TapView(
             taps=self._paged_taps(encoder_id),
-            page_table=page_table,
-            taps_to_read=taps_to_read,
-            num_tokens=num_tokens,
+            request_pages=(
+                plan.request_pages[selected]
+                if plan.row_requests is None
+                else plan.request_pages
+            ),
+            row_requests=(
+                None if plan.row_requests is None else plan.row_requests[selected]
+            ),
+            taps_to_read=plan.taps_to_read[selected],
+            num_tokens=rows.shape[0],
             trtllm_workspace=self._attention_workspace,
         )
 
@@ -300,7 +333,8 @@ class FrankyTapCache:
             + [torch.zeros(1, dtype=torch.int64)]
         )
         row_requests = torch.repeat_interleave(
-            torch.arange(len(num_rows)), torch.tensor(num_rows, dtype=torch.int64)
+            torch.arange(len(num_rows) + 1),
+            torch.tensor(num_rows + [1], dtype=torch.int64),
         )
         device = self._decode_taps_to_read.device
         num_pages = max(1, -(-int(taps_to_read.max()) // self.page_size))
@@ -308,14 +342,11 @@ class FrankyTapCache:
             forward_batch.req_pool_indices, num_pages=num_pages
         )
         return _RowPlan(
-            page_table=torch.cat(
-                [
-                    page_table[_to_device(row_requests, device=device)],
-                    page_table.new_zeros((1, num_pages)),
-                ]
-            ),
+            request_pages=torch.cat([page_table, page_table.new_zeros((1, num_pages))]),
+            row_requests=_to_device(row_requests.to(torch.int32), device=device),
             taps_to_read=_to_device(taps_to_read.to(torch.int32), device=device),
-            num_rows=int(row_requests.shape[0]),
+            num_rows=sum(num_rows),
+            row_blocks=franky_reader_row_blocks(num_rows, device=device),
         )
 
     def _decode_plan(self, forward_batch: ForwardBatch) -> _RowPlan:
@@ -323,7 +354,8 @@ class FrankyTapCache:
         page_table = self._page_table(req_pool_indices, num_pages=self._max_pages)
         taps_to_read = self._decode_taps_to_read[req_pool_indices]
         return _RowPlan(
-            page_table=torch.cat([page_table, page_table[:1] * 0]),
+            request_pages=torch.cat([page_table, page_table[:1] * 0]),
+            row_requests=None,
             taps_to_read=torch.cat([taps_to_read, taps_to_read[:1] * 0]),
             num_rows=req_pool_indices.shape[0],
         )
@@ -357,9 +389,11 @@ class _RowPlan(msgspec.Struct, frozen=True, kw_only=True):
     reads, with one more row that reads nothing.
     """
 
-    page_table: torch.Tensor
+    request_pages: torch.Tensor
+    row_requests: Optional[torch.Tensor]
     taps_to_read: torch.Tensor
     num_rows: int
+    row_blocks: Optional[torch.Tensor] = None
 
 
 def _to_device(host: torch.Tensor, *, device: torch.device) -> torch.Tensor:
