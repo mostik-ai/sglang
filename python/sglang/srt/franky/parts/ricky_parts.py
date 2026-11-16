@@ -10,6 +10,7 @@ from sglang.srt.franky.parts.franky_parts import FrankyParts, load_part
 from sglang.srt.franky.parts.reader.query.reader import attention_workspace
 
 if TYPE_CHECKING:
+    from sglang.srt.franky.cache.tap_cache import TrtllmWorkspace
     from sglang.srt.franky.config import FrankyConfig
     from sglang.srt.franky.parts.franky_mixin import FrankyMixin
     from sglang.srt.franky.parts.injector.injector import Injector
@@ -71,7 +72,7 @@ class RickyParts(FrankyParts):
         return cls(config=config, injector=injector, readers=readers, device=device)
 
     @override
-    def _attention_workspace(self) -> Optional[torch.Tensor]:
+    def _attention_workspace(self) -> Optional[TrtllmWorkspace]:
         return attention_workspace(device=self.device)
 
     @override

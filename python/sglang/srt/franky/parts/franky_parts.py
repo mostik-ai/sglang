@@ -9,7 +9,7 @@ from safetensors.torch import load_file
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.kv_options import FrankyKvOptions
 from sglang.srt.franky.cache.swa_kv_allocator import FrankySwaKvAllocator
-from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
+from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache, TrtllmWorkspace
 from sglang.srt.franky.config import FrankyConfig
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 
@@ -149,7 +149,7 @@ class FrankyParts(ABC):
     def read_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         """Take what an earlier PP stage carried."""
 
-    def _attention_workspace(self) -> Optional[torch.Tensor]:
+    def _attention_workspace(self) -> Optional[TrtllmWorkspace]:
         """The buffer the readers' attention kernel needs, if any."""
         return None
 

@@ -8,7 +8,7 @@ from torch import nn
 from typing_extensions import override
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
-from sglang.srt.franky.cache.tap_cache import TAP_DTYPE
+from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, TrtllmWorkspace
 from sglang.srt.franky.parts.reader.reader import Reader
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
@@ -128,18 +128,26 @@ def attend_taps(
     has_taps[rows, 0] = reads.to(has_taps.dtype)
 
 
-def attention_workspace(*, device: str) -> Optional[torch.Tensor]:
+# Split-KV completion tickets, one int32 a query head of a row, for 2^18 rows of
+# 8 heads: a forward's rows stay far below.
+_TRTLLM_COUNTER_BYTES = (1 << 18) * 8 * 4
+
+
+def attention_workspace(*, device: str) -> Optional[TrtllmWorkspace]:
     """
     Returns:
-        A zeroed workspace for the TRT-LLM kernels the readers run on Blackwell,
-        or None where they run FA3.
+        The zeroed workspace for the TRT-LLM kernels the readers run on
+        Blackwell, or None where they run FA3.
     """
     if torch.device(device).type != "cuda":
         return None
     if torch.cuda.get_device_capability(device)[0] < 10:
         return None
-    # Arbitrary size; the kernels need it zeroed once.
-    return torch.zeros(256 << 20, dtype=torch.uint8, device=device)
+    return TrtllmWorkspace(
+        # Arbitrary size; the kernels need it zeroed once.
+        buffer=torch.zeros(256 << 20, dtype=torch.uint8, device=device),
+        counters=torch.zeros(_TRTLLM_COUNTER_BYTES, dtype=torch.uint8, device=device),
+    )
 
 
 def _attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
@@ -172,7 +180,8 @@ def _trtllm_attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -
     result = decode.trtllm_batch_decode_with_kv_cache(
         query=queries,
         kv_cache=(taps, taps),
-        workspace_buffer=view.trtllm_workspace,
+        workspace_buffer=view.trtllm_workspace.buffer,
+        multi_ctas_kv_counter_buffer=view.trtllm_workspace.counters,
         block_tables=view.page_table,
         seq_lens=view.taps_to_read,
         max_seq_len=view.page_table.shape[1] * page_size,

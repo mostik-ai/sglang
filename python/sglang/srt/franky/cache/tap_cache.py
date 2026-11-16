@@ -56,6 +56,21 @@ class FrankyReqState(msgspec.Struct, kw_only=True):
         return self.taken_kv_slots[start - self.taken_from : end - self.taken_from]
 
 
+class TrtllmWorkspace(msgspec.Struct, frozen=True, kw_only=True):
+    """What the readers' TRT-LLM kernels keep across launches on Blackwell.
+
+    Attributes:
+        buffer: scratch for split-KV partials, zeroed once.
+        counters: the split-KV completion tickets, zeroed once; every launch
+            resets them. Without them FlashInfer allocates fresh tickets per
+            launch, whose memory the allocator, or a CUDA graph's pool, hands
+            to a later kernel while the launch may still run.
+    """
+
+    buffer: torch.Tensor
+    counters: torch.Tensor
+
+
 class TapView(msgspec.Struct, frozen=True, kw_only=True):
     """One encoder's taps for the rows of one forward, as the paged attention
     kernels take them.
@@ -72,7 +87,7 @@ class TapView(msgspec.Struct, frozen=True, kw_only=True):
     page_table: torch.Tensor
     taps_to_read: torch.Tensor
     num_tokens: int
-    trtllm_workspace: Optional[torch.Tensor]
+    trtllm_workspace: Optional[TrtllmWorkspace]
 
 
 class FrankyTapCache:
@@ -103,7 +118,7 @@ class FrankyTapCache:
         req_to_token: torch.Tensor,
         device: str,
         own_pages: bool = False,
-        attention_workspace: Optional[torch.Tensor] = None,
+        attention_workspace: Optional[TrtllmWorkspace] = None,
     ) -> None:
         """
         Args:
