@@ -273,20 +273,21 @@ class TestHandleFranky(_WithFiles):
             server_args._resolved_overrides,
         )
 
-    def test_sandy_runs_without_overlap_scheduling(self):
+    def test_sandy_runs_without_overlap_scheduling_or_decode_graphs(self):
         sandy = self._server_args(side="sandy")
         ricky = self._server_args(side="ricky")
 
         handle_franky(sandy)
         handle_franky(ricky)
 
-        self.assertIn(
-            ("handle_franky", {"disable_overlap_schedule": True}),
-            sandy._resolved_overrides,
+        resolved = dict(sandy._resolved_overrides)["handle_franky"]
+        self.assertTrue(resolved["disable_overlap_schedule"])
+        self.assertEqual(resolved["cuda_graph_config"].decode.backend, Backend.DISABLED)
+        self.assertEqual(
+            resolved["cuda_graph_config"].prefill, CudaGraphConfig().prefill
         )
         self.assertNotIn(
-            ("handle_franky", {"disable_overlap_schedule": True}),
-            getattr(ricky, "_resolved_overrides", []),
+            "handle_franky", dict(getattr(ricky, "_resolved_overrides", []))
         )
 
     def test_each_side_picks_its_own_attention_dp_size(self):
