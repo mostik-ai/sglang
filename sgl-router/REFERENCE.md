@@ -459,6 +459,16 @@ in the next block:
   routed experts and sessions are refused with `400`, as is chat the router
   does not lower to `/generate`: it lowers chat only for the templates it
   renders as SGLang does (see [Chat rendering](#chat-rendering)).
+- With `--franky-boundary-token-id ID` (such as the close of Ricky's thinking),
+  a block also ends where Ricky writes `ID`, unless the client stops on it, and
+  the next block starts a new answer: the router ends the chain on its engines
+  and goes on with a new chain whose blocks list every earlier answer of the
+  request as `franky_generated_spans` after the client's own, so the tokens
+  after the boundary read the taps of every token before them. Each block asks
+  the engines to stop on `ID`; `ignore_eos`, which turns stops off, gets `400`.
+  The client still gets one response, which ends only at the client's own stop
+  or limit. A trainer reading the same answers must start a new answer after
+  every `ID` that Ricky generated before the answer's last token.
 - A stop string across two blocks is not matched; each block checks its own
   output.
 - Between two blocks a chain waits for Sandy to prefill the last block's tokens

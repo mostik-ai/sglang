@@ -117,13 +117,21 @@ pub(super) struct ChainOutput {
     block_report: Map<String, Value>,
     last_block: bool,
     finish_reason: Value,
+    /// The token that ends an answer at a block's end, when the client does
+    /// not stop on it.
+    boundary: Option<u32>,
 }
 
 impl ChainOutput {
-    pub(super) fn new(id: String, incremental_streaming_output: bool) -> Self {
+    pub(super) fn new(
+        id: String,
+        incremental_streaming_output: bool,
+        boundary: Option<u32>,
+    ) -> Self {
         Self {
             id,
             incremental_streaming_output,
+            boundary,
             finished: Generated::default(),
             current: Generated::default(),
             prompt_meta: None,
@@ -148,10 +156,19 @@ impl ChainOutput {
         self.chain_frame(frame, self.incremental_streaming_output)
     }
 
-    /// Whether the current block ended at its own token limit, so the chain
-    /// goes on with another block.
+    /// Whether the current block ended at its own token limit or at the
+    /// boundary token, so the chain goes on with another block.
     pub(super) fn block_cut(&self) -> bool {
-        !self.last_block && self.finish_reason["type"] == "length"
+        !self.last_block && (self.finish_reason["type"] == "length" || self.ended_on_boundary())
+    }
+
+    /// Whether the current block stopped on the boundary token, so the next
+    /// block starts a new answer.
+    pub(super) fn ended_on_boundary(&self) -> bool {
+        self.finish_reason["type"] == "stop"
+            && self.boundary.is_some_and(|boundary| {
+                self.finish_reason["matched"].as_u64() == Some(u64::from(boundary))
+            })
     }
 
     /// Whether the current block is the chain's last one: no engine holds the
@@ -252,7 +269,7 @@ mod tests {
 
     #[test]
     fn a_later_cumulative_frame_continues_the_finished_blocks() {
-        let mut output = ChainOutput::new("chain".into(), false);
+        let mut output = ChainOutput::new("chain".into(), false, None);
         output.start_block(false);
         let first = output.streamed_frame(frame("ab", &[1, 2], 2, length(2)));
         assert!(output.block_cut());
@@ -281,7 +298,7 @@ mod tests {
 
     #[test]
     fn incremental_frames_stay_deltas_and_their_counts_add_up() {
-        let mut output = ChainOutput::new("chain".into(), true);
+        let mut output = ChainOutput::new("chain".into(), true, None);
         output.start_block(false);
         output.streamed_frame(frame("a", &[1], 1, Value::Null));
         output.streamed_frame(frame("b", &[2], 2, length(2)));
@@ -299,7 +316,7 @@ mod tests {
     #[test]
     fn the_last_block_and_a_stop_keep_their_finish_reason() {
         let stop = json!({"type": "stop", "matched": 7});
-        let mut output = ChainOutput::new("chain".into(), false);
+        let mut output = ChainOutput::new("chain".into(), false, None);
         output.start_block(false);
         let stopped = output.streamed_frame(frame("a", &[7], 1, stop.clone()));
         assert!(!output.block_cut());
@@ -313,7 +330,7 @@ mod tests {
 
     #[test]
     fn a_unary_block_is_one_whole_frame_even_with_incremental_streams() {
-        let mut output = ChainOutput::new("chain".into(), true);
+        let mut output = ChainOutput::new("chain".into(), true, None);
         output.start_block(false);
         output.whole_block_frame(frame("ab", &[1, 2], 2, length(2)));
         output.finish_block();
@@ -323,5 +340,30 @@ mod tests {
 
         assert_eq!(whole["text"], "abc");
         assert_eq!(whole["output_ids"], json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn a_stop_on_the_boundary_token_cuts_the_block_and_clears_the_finish_reason() {
+        let mut output = ChainOutput::new("chain".into(), false, Some(7));
+        output.start_block(false);
+        let boundary = json!({"type": "stop", "matched": 7});
+        let cut = output.whole_block_frame(frame("<3>", &[3, 7], 2, boundary));
+
+        assert!(output.block_cut());
+        assert!(output.ended_on_boundary());
+        assert_eq!(cut["meta_info"]["finish_reason"], Value::Null);
+
+        output.start_block(true);
+        let last = output.whole_block_frame(frame(
+            "<8>",
+            &[8, 7],
+            2,
+            json!({"type": "stop", "matched": 7}),
+        ));
+        assert!(!output.block_cut());
+        assert_eq!(
+            last["meta_info"]["finish_reason"],
+            json!({"type": "stop", "matched": 7})
+        );
     }
 }

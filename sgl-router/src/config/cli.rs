@@ -180,6 +180,12 @@ pub struct ServerArgs {
     /// sequence; unset runs each request in one block.
     #[arg(long)]
     pub franky_block_size: Option<NonZeroU32>,
+    /// Franky: a token id that also ends a block wherever Ricky writes it, such
+    /// as the close of his thinking, unless the client stops on it; the next
+    /// block starts a new answer, whose tokens read the taps of every token
+    /// before it. Needs --franky-block-size.
+    #[arg(long)]
+    pub franky_boundary_token_id: Option<u32>,
     /// Franky: the served model's chat template, so the router marks the answers
     /// Ricky generated in a chat's earlier turns (franky_generated_spans) in the
     /// chats it renders. Without it, a Franky chat with earlier assistant
@@ -719,6 +725,7 @@ impl Cli {
                 decode_dispatch_limit: self.server.decode_dispatch_limit,
                 stream_after_prefill: self.server.pd_stream_after_prefill,
                 franky_block_size: self.server.franky_block_size,
+                franky_boundary_token_id: self.server.franky_boundary_token_id,
                 franky_chat_adapter: self.server.franky_chat_adapter,
             },
             router_inflight_load: InflightLoadConfig {

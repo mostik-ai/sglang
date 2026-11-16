@@ -54,6 +54,15 @@ pub(super) struct BlockChain {
     /// Sandy's own view of the prompt, when the client sent one; each block
     /// gives her that view and every token generated so far.
     sandy_prompt_ids: Option<Vec<u32>>,
+    /// The token that ends an answer at a block's end (`--franky-boundary-token-id`),
+    /// unless the client stops on it.
+    boundary: Option<u32>,
+    /// The request's answers before the current one, as `[start, end)` runs of
+    /// the block's `input_ids`; each later block lists them as
+    /// `franky_generated_spans` after the client's own.
+    earlier_answers: Vec<[usize; 2]>,
+    /// Where the current answer starts among the generated tokens.
+    answer_start: usize,
     streaming: bool,
     responder: Option<Responder>,
     output: ChainOutput,
@@ -103,6 +112,7 @@ impl BlockChain {
         };
         body.remove("text");
         let sandy_prompt_ids = request.sandy_input_ids.take();
+        let boundary = boundary_of(ctx, &body)?;
         let client_rid = body.remove("rid");
         let total_limit = body
             .get("sampling_params")
@@ -116,7 +126,7 @@ impl BlockChain {
         let incremental_streaming_output = model_openai_settings(ctx, &request.model)
             .is_some_and(|settings| settings.incremental_streaming_output);
         Ok(Some(Self {
-            output: ChainOutput::new(reported_id, incremental_streaming_output),
+            output: ChainOutput::new(reported_id, incremental_streaming_output, boundary),
             end: ChainEnd::new(ctx.proxy.admin_client().clone(), id.clone(), headers),
             id,
             model: request.model.clone(),
@@ -125,6 +135,9 @@ impl BlockChain {
             body_without_prompt: body,
             prompt_ids,
             sandy_prompt_ids,
+            boundary,
+            earlier_answers: Vec::new(),
+            answer_start: 0,
             streaming: request.streaming,
             responder: request.responder.take(),
             workers: None,
@@ -224,7 +237,23 @@ impl BlockChain {
         );
         let sampling = body.entry("sampling_params").or_insert_with(|| json!({}));
         sampling["max_new_tokens"] = max_new_tokens.into();
-        if self.blocks_sent > 1 && body.contains_key("logprob_start_len") {
+        if let Some(boundary) = self.boundary {
+            let stops = sampling
+                .as_object_mut()
+                .map(|params| params.entry("stop_token_ids").or_insert_with(|| json!([])));
+            if let Some(Value::Array(stops)) = stops {
+                stops.push(boundary.into());
+            }
+        }
+        if !self.earlier_answers.is_empty() {
+            let mut spans = match body.remove("franky_generated_spans") {
+                Some(Value::Array(spans)) => spans,
+                _ => Vec::new(),
+            };
+            spans.extend(self.earlier_answers.iter().map(|span| json!(span)));
+            body.insert("franky_generated_spans".into(), Value::Array(spans));
+        }
+        if !self.output.generated_ids().is_empty() && body.contains_key("logprob_start_len") {
             body.insert("logprob_start_len".into(), (-1).into());
         }
         Value::Object(body)
@@ -260,6 +289,7 @@ impl BlockChain {
             }
             self.log_block();
             self.output.finish_block();
+            self.start_answer_after_boundary();
             response = self
                 .send_block(ctx, routing, headers, start, duration)
                 .await?;
@@ -310,6 +340,7 @@ impl BlockChain {
             }
             self.log_block();
             self.output.finish_block();
+            self.start_answer_after_boundary();
             let next = match ModelRouting::lookup(&ctx, &self.model) {
                 Ok(routing) => {
                     self.send_block(&ctx, &routing, &headers, start, &mut duration)
@@ -367,6 +398,24 @@ impl BlockChain {
         }
     }
 
+    /// After a block that stopped on the boundary token, the next block starts
+    /// a new answer. Its engines' chain counts blocks of one size from the
+    /// answer's start, so the chain ends on them and goes on under a new id
+    /// whose blocks list every earlier answer.
+    fn start_answer_after_boundary(&mut self) {
+        if !self.output.ended_on_boundary() {
+            return;
+        }
+        let generated = self.output.generated_ids().len();
+        let prompt = self.prompt_ids.len();
+        self.earlier_answers
+            .push([prompt + self.answer_start, prompt + generated]);
+        self.answer_start = generated;
+        self.id = uuid::Uuid::new_v4().simple().to_string();
+        self.end.restart(self.id.clone());
+        self.blocks_sent = 0;
+    }
+
     fn ended(&mut self) {
         self.log_block();
         if self.output.on_last_block() {
@@ -385,6 +434,36 @@ impl BlockChain {
             "franky block ended"
         );
     }
+}
+
+/// The router's boundary token for a request, unless the client stops on it.
+///
+/// Errors: `ApiError::BadRequest` for `ignore_eos`, which turns off the stop
+/// that ends an answer at the boundary.
+fn boundary_of(ctx: &AppContext, body: &Map<String, Value>) -> Result<Option<u32>, ApiError> {
+    let Some(boundary) = ctx.config.proxy.franky_boundary_token_id else {
+        return Ok(None);
+    };
+    let sampling = body.get("sampling_params");
+    let client_stops = sampling
+        .and_then(|params| params.get("stop_token_ids"))
+        .and_then(Value::as_array);
+    if client_stops.is_some_and(|stops| {
+        stops
+            .iter()
+            .any(|id| id.as_u64() == Some(u64::from(boundary)))
+    }) {
+        return Ok(None);
+    }
+    if sampling
+        .and_then(|params| params.get("ignore_eos"))
+        .is_some_and(is_set)
+    {
+        return Err(refused(
+            "ignore_eos, which turns off the stop that ends an answer at --franky-boundary-token-id",
+        ));
+    }
+    Ok(Some(boundary))
 }
 
 fn check_blocks_can_serve(body: &Map<String, Value>) -> Result<(), ApiError> {
