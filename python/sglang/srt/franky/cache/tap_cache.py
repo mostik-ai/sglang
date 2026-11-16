@@ -129,6 +129,7 @@ class FrankyTapCache:
             None
         ] * req_to_token.shape[0]
         self._plan: Optional[_RowPlan] = None
+        self._last_encoder_id = -1
         self._max_pages = -(-req_to_token.shape[1] // page_size)
         self.own_pages = (
             FrankyOwnTapPages(
@@ -231,7 +232,7 @@ class FrankyTapCache:
                 into them; None for all of them. An index past the last row reads
                 nothing.
         """
-        plan = self._plan_of(forward_batch)
+        plan = self._plan_of(forward_batch, encoder_id=encoder_id)
         if rows is None:
             page_table = plan.page_table[: plan.num_rows]
             taps_to_read = plan.taps_to_read[: plan.num_rows]
@@ -249,18 +250,21 @@ class FrankyTapCache:
             trtllm_workspace=self._attention_workspace,
         )
 
-    def _plan_of(self, forward_batch: ForwardBatch) -> _RowPlan:
-        """The rows' pages and tap counts of one forward, built once for all of
-        its readers."""
-        is_decode = forward_batch.forward_mode.is_decode_or_idle()
-        # A decode CUDA graph replays one index tensor, so its plan is captured once.
-        source = forward_batch.req_pool_indices if is_decode else forward_batch
-        if self._plan is None or self._plan.source is not source:
+    def _plan_of(self, forward_batch: ForwardBatch, *, encoder_id: int) -> _RowPlan:
+        """The rows' pages and tap counts of one forward, built by its first reader
+        for all of them. Readers view their encoders in increasing order within a
+        forward, so an encoder at or below the last one starts the next forward.
+        A CUDA graph runner warms a batch up and captures it on the same tensors;
+        a plan kept across forwards would leave the captured forward reading the
+        warmup's freed plan instead of building its own.
+        """
+        if self._plan is None or encoder_id <= self._last_encoder_id:
             self._plan = (
                 self._decode_plan(forward_batch)
-                if is_decode
+                if forward_batch.forward_mode.is_decode_or_idle()
                 else self._extend_plan(forward_batch)
             )
+        self._last_encoder_id = encoder_id
         return self._plan
 
     def _extend_plan(self, forward_batch: ForwardBatch) -> _RowPlan:
@@ -289,7 +293,6 @@ class FrankyTapCache:
             forward_batch.req_pool_indices, num_pages=num_pages
         )
         return _RowPlan(
-            source=forward_batch,
             page_table=torch.cat(
                 [
                     page_table[_to_device(row_requests, device=device)],
@@ -305,7 +308,6 @@ class FrankyTapCache:
         page_table = self._page_table(req_pool_indices, num_pages=self._max_pages)
         taps_to_read = self._decode_taps_to_read[req_pool_indices]
         return _RowPlan(
-            source=req_pool_indices,
             page_table=torch.cat([page_table, page_table[:1] * 0]),
             taps_to_read=torch.cat([taps_to_read, taps_to_read[:1] * 0]),
             num_rows=req_pool_indices.shape[0],
@@ -337,11 +339,9 @@ class FrankyTapCache:
 
 class _RowPlan(msgspec.Struct, frozen=True, kw_only=True):
     """Per row of one forward: its request's tap pages and how many taps its query
-    reads, with one more row that reads nothing. Holding ``source``, what the plan
-    was built from, keeps its identity from being reused by a later forward.
+    reads, with one more row that reads nothing.
     """
 
-    source: object
     page_table: torch.Tensor
     taps_to_read: torch.Tensor
     num_rows: int

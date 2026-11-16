@@ -109,6 +109,19 @@ class TestReadingOwnTapPages(CustomTestCase):
         self.assertEqual(view.taps_to_read.tolist(), [6])
         self.assertEqual(view.page_table[0, :2].tolist(), self.pages.tolist())
 
+    def test_each_forward_builds_its_plan_even_on_the_same_tensors(self):
+        """A CUDA graph runner warms a batch up and captures it on the same
+        tensors: the captured forward must build its own plan."""
+        batch = _decode_batch(rows=[1])
+        first = self.cache.view(encoder_id=0, forward_batch=batch)
+        moved = self.own_pages.take(num_pages=2)
+        self.own_pages.bind(req_pool_indices=[1], pages=[moved])
+
+        second = self.cache.view(encoder_id=0, forward_batch=batch)
+
+        self.assertEqual(first.page_table[0, :2].tolist(), self.pages.tolist())
+        self.assertEqual(second.page_table[0, :2].tolist(), moved.tolist())
+
     def test_an_owned_page_is_the_bytes_the_transfer_writes(self):
         page = int(self.pages[1])
         start = page * self.cache.page_bytes // TAP_DTYPE.itemsize
