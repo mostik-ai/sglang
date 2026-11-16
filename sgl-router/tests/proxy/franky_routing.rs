@@ -545,3 +545,88 @@ async fn requests_blocks_cannot_serve_are_refused() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     assert!(ricky.requests().is_empty());
 }
+
+/// Sandy reads her own view of a `/generate` prompt and Ricky his; the field
+/// that carries hers reaches no engine.
+#[tokio::test]
+async fn a_sandy_reads_her_own_view_of_the_prompt() {
+    let ricky = MockWorker::start(vec![]).await;
+    let sandy = MockWorker::start(vec![]).await;
+    let ctx = franky_ctx(
+        &[("r", &ricky.url, WorkerMode::Plain)],
+        &[("s", &sandy.url)],
+        1,
+        false,
+    );
+    let body = json!({
+        "input_ids": [1, 2, 3, 4],
+        "franky_sandy_input_ids": [1, 9, 9, 4],
+        "sampling_params": {"max_new_tokens": 4},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let ricky_body = ricky.captured_json().await;
+    let sandy_body = sandy.captured_json().await;
+    assert_eq!(ricky_body["input_ids"], json!([1, 2, 3, 4]));
+    assert_eq!(sandy_body["input_ids"], json!([1, 9, 9, 4]));
+    for body in [&ricky_body, &sandy_body] {
+        assert!(body.get("franky_sandy_input_ids").is_none(), "{body}");
+    }
+    assert_eq!(
+        without(sandy_body, &["input_ids"]),
+        without(ricky_body, &["input_ids"])
+    );
+}
+
+/// Every block gives Sandy her own view and every token Ricky generated so far,
+/// and Ricky his view and the same tokens.
+#[tokio::test]
+async fn every_block_gives_sandy_her_view_and_rickys_tokens_so_far() {
+    let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "franky_sandy_input_ids": [7, 8, 9],
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let (ricky_requests, sandy_requests) = (ricky.requests(), sandy.requests());
+    assert_eq!((ricky_requests.len(), sandy_requests.len()), (3, 3));
+    for (block, (ricky_request, sandy_request)) in
+        ricky_requests.iter().zip(&sandy_requests).enumerate()
+    {
+        let generated: Vec<u64> = (3..3 + 4 * block as u64).collect();
+        let ricky_context: Vec<u64> = [1, 2, 3].into_iter().chain(generated.clone()).collect();
+        let sandy_context: Vec<u64> = [7, 8, 9].into_iter().chain(generated).collect();
+        assert_eq!(ricky_request["input_ids"], json!(ricky_context));
+        assert_eq!(sandy_request["input_ids"], json!(sandy_context));
+        assert_eq!(sandy_request["franky_chain"], ricky_request["franky_chain"]);
+        for request in [ricky_request, sandy_request] {
+            assert!(request.get("franky_sandy_input_ids").is_none(), "{request}");
+        }
+    }
+}
+
+/// A view of another length, a prompt sent as text, or a view that is not token
+/// ids is refused before any engine sees it.
+#[tokio::test]
+async fn a_sandy_view_that_cannot_align_with_rickys_prompt_is_refused() {
+    let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+    for body in [
+        json!({"input_ids": [1, 2, 3], "franky_sandy_input_ids": [7, 8]}),
+        json!({"text": "one two three", "franky_sandy_input_ids": [7, 8, 9]}),
+        json!({"input_ids": [1, 2, 3], "franky_sandy_input_ids": "seven eight nine"}),
+    ] {
+        let res = build_router(Arc::clone(&ctx))
+            .oneshot(generate(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    assert!(ricky.requests().is_empty());
+    assert!(sandy.requests().is_empty());
+}

@@ -51,6 +51,9 @@ pub(super) struct BlockChain {
     total_limit: Option<u64>,
     body_without_prompt: Map<String, Value>,
     prompt_ids: Vec<Value>,
+    /// Sandy's own view of the prompt, when the client sent one; each block
+    /// gives her that view and every token generated so far.
+    sandy_prompt_ids: Option<Vec<u32>>,
     streaming: bool,
     responder: Option<Responder>,
     output: ChainOutput,
@@ -99,6 +102,7 @@ impl BlockChain {
             }
         };
         body.remove("text");
+        let sandy_prompt_ids = request.sandy_input_ids.take();
         let client_rid = body.remove("rid");
         let total_limit = body
             .get("sampling_params")
@@ -120,6 +124,7 @@ impl BlockChain {
             total_limit,
             body_without_prompt: body,
             prompt_ids,
+            sandy_prompt_ids,
             streaming: request.streaming,
             responder: request.responder.take(),
             workers: None,
@@ -196,6 +201,14 @@ impl BlockChain {
         let mut body = self.body_without_prompt.clone();
         let context = self.prompt_ids.iter().chain(self.output.generated_ids());
         body.insert("input_ids".into(), Value::Array(context.cloned().collect()));
+        if let Some(sandy) = &self.sandy_prompt_ids {
+            let view = sandy.iter().map(|&id| Value::from(id));
+            let context = view.chain(self.output.generated_ids().iter().cloned());
+            body.insert(
+                "franky_sandy_input_ids".into(),
+                Value::Array(context.collect()),
+            );
+        }
         body.insert(
             "rid".into(),
             format!("{}-{}", self.id, self.blocks_sent).into(),

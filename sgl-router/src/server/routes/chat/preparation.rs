@@ -114,6 +114,9 @@ pub(super) struct PreparedRequest {
     sampling_defaults: Vec<(SamplingField, Number)>,
     /// Turns the engine's `/generate` response back into the OpenAI one.
     pub(super) responder: Option<Responder>,
+    /// Sandy's own view of the prompt, from a `/generate` body's
+    /// `franky_sandy_input_ids`: her leg's `input_ids`, as long as Ricky's.
+    pub(super) sandy_input_ids: Option<Vec<u32>>,
 }
 
 impl PreparedRequest {
@@ -253,6 +256,7 @@ impl PreparedRequest {
                 || (path == COMPLETIONS_PATH && fields.prompt_batch),
             input_ids_forwarding: forwarding,
             forwarding_booked: false,
+            sandy_input_ids: None,
             parsed_body,
             sampling_defaults,
             responder: None,
@@ -313,6 +317,7 @@ impl PreparedRequest {
             fans_out: batch.is_some() || requests_multiple_samples(&fields, &sampling_defaults),
             input_ids_forwarding: None,
             forwarding_booked: false,
+            sandy_input_ids: None,
             responder: None,
             cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
@@ -346,6 +351,8 @@ impl PreparedRequest {
             Some(_) => apply_sampling_overrides(ctx, &mut value)?,
             None => true,
         };
+        let sandy_input_ids = take_sandy_input_ids(&mut value)?;
+        rewrite |= sandy_input_ids.is_some();
         let text_ids = tokenize_text(ctx, &model, &value);
         // Routing sees `text` as the engine's ids, whether or not they are forwarded.
         let routed = text_ids.as_ref().map(|ids| json!({ "input_ids": ids }));
@@ -407,6 +414,7 @@ impl PreparedRequest {
             fans_out,
             input_ids_forwarding: None,
             forwarding_booked: false,
+            sandy_input_ids,
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
             responder: None,
@@ -527,6 +535,7 @@ impl PreparedRequest {
             fans_out,
             input_ids_forwarding: None,
             forwarding_booked: false,
+            sandy_input_ids: None,
             responder: None,
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
@@ -561,6 +570,7 @@ impl PreparedRequest {
             fans_out: false,
             input_ids_forwarding: None,
             forwarding_booked: false,
+            sandy_input_ids: None,
             parsed_body: None,
             sampling_defaults: Vec::new(),
             responder: None,
@@ -608,6 +618,28 @@ impl PreparedRequest {
             .into();
         self.parsed_body = Some(body);
         Ok(())
+    }
+
+    /// Sandy's engine body for one dispatch attempt: the body Ricky's leg gets,
+    /// with her own view of the prompt as `input_ids` when the client sent one.
+    pub(super) fn sandy_outgoing_body(
+        &mut self,
+        ctx: &AppContext,
+        franky_room: &FrankyRoom,
+        engine_rid: Option<&str>,
+    ) -> Result<Bytes, ApiError> {
+        let Some(sandy_input_ids) = self.sandy_input_ids.clone() else {
+            return self.outgoing_body(ctx, None, Some(franky_room), engine_rid);
+        };
+        build_outgoing_body(
+            &self.body,
+            self.parsed_body.take(),
+            Some(&sandy_input_ids),
+            None,
+            Some(franky_room),
+            &self.sampling_defaults,
+            engine_rid,
+        )
     }
 
     /// The engine body for one dispatch attempt; each attempt brings its own
@@ -1622,6 +1654,41 @@ pub(super) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiErr
     // Keep deserialization details out of the client-visible error.
     tracing::debug!(error = %err, "chat-completions routing-fields deserialize failed");
     Err(invalid_request())
+}
+
+/// Takes the client's `franky_sandy_input_ids`, Sandy's own view of the
+/// prompt, out of a `/generate` body, so no engine sees the field. Design A
+/// replaces Sandy's part one for one by filler in Ricky's view, so every tap
+/// keeps its position: the two views must be token ids of one length.
+///
+/// Errors: `ApiError::BadRequest` for a view that is not token ids, a prompt
+/// sent as text or a batch, or views of different lengths.
+fn take_sandy_input_ids(value: &mut Value) -> Result<Option<Vec<u32>>, ApiError> {
+    let Some(fields) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(view) = fields.remove("franky_sandy_input_ids") else {
+        return Ok(None);
+    };
+    let view: Vec<u32> = serde_json::from_value(view).map_err(|_| {
+        ApiError::BadRequest("franky_sandy_input_ids must be one prompt's token ids".into())
+    })?;
+    let prompt = match fields.get("input_ids") {
+        Some(Value::Array(ids)) if ids.iter().all(Value::is_u64) => ids.len(),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "franky_sandy_input_ids needs Ricky's prompt as one prompt's input_ids".into(),
+            ))
+        }
+    };
+    if view.len() != prompt {
+        return Err(ApiError::BadRequest(format!(
+            "franky_sandy_input_ids holds {} tokens for a prompt of {prompt}: \
+             Sandy's view must be as long as Ricky's",
+            view.len()
+        )));
+    }
+    Ok(Some(view))
 }
 
 pub(super) fn invalid_request() -> ApiError {
