@@ -139,7 +139,8 @@ class FrankyTapCache:
         """
         Args:
             page_size: tokens of a tap page; it divides ``kv_page_size``.
-            num_tokens: KV slots past the KV pool's first page.
+            num_tokens: tokens whose taps fit past the first KV page: the KV
+                slots, or with ``own_pages`` as many as the tap budget holds.
             own_pages: whether requests own tap pages apart from their KV slots.
         """
         if kv_page_size % page_size != 0:

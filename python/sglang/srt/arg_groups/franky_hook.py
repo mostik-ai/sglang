@@ -86,6 +86,9 @@ def _shared_checks(*, cfg: Any, model_config: ModelConfig) -> dict[str, bool]:
         f"--franky-chain-hold-ratio {cfg.franky_chain_hold_ratio}, it is a share": (
             not 0 <= cfg.franky_chain_hold_ratio <= 1
         ),
+        f"--franky-tap-pool-ratio {cfg.franky_tap_pool_ratio}, it must be above 0": (
+            cfg.franky_tap_pool_ratio <= 0
+        ),
     }
 
 
@@ -117,6 +120,10 @@ def _sandy_checks(
         ),
         f"encoder layer {last_layer}, the model has {num_layers} layers": (
             last_layer > num_layers
+        ),
+        # Sandy's taps live at its KV slots.
+        f"--franky-tap-pool-ratio {cfg.franky_tap_pool_ratio}": (
+            cfg.franky_tap_pool_ratio != 1
         ),
     }
 
@@ -163,5 +170,9 @@ def _ricky_checks(
         # replays the lengths it was captured with.
         "--cuda-graph-backend-prefill full": (
             cfg.cuda_graph_config.prefill.backend == Backend.FULL
+        ),
+        # With one tokenizer a token's taps live at its KV slot.
+        f"--franky-tap-pool-ratio {cfg.franky_tap_pool_ratio} with shared_tokenizer": (
+            config.shared_tokenizer and cfg.franky_tap_pool_ratio != 1
         ),
     }

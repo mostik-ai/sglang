@@ -29,7 +29,7 @@ _OTHER_LAYER = 4
 class _Parts(FrankyParts):
     """Adds ``extra`` after its layer; None reads only, as Sandy's encoders do."""
 
-    def __init__(self, *, extra=None):
+    def __init__(self, *, extra=None, own_pages=False, tap_pool_ratio=1.0):
         super().__init__(
             config=SimpleNamespace(
                 encoder=SimpleNamespace(output_size=256), tap_page_size=4
@@ -37,9 +37,11 @@ class _Parts(FrankyParts):
             injector=ResidualInjector(),
             layer_indices=frozenset({_PART_LAYER}),
             device="cpu",
+            tap_pool_ratio=tap_pool_ratio,
         )
         self.extra = extra
         self.seen = None
+        self.own_pages = own_pages
 
     @classmethod
     def build(cls, **kwargs):
@@ -47,6 +49,9 @@ class _Parts(FrankyParts):
 
     def _tap_encoder_ids(self):
         return (0, 2)
+
+    def _owns_tap_pages(self):
+        return self.own_pages
 
     def _after_layer(self, *, layer_idx, output):
         self.seen = self.injector.read(output=output)
@@ -168,6 +173,47 @@ class TestFrankyParts(CustomTestCase):
             _Parts().init_tap_cache(
                 num_tokens=8, kv_allocator=object(), req_to_token_pool=object()
             )
+
+
+class TestTapPool(CustomTestCase):
+    """Requests that own tap pages hold them only while they run, and the prefix
+    cache keeps KV after them, so the budget may charge taps for a share of the
+    KV slots; a share too small for one request would park it for good.
+    """
+
+    def _init(self, parts, *, context_len):
+        allocator = FrankyKvAllocator.__new__(FrankyKvAllocator)
+        allocator.page_size = 8
+        parts.init_tap_cache(
+            num_tokens=64,
+            kv_allocator=allocator,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((2, context_len), dtype=torch.int32)
+            ),
+        )
+        return parts.tap_cache
+
+    def test_the_budget_charges_the_ratio_of_the_taps_per_kv_slot(self):
+        options = _Parts(own_pages=True, tap_pool_ratio=0.25).kv_options()
+
+        self.assertEqual(options.tap_bytes_per_token, 2 * 256 * TAP_DTYPE.itemsize // 4)
+
+    def test_owned_tap_pages_fit_the_ratio_of_the_kv_slots(self):
+        tap_cache = self._init(
+            _Parts(own_pages=True, tap_pool_ratio=0.25), context_len=16
+        )
+
+        # A quarter of 64 KV slots is 16 tokens: four tap pages of four tokens.
+        self.assertEqual(tap_cache.own_pages.num_free(), 4)
+        self.assertEqual(tap_cache.transfer_buffers()[0][1], (16 + 8) * 256 * 2)
+
+    def test_a_ratio_is_refused_where_taps_live_at_kv_slots(self):
+        with self.assertRaisesRegex(ValueError, "taps live at KV slots"):
+            self._init(_Parts(tap_pool_ratio=0.25), context_len=16)
+
+    def test_a_pool_short_of_one_request_at_the_context_length_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "fewer than one request"):
+            self._init(_Parts(own_pages=True, tap_pool_ratio=0.25), context_len=32)
 
 
 if __name__ == "__main__":

@@ -49,3 +49,10 @@ class Franky(msgspec.Struct):
         "Share of the KV pool that chain holds may lock; past it the oldest holds "
         "are released. Default is 0.25.",
     ] = 0.25
+    franky_tap_pool_ratio: A[
+        float,
+        "Taps a ricky holds per KV slot when its sandy tokenizes on its own. "
+        "Requests then hold taps only while they run, but the prefix cache keeps "
+        "their KV after them, so a PD prefill engine fits far more KV with a "
+        "lower ratio. Default is 1: taps for every KV slot.",
+    ] = 1.0
