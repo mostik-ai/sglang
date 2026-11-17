@@ -95,9 +95,7 @@ class TestFrankyGeneratedSpans(CustomTestCase):
     def test_with_sandy_on_its_own_each_block_reads_sandys_tokens_before_it(self):
         # A prompt of 22 tokens and two earlier 4-token blocks; Sandy's copy of
         # the answer starts at its token 20, its blocks at 23 and 27.
-        chain = FrankyChain(
-            id="c", block=3, block_size=4, sandy_block_starts=(20, 23)
-        )
+        chain = FrankyChain(id="c", block=3, block_size=4, sandy_block_starts=(20, 23))
 
         spans = FrankyGeneratedSpans.of(
             earlier_answers=_SANDY_ANSWERS_FROM_3_AND_FROM_12[:1],
