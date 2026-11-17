@@ -55,7 +55,9 @@ class _LanguageModel(FrankyMixin, nn.Module):
     def __init__(self, *, start_layer, end_layer):
         super().__init__()
         self.start_layer, self.end_layer = start_layer, end_layer
-        self.config = SimpleNamespace(hidden_size=_HIDDEN_SIZE)
+        self.config = SimpleNamespace(
+            hidden_size=_HIDDEN_SIZE, num_hidden_layers=_NUM_LAYERS
+        )
 
 
 class _Model(nn.Module):

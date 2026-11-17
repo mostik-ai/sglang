@@ -79,6 +79,13 @@ class FrankyParts(ABC):
             dtype=dtype,
             device=device,
         )
+        # At load, before the KV pools: a part this stage cannot run fails here,
+        # not at the first request.
+        injector.check_stage(
+            layer_indices=parts._layer_indices,
+            end_layer=language_model.end_layer,
+            num_layers=language_model.config.num_hidden_layers,
+        )
         language_model.franky_parts = parts
         return parts
 

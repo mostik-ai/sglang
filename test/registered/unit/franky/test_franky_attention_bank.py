@@ -142,5 +142,26 @@ class TestAttentionBankInjector(CustomTestCase):
             AttentionBankInjector().read(output=self._output())
 
 
+class TestAttentionBankStages(CustomTestCase):
+    """A read after a layer needs the next layer's mix weights, which the next
+    pipeline stage holds when that layer ends a stage."""
+
+    def test_a_part_at_an_inner_stage_edge_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_PP_LAYER_PARTITION"):
+            AttentionBankInjector().check_stage(
+                layer_indices=frozenset({8, 32}), end_layer=33, num_layers=93
+            )
+
+    def test_parts_inside_a_stage_run(self):
+        AttentionBankInjector().check_stage(
+            layer_indices=frozenset({8, 32}), end_layer=36, num_layers=93
+        )
+
+    def test_a_part_after_the_last_layer_runs(self):
+        AttentionBankInjector().check_stage(
+            layer_indices=frozenset({92}), end_layer=93, num_layers=93
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

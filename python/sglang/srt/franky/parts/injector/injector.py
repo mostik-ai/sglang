@@ -31,6 +31,19 @@ class Injector(ABC):
         """
         raise NotImplementedError
 
+    def check_stage(
+        self, *, layer_indices: frozenset[int], end_layer: int, num_layers: int
+    ) -> None:
+        """Refuses parts that this PP stage cannot run.
+
+        Args:
+            layer_indices: the stage's layers with a part, counted from 0.
+            end_layer: the stage runs the layers before this one.
+            num_layers: the model's layers.
+        Raises:
+            ValueError: a part needs what only another stage holds.
+        """
+
     @abstractmethod
     def inject(self, *, output: LayerOutput, addition: torch.Tensor) -> LayerOutput:
         """
