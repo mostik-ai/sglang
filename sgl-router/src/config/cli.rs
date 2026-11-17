@@ -6,7 +6,7 @@
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
 use reqwest::header::HeaderValue;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
 use crate::config::types::{is_selector_empty, resolve_sandy_selector};
@@ -211,6 +211,16 @@ pub struct ServerArgs {
         requires = "franky_sandy_tokenizer_path"
     )]
     pub franky_sandy_chat_adapter: Option<ChatTemplateAdapterKind>,
+    /// Franky: Sandy reads the earlier answers of each chat the router renders
+    /// for it whole and, outside them, only every Kth token of its rendering,
+    /// counted from the start; 1 reads every token.
+    #[arg(
+        long,
+        value_name = "K",
+        default_value_t = NonZeroUsize::MIN,
+        requires = "franky_sandy_tokenizer_path"
+    )]
+    pub franky_sandy_keep_every: NonZeroUsize,
 
     /// PD: at most N requests per prefill DP rank go to decode before their
     /// first token; the rest wait and get their decode DP rank when sent.
@@ -742,6 +752,7 @@ impl Cli {
                     .map(|(tokenizer_path, chat_adapter)| FrankySandyConfig {
                         tokenizer_path,
                         chat_adapter,
+                        keep_every: self.server.franky_sandy_keep_every,
                     }),
             },
             router_inflight_load: InflightLoadConfig {
@@ -1576,8 +1587,32 @@ mod tests {
             Some(FrankySandyConfig {
                 tokenizer_path: "/models/kimi-k3".into(),
                 chat_adapter: ChatTemplateAdapterKind::KimiK3,
+                keep_every: NonZeroUsize::MIN,
             })
         );
+    }
+
+    #[test]
+    fn franky_sandy_keep_every_reaches_the_proxy_config_with_sandys_tokenizer() {
+        let base = with_model(&["--worker-urls", "http://10.0.0.1:30000"]);
+        let keep_every = ["--franky-sandy-keep-every", "4"].map(str::to_owned);
+        let sandy = [
+            "--franky-chat-adapter",
+            "deepseek-v4",
+            "--franky-sandy-tokenizer-path",
+            "/models/kimi-k3",
+            "--franky-sandy-chat-adapter",
+            "kimi-k3",
+        ]
+        .map(str::to_owned);
+
+        let with_sandy = [base.clone(), sandy.to_vec(), keep_every.to_vec()].concat();
+        let without_sandy = [base, keep_every.to_vec()].concat();
+
+        let config = into_config_owned(with_sandy).unwrap();
+
+        assert_eq!(config.proxy.franky_sandy.unwrap().keep_every.get(), 4);
+        assert!(into_config_owned(without_sandy).is_err());
     }
 
     #[test]
