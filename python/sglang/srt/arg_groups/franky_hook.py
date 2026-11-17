@@ -8,6 +8,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.franky.config import FrankyConfig
+from sglang.srt.franky.parts.reader.query.config import QueryReaderConfig
 from sglang.srt.model_executor.cuda_graph_config import Backend
 
 if TYPE_CHECKING:
@@ -131,9 +132,11 @@ def _ricky_checks(
         f"reader layer {last_layer}, the model has {num_layers} layers": (
             last_layer > num_layers
         ),
-        # Readers attend over taps with FlashAttention, whose heads are this size.
+        # Query readers attend over taps with FlashAttention, whose heads are this
+        # size; an aligned reader maps one tap and attends over none.
         f"encoder output_size {tap_size}, readers need a multiple of 8 up to 256": (
-            tap_size % 8 != 0 or tap_size > 256
+            isinstance(config.reader, QueryReaderConfig)
+            and (tap_size % 8 != 0 or tap_size > 256)
         ),
         # Readers take each prefill's lengths from the host, and a full graph
         # replays the lengths it was captured with.

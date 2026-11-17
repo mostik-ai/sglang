@@ -224,7 +224,17 @@ class TestHandleFranky(_WithFiles):
                     handle_franky(server_args)
                 handle_franky(self._server_args(side="sandy", **fields))
 
-    def test_ricky_pd_refusals(self):
+    def test_an_aligned_reader_takes_taps_wider_than_attention_heads(self):
+        aligned = {
+            "encoder": {"type": "singular_normed", "layers": [4], "output_size": 1024},
+            "reader": {"type": "aligned", "layers": [9], "output_scale": 0.283},
+            "injector": {"type": "residual"},
+            "tap_page_size": 64,
+        }
+
+        handle_franky(self._server_args(side="ricky", config=aligned))
+
+
         pd = {
             "disaggregation_mode": "decode",
             "disaggregation_transfer_backend": "nixl",
