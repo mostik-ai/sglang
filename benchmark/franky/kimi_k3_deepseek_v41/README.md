@@ -168,3 +168,15 @@ without the user-centric points (Franky keeps no host or storage KV tier):
 Every point also passes `--endpoint-type chat --streaming --use-server-token-count
 --extra-inputs '{"ignore_eos": true}'`. The baseline is the same Ricky PD
 without `--franky-*` flags and without Sandy.
+
+## Signals for the benchmark viewer
+
+Kolupalka builds every distribution per point from three sources besides
+AIPerf's own records. All are cheap: with them on, Qwen3-0.6B on one B300 at
+80 requests/s served within run-to-run noise of the same server without them.
+
+| Source | Turn on | Collect |
+| --- | --- | --- |
+| Per-request records: one JSON line per request and engine, with `stage_times` (every stage boundary the scheduler keeps, in wall-clock seconds, plus Franky's page, tap and parking times), `client_request_id` (AIPerf's `X-Request-ID`, passed on by the router) and the token counts | `--enable-metrics --export-metrics-to-file --export-metrics-to-file-dir DIR` on every engine (Sandy, Ricky prefill, Ricky decode, and the solo baselines) | every engine's `DIR/sglang-request-metrics-*.log`, a second or more after the last point, since records are written in batches every 0.5 s |
+| Engine gauges, now also refreshed every 0.25 s while requests wait without a batch; Ricky's `sglang:franky_own_tap_pages` and `sglang:franky_own_tap_pages_free` | `--enable-metrics` | AIPerf `--server-metrics` with every engine's `/metrics`, as before |
+| GPU busy time and, while busy, SM, tensor pipe and DRAM bandwidth use, as counters from NVML's GPM samples | [`../gpu_exporter.py`](../gpu_exporter.py) on every node, with `--pods` naming each GPU's engine | add every exporter's `/metrics` to AIPerf `--server-metrics` (AIPerf's GPU telemetry keeps only the DCGM fields); `GET /clock` on each exporter gives the node's clock for the runner to measure offsets at each point start |
