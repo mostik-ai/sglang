@@ -616,6 +616,48 @@ async fn a_sandy_reads_her_own_view_of_the_prompt() {
     );
 }
 
+/// Ricky's cached KV holds what his readers added, so it depends on Sandy's
+/// view: one Ricky prompt under two views gets two cache keys on both engines,
+/// the same view the same key, and a client's own key stays in front.
+#[tokio::test]
+async fn each_sandy_view_keys_both_engines_caches() {
+    async fn keys(sandy_view: Value, client_key: Option<&str>) -> (String, String) {
+        let ricky = MockWorker::start(vec![]).await;
+        let sandy = MockWorker::start(vec![]).await;
+        let ctx = franky_ctx(
+            &[("r", &ricky.url, WorkerMode::Plain)],
+            &[("s", &sandy.url)],
+            1,
+            false,
+        );
+        let mut body = json!({
+            "input_ids": [1, 2, 3, 4],
+            "franky_sandy_input_ids": sandy_view,
+            "sampling_params": {"max_new_tokens": 4},
+        });
+        if let Some(key) = client_key {
+            body["extra_key"] = key.into();
+        }
+        let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let key = |body: Value| body["extra_key"].as_str().unwrap().to_owned();
+        (
+            key(ricky.captured_json().await),
+            key(sandy.captured_json().await),
+        )
+    }
+
+    let (ricky_first, sandy_first) = keys(json!([1, 9, 9, 4]), None).await;
+    let (ricky_same, _) = keys(json!([1, 9, 9, 4]), None).await;
+    let (ricky_other, _) = keys(json!([1, 8, 8, 4]), None).await;
+    let (ricky_keyed, _) = keys(json!([1, 9, 9, 4]), Some("eval:3")).await;
+
+    assert_eq!(ricky_first, sandy_first);
+    assert_eq!(ricky_first, ricky_same);
+    assert_ne!(ricky_first, ricky_other);
+    assert_eq!(ricky_keyed, format!("eval:3|{ricky_first}"));
+}
+
 /// Every block gives Sandy her own view and every token Ricky generated so far,
 /// and Ricky his view and the same tokens.
 #[tokio::test]

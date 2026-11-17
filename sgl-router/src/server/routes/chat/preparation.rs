@@ -22,7 +22,9 @@ use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
     lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
 };
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -352,6 +354,9 @@ impl PreparedRequest {
             None => true,
         };
         let sandy_input_ids = take_sandy_input_ids(&mut value)?;
+        if let Some(view) = &sandy_input_ids {
+            key_cache_by_view(&mut value, view);
+        }
         rewrite |= sandy_input_ids.is_some();
         let text_ids = tokenize_text(ctx, &model, &value);
         // Routing sees `text` as the engine's ids, whether or not they are forwarded.
@@ -1691,6 +1696,23 @@ fn take_sandy_input_ids(value: &mut Value) -> Result<Option<Vec<u32>>, ApiError>
     Ok(Some(view))
 }
 
+/// Ricky's cached KV holds what his readers added, which depends on Sandy's
+/// taps and so on her view as well as on his own tokens: requests that share
+/// his tokens but not her view must not share his cache. Appends a digest of
+/// her view to the request's `extra_key`, which SGLang's radix cache keys on,
+/// after any key of the client's own.
+fn key_cache_by_view(value: &mut Value, view: &[u32]) {
+    let mut hasher = DefaultHasher::new();
+    view.hash(&mut hasher);
+    let digest = format!("sandy-view:{:016x}", hasher.finish());
+    let fields = value.as_object_mut().expect("parsed as an object");
+    let key = match fields.get("extra_key").and_then(Value::as_str) {
+        Some(client) if !client.is_empty() => format!("{client}|{digest}"),
+        _ => digest,
+    };
+    fields.insert("extra_key".into(), Value::String(key));
+}
+
 pub(super) fn invalid_request() -> ApiError {
     ApiError::BadRequest("invalid request: body must be a JSON object".into())
 }
@@ -1698,6 +1720,23 @@ pub(super) fn invalid_request() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sandy_view_keys_the_cache_after_the_clients_own_key() {
+        let mut first = json!({"input_ids": [1, 2, 3]});
+        let mut same = json!({"input_ids": [1, 2, 3]});
+        let mut other = json!({"input_ids": [1, 2, 3]});
+        let mut keyed = json!({"input_ids": [1, 2, 3], "extra_key": "eval:7"});
+        key_cache_by_view(&mut first, &[1, 9, 3]);
+        key_cache_by_view(&mut same, &[1, 9, 3]);
+        key_cache_by_view(&mut other, &[1, 8, 3]);
+        key_cache_by_view(&mut keyed, &[1, 9, 3]);
+        let key = |value: &Value| value["extra_key"].as_str().unwrap().to_owned();
+        assert!(key(&first).starts_with("sandy-view:"));
+        assert_eq!(key(&first), key(&same));
+        assert_ne!(key(&first), key(&other));
+        assert_eq!(key(&keyed), format!("eval:7|{}", key(&first)));
+    }
     use crate::tokenizer::TokenizerRegistry;
     use std::sync::Arc;
 

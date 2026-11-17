@@ -510,6 +510,10 @@ Sandy may read is replaced one for one by filler in Ricky's view.
 - The router answers `400` for a view of another length, a prompt sent as
   `text`, or a view that is not one prompt's token ids.
 - No engine gets the field; Sandy gets her view as her `input_ids`.
+- Both legs get a digest of her view in `extra_key`, after any key the
+  client sent, because Ricky's cached KV holds what his readers added from
+  her taps: requests with one Ricky prompt under different views share no
+  cache, and requests under one view still share it.
 
 ## Chat rendering
 
