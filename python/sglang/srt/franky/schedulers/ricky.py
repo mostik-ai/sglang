@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
+from sglang.srt.franky.cache.own_tap_pages_metrics import FrankyOwnTapPagesMetrics
 from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
@@ -23,6 +24,9 @@ from sglang.srt.franky.transfer.receive_queue import FrankyReceiveQueue
 from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    STALL_METRICS_INTERVAL_S,
+)
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.runtime_context import (
     get_device,
@@ -64,6 +68,14 @@ class RickyScheduler(Scheduler):
         self.init_franky_receiving()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.init_franky_relay()
+        self.init_franky_own_tap_pages_metrics()
+
+    def init_franky_own_tap_pages_metrics(self) -> None:
+        self.franky_own_tap_pages_metrics = FrankyOwnTapPagesMetrics.of_scheduler(
+            own_pages=self.tp_worker.model_runner.franky_parts.tap_cache.own_pages,
+            metrics_collector_context=self.metrics_collector_context,
+            interval_seconds=STALL_METRICS_INTERVAL_S,
+        )
 
     def init_franky_chain_holds(self) -> None:
         self.franky_chain_holds = FrankyChainHolds.from_config(
@@ -171,6 +183,8 @@ class RickyScheduler(Scheduler):
     @override
     def ingest_requests(self, stop_at_pause: bool = False) -> List:
         self.franky_receive_queue.poll()
+        if self.franky_own_tap_pages_metrics is not None:
+            self.franky_own_tap_pages_metrics.maybe_publish()
         return super().ingest_requests(stop_at_pause=stop_at_pause)
 
     @override

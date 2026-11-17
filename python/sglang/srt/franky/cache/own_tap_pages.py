@@ -29,6 +29,7 @@ class FrankyOwnTapPages:
             first_page: pages before it hold the zeros that padded rows read.
         """
         self._free_pages = torch.arange(first_page, num_pages, dtype=torch.int32)
+        self.num_ownable_pages = num_pages - first_page
         self.page_table = torch.zeros(
             (num_request_rows, max_pages_per_request), dtype=torch.int32, device=device
         )

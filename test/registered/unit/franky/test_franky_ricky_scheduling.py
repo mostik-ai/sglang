@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     TreeLock,
 )
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -131,6 +132,7 @@ class _Req:
         self.skip_radix_cache_insert = False
         self.done = False
         self.copies_mamba_state = []
+        self.time_stats = SchedulerReqTimeStats()
 
     def init_next_round_input(self, tree_cache, cow_mamba=None):
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
@@ -294,6 +296,26 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
         self.assertEqual(messages, [FrankyTapsReady(request_rid="r", taps_ready=48)])
         self.assertEqual(req.franky.taps_ready, 48)
+
+    def test_a_request_notes_when_it_took_its_pages_and_its_first_chunk_could_run(self):
+        req = self._arrive(_Req("r", prompt_len=70, cached_prefix_len=32))
+        stats = req.time_stats
+        self.assertGreater(stats.franky_pages_taken_time, 0.0)
+        self.assertEqual(stats.franky_tap_len, 70)
+        self.assertEqual(stats.franky_taps_ready_time, 0.0)
+        self.receivers[0].landed_tokens = 48
+
+        self._step(other_stage={"landed:r": 48, "ok:r": 1})
+
+        self.assertGreater(stats.franky_taps_ready_time, stats.franky_pages_taken_time)
+
+    def test_a_request_without_a_room_can_run_once_it_took_its_pages(self):
+        req = self._arrive(_Req("r", prompt_len=64, room=False))
+        stats = req.time_stats
+        self.assertGreater(stats.franky_pages_taken_time, 0.0)
+        self.assertGreaterEqual(
+            stats.franky_taps_ready_time, stats.franky_pages_taken_time
+        )
 
     def test_an_arrival_that_does_not_fit_holds_back_the_ones_behind_it(self):
         self._arrive(_Req("first", prompt_len=512))
