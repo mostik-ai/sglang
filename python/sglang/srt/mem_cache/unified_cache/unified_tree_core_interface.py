@@ -189,6 +189,12 @@ class UnifiedTreeCoreInterface(ABC):
         """Hand the queued KV placement events to the Controller."""
         return self.kv_events.take()
 
+    def take_device_eviction_ages(self) -> list[tuple[float, int]]:
+        """Hand the Controller the (age seconds, tokens) of each device eviction
+        since the last call: how long that Full KV had been in device memory. A
+        core that does not stamp its nodes (the Rust one) reports none."""
+        return []
+
     @abstractmethod
     def reset(self) -> None:
         """Drop the entire tree and reinitialize empty state."""
