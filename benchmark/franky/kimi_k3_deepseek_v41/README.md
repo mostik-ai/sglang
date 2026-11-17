@@ -13,7 +13,13 @@ both models.
 ## Layout
 
 Two B300 nodes. Node A runs Sandy; node B runs Ricky as PD (prefill and decode,
-TP4 + EP4 each) and the router.
+TP4 + EP4 each) and the router. Every NIXL agent keeps a progress thread
+polling, and a Ricky prefill rank runs three (PD's KV, taps from Sandy, the relay
+to decode), so node B's eight schedulers keep about 27 cores busy even when idle.
+Run the pair on bare metal or plain containers: under a sandboxed runtime (gVisor,
+as on Modal) syscalls beside those pollers are slow (`getpid` took ~50 µs under
+load), and decode's HTTP process, which spends its time on per-token metrics and
+stream writes, then caps Franky near 3 requests/s whatever the prompt length.
 
 ```bash
 python seed_weights.py --config franky-config.json \
@@ -59,8 +65,10 @@ and 1.7x the prefix cache; deeper pipelines trade latency for more of both. Repl
 next stage holds that layer's attention-residual mix: set `SGLANG_PP_LAYER_PARTITION`
 to `47,46` (PP2), `24,23,22,24` (PP4) or `12,12,11,12,11,11,12,12` (PP8). Sandy
 refuses a split that ends a stage at a part's layer when it loads. For prefill-heavy
-traffic, run more Sandy engines per Ricky; the router spreads chats over them by
-cache.
+traffic, use PP8 x TP1, the K3 cookbook's Long-Context prefill strategy: it nearly
+doubles TP8's prefill throughput, close to the ~45k tokens/s one DeepSeek V4.1 PD
+node takes at 8k/1k c64, at ~220 ms more for a lone 1k request. Beyond that, run
+more Sandy engines per Ricky; the router spreads chats over them by cache.
 
 Ricky, node B (the cookbook's B300 High-Throughput flags per worker, with
 `--mem-fraction-static 0.85`: at SGLang's default a B300 decode worker runs out of
