@@ -54,6 +54,20 @@ class TapView(msgspec.Struct, frozen=True, kw_only=True):
     trtllm_workspace: Optional[torch.Tensor]
 
 
+class AlignedTaps(msgspec.Struct, frozen=True, kw_only=True):
+    """One encoder's tap at each row's own token, for the rows of one extend
+    forward.
+
+    Attributes:
+        taps: [rows, output_size], the tap Sandy wrote at each row's input token.
+        reads: [rows] bool, whether the row reads it: its input token is outside
+            its request's answers. CUDA graph padding and answer rows read none.
+    """
+
+    taps: torch.Tensor
+    reads: torch.Tensor
+
+
 class FrankyTapCache:
     """This rank's taps: one tensor per encoder, in pages like KV.
 
@@ -183,6 +197,45 @@ class FrankyTapCache:
             ),
             num_tokens=len(row_requests),
             trtllm_workspace=self._attention_workspace,
+        )
+
+    def aligned_taps(
+        self, *, encoder_id: int, forward_batch: ForwardBatch, num_rows: int
+    ) -> Optional[AlignedTaps]:
+        """Each row's tap at its own input token, which Sandy wrote on the KV slot
+        the row's chunk runs on: a prompt chunk runs only once its tokens' taps
+        landed. None in a decode forward, whose rows are all answer tokens.
+
+        Args:
+            num_rows: the forward's rows, CUDA graph padding included.
+        """
+        if forward_batch.forward_mode.is_decode_or_idle():
+            return None
+        req_pool_indices = _on_host(
+            forward_batch.req_pool_indices_cpu, forward_batch.req_pool_indices
+        )
+        first_rows = _on_host(
+            forward_batch.extend_prefix_lens_cpu, forward_batch.extend_prefix_lens
+        )
+        reads: list[bool] = []
+        for req_pool_index, first_row, count in zip(
+            req_pool_indices, first_rows, forward_batch.extend_seq_lens_cpu
+        ):
+            spans = self._generated_spans[req_pool_index]
+            if spans is None:
+                reads.extend([False] * count)
+                continue
+            tokens = torch.arange(first_row, first_row + count)
+            reads.extend((~spans.answer_tokens(tokens)).tolist())
+        reads.extend([False] * (num_rows - len(reads)))
+        device = self._decode_taps_to_read.device
+        slots = self.slots_of(kv_slots=forward_batch.out_cache_loc)
+        taps = self._buffers[encoder_id][slots]
+        if taps.shape[0] < num_rows:
+            padding = taps.new_zeros(num_rows - taps.shape[0], taps.shape[1])
+            taps = torch.cat([taps, padding])
+        return AlignedTaps(
+            taps=taps, reads=async_h2d(reads, dtype=torch.bool, device=device)
         )
 
     def _taps_to_read(

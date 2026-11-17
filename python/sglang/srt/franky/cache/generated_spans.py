@@ -60,6 +60,21 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
             taps = torch.where(inside, self._block_start(tokens, span.start), taps)
         return taps
 
+    def answer_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            tokens: indices of tokens of the request.
+        Returns:
+            Per token, whether it is a token of one of the answers.
+        """
+        inside = torch.zeros_like(tokens, dtype=torch.bool)
+        for span in self.spans:
+            here = tokens >= span.start
+            if span.end is not None:
+                here &= tokens < span.end
+            inside |= here
+        return inside
+
     def _block_start(self, tokens: torch.Tensor, answer_start: int) -> torch.Tensor:
         if self.block_size is None:
             return torch.full_like(tokens, answer_start)
