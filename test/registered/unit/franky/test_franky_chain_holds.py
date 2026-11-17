@@ -208,6 +208,69 @@ class TestFrankyChain(CustomTestCase):
                 franky_chain=third_block, rid="abc-3", prompt_len=16
             )
 
+    def test_with_sandy_on_its_own_a_block_names_sandys_start_of_each_earlier_block(
+        self,
+    ):
+        third_block = {"id": "abc", "block": 3, "block_size": 8}
+
+        chain = FrankyChain.from_request(
+            franky_chain={**third_block, "sandy_block_starts": [11, 18]},
+            rid="abc-3",
+            prompt_len=30,
+            sandy_input_len=25,
+        )
+
+        self.assertEqual(chain.sandy_block_starts, (11, 18))
+        self.assertEqual(chain.sandy_answer_start(sandy_input_len=25), 11)
+        for starts, sandy_input_len, problem in (
+            ([11], 25, "earlier blocks"),
+            ([18, 11], 25, "in order"),
+            ([11, 18], None, "come with franky_sandy_input_len"),
+            ([], 25, "needs Sandy's tokens before each earlier block"),
+            ([11, 26], 25, "before its earlier blocks"),
+        ):
+            with (
+                self.subTest(starts=starts, sandy_input_len=sandy_input_len),
+                self.assertRaisesRegex(ValueError, problem),
+            ):
+                FrankyChain.from_request(
+                    franky_chain={**third_block, "sandy_block_starts": starts},
+                    rid="abc-3",
+                    prompt_len=30,
+                    sandy_input_len=sandy_input_len,
+                )
+
+    def test_a_first_block_reads_sandys_input_as_its_answer_start(self):
+        chain = FrankyChain.from_request(
+            franky_chain={"id": "abc", "block_size": 8},
+            rid="abc-1",
+            prompt_len=12,
+            sandy_input_len=9,
+        )
+
+        self.assertEqual(chain.sandy_answer_start(sandy_input_len=9), 9)
+
+    def test_on_a_sandy_of_its_own_a_blocks_prompt_counts_sandys_tokens(self):
+        third_block = {"id": "abc", "block": 3, "block_size": 8}
+        starts = {"sandy_block_starts": [11, 13]}
+
+        # Sandy's tokens of two 8-token blocks may be fewer than Ricky's 16.
+        chain = FrankyChain.from_request(
+            franky_chain={**third_block, **starts},
+            rid="abc-3",
+            prompt_len=15,
+            on_sandy=True,
+        )
+
+        self.assertEqual(chain.sandy_block_starts, (11, 13))
+        with self.assertRaisesRegex(ValueError, "too short"):
+            FrankyChain.from_request(
+                franky_chain={**third_block, **starts},
+                rid="abc-3",
+                prompt_len=12,
+                on_sandy=True,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

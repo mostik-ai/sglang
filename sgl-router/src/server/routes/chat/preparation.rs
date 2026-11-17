@@ -600,6 +600,17 @@ impl PreparedRequest {
         Some(&tokens.ids)
     }
 
+    /// The ids of a Sandy that tokenizes on its own, which a chain of blocks
+    /// takes to send Sandy its own ids for every block.
+    pub(super) fn take_franky_sandy_ids(&mut self) -> Option<Vec<u32>> {
+        self.franky_sandy_ids.take()
+    }
+
+    /// Sends a Sandy that tokenizes on its own `ids` in place of Ricky's.
+    pub(super) fn set_franky_sandy_ids(&mut self, ids: Vec<u32>) {
+        self.franky_sandy_ids = Some(ids);
+    }
+
     /// Adds `spans` to the engine body as `franky_generated_spans`.
     pub(super) fn add_franky_generated_spans(
         &mut self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import sys
 from typing import TYPE_CHECKING, Optional
 
@@ -14,11 +15,18 @@ class GeneratedSpan(msgspec.Struct, frozen=True, kw_only=True):
     """Tokens ``[start, end)`` of a request that Ricky generated; ``end`` is None
     while the answer is still being generated. Sandy's tokens of the same answer
     start at ``sandy_start``, which is ``start`` when both sides tokenize alike.
+
+    Attributes:
+        sandy_block_starts: with blocks and a Sandy that tokenizes on its own,
+            Sandy's tokens before each block of the answer after its first; past
+            the last, every block reads as many. None when Sandy's copy of each
+            block is as long as Ricky's.
     """
 
     start: int
     sandy_start: int
     end: Optional[int] = None
+    sandy_block_starts: Optional[tuple[int, ...]] = None
 
 
 class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
@@ -28,7 +36,6 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
 
     Attributes:
         block_size: tokens per block, counted from each answer's start; None: one.
-            Blocks need both sides to tokenize alike.
     """
 
     spans: tuple[GeneratedSpan, ...]
@@ -58,9 +65,25 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
             )
             return FrankyGeneratedSpans(spans=(*earlier_answers, current))
         start = num_input_tokens - chain.num_generated_before
-        current = GeneratedSpan(start=start, sandy_start=start)
+        if sandy_input_len is None:
+            current = GeneratedSpan(start=start, sandy_start=start)
+            return FrankyGeneratedSpans(
+                spans=(*earlier_answers, current), block_size=chain.block_size
+            )
+        # Sandy tokenizes on its own: each block of the answer reads Sandy's tokens
+        # before it, this one all of Sandy's input. An earlier answer's blocks
+        # are not known in Sandy's tokens, so all of its tokens read the taps
+        # before it.
+        starts = (*chain.sandy_block_starts, sandy_input_len)
+        current = GeneratedSpan(
+            start=start, sandy_start=starts[0], sandy_block_starts=starts[1:]
+        )
+        earlier = tuple(
+            msgspec.structs.replace(span, sandy_block_starts=())
+            for span in earlier_answers
+        )
         return FrankyGeneratedSpans(
-            spans=(*earlier_answers, current), block_size=chain.block_size
+            spans=(*earlier, current), block_size=chain.block_size
         )
 
     def taps_to_read(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -90,7 +113,12 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
                 return span.start - 1
             if self.block_size is None:
                 continue
-            past_blocks = (num_taps - span.sandy_start) // self.block_size + 1
+            if span.sandy_block_starts is None:
+                past_blocks = (num_taps - span.sandy_start) // self.block_size + 1
+            else:
+                past_blocks = 1 + bisect.bisect_right(span.sandy_block_starts, num_taps)
+                if past_blocks > len(span.sandy_block_starts):
+                    continue
             first_token = span.start + past_blocks * self.block_size
             if span.end is None or first_token < span.end:
                 return first_token - 1
@@ -100,7 +128,14 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
         if self.block_size is None:
             return torch.full_like(tokens, span.sandy_start)
         blocks = (tokens - span.start).div(self.block_size, rounding_mode="floor")
-        return span.sandy_start + blocks * self.block_size
+        if span.sandy_block_starts is None:
+            return span.sandy_start + blocks * self.block_size
+        starts = torch.tensor(
+            (span.sandy_start, *span.sandy_block_starts),
+            dtype=tokens.dtype,
+            device=tokens.device,
+        )
+        return starts[blocks.clamp(min=0, max=len(starts) - 1)]
 
 
 def checked_earlier_answers(

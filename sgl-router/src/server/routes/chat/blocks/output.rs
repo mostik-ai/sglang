@@ -176,6 +176,11 @@ impl ChainOutput {
         &self.finished.output_ids
     }
 
+    /// The text every finished block generated, in order.
+    pub(super) fn generated_text(&self) -> &str {
+        &self.finished.text
+    }
+
     fn chain_frame(&mut self, mut frame: Value, is_delta: bool) -> Value {
         self.record(&frame, is_delta);
         let Value::Object(fields) = &mut frame else {
