@@ -62,10 +62,14 @@ class AlignedTaps(msgspec.Struct, frozen=True, kw_only=True):
         taps: [rows, output_size], the tap Sandy wrote at each row's input token.
         reads: [rows] bool, whether the row reads it: its input token is in its
             request's write ranges. Answer rows and CUDA graph padding read none.
+        positions: per row, its input token's index in its request; -1 for padding.
+        requests: per row, its request's index in the batch; -1 for padding.
     """
 
     taps: torch.Tensor
     reads: torch.Tensor
+    positions: list[int]
+    requests: list[int]
 
 
 class FrankyTapCache:
@@ -219,16 +223,23 @@ class FrankyTapCache:
             forward_batch.extend_prefix_lens_cpu, forward_batch.extend_prefix_lens
         )
         reads: list[bool] = []
-        for req_pool_index, first_row, count in zip(
-            req_pool_indices, first_rows, forward_batch.extend_seq_lens_cpu
+        positions: list[int] = []
+        requests: list[int] = []
+        for request, (req_pool_index, first_row, count) in enumerate(
+            zip(req_pool_indices, first_rows, forward_batch.extend_seq_lens_cpu)
         ):
+            positions.extend(range(first_row, first_row + count))
+            requests.extend([request] * count)
             spans = self._generated_spans[req_pool_index]
             if spans is None:
                 reads.extend([False] * count)
                 continue
             tokens = torch.arange(first_row, first_row + count)
             reads.extend(spans.written_tokens(tokens).tolist())
-        reads.extend([False] * (num_rows - len(reads)))
+        padding = num_rows - len(reads)
+        reads.extend([False] * padding)
+        positions.extend([-1] * padding)
+        requests.extend([-1] * padding)
         device = self._decode_taps_to_read.device
         slots = self.slots_of(kv_slots=forward_batch.out_cache_loc)
         taps = self._buffers[encoder_id][slots]
@@ -236,7 +247,10 @@ class FrankyTapCache:
             padding = taps.new_zeros(num_rows - taps.shape[0], taps.shape[1])
             taps = torch.cat([taps, padding])
         return AlignedTaps(
-            taps=taps, reads=async_h2d(reads, dtype=torch.bool, device=device)
+            taps=taps,
+            reads=async_h2d(reads, dtype=torch.bool, device=device),
+            positions=positions,
+            requests=requests,
         )
 
     def _taps_to_read(

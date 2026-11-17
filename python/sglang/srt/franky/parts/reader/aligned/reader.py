@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,8 +19,12 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+    from sglang.srt.franky.cache.tap_cache import AlignedTaps, FrankyTapCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+# Test-only: a file each prefill appends its reading rows' positions and taps to, so
+# a parity test can compare the engine's writes with the trainer's row for row.
+DUMP_VARIABLE = "SGLANG_FRANKY_ALIGNED_DUMP"
 
 
 class AlignedReader(Reader):
@@ -86,3 +92,26 @@ def _aligned_taps(
         return
     taps.copy_(aligned.taps)
     reads[:, 0] = aligned.reads.to(reads.dtype)
+    dump = os.environ.get(DUMP_VARIABLE)
+    if dump:
+        _dump(dump, aligned, forward_batch, encoder_id)
+
+
+def _dump(
+    path: str, aligned: AlignedTaps, forward_batch: ForwardBatch, encoder_id: int
+) -> None:
+    reading = aligned.reads.tolist()
+    rids = forward_batch.rids or []
+    by_request: dict[int, list[int]] = {}
+    for row, read in enumerate(reading):
+        if read:
+            by_request.setdefault(aligned.requests[row], []).append(row)
+    with open(path, "a") as file:  # test-only dump, never in a serving run
+        for request, rows in by_request.items():
+            record = {
+                "rid": rids[request] if request < len(rids) else None,
+                "encoder": encoder_id,
+                "positions": [aligned.positions[row] for row in rows],
+                "taps": aligned.taps[rows].float().tolist(),
+            }
+            file.write(json.dumps(record) + "\n")

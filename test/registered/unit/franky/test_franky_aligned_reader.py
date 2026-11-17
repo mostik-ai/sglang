@@ -92,6 +92,8 @@ class TestAlignedTaps(CustomTestCase):
         )
         self.assertEqual(aligned.taps[:6, 0].tolist(), [float(s) for s in slots])
         self.assertTrue(torch.all(aligned.taps[6:] == 0))
+        self.assertEqual(aligned.positions, [3, 4, 5, 6, 0, 1, -1, -1])
+        self.assertEqual(aligned.requests, [0, 0, 0, 0, 1, 1, -1, -1])
 
     def test_a_chain_block_recomputed_from_its_prompt_reads_only_its_prompt(self):
         cache = _tap_cache()
@@ -198,7 +200,11 @@ class TestAlignedReader(CustomTestCase):
         reads = torch.tensor([True, False, True, False])
 
         added = reader(
-            tap_cache=_FixedTaps(AlignedTaps(taps=taps, reads=reads)),
+            tap_cache=_FixedTaps(
+                AlignedTaps(
+                    taps=taps, reads=reads, positions=[0, 1, 2, 3], requests=[0] * 4
+                )
+            ),
             encoder_id=0,
             residual=torch.zeros(4, _RICKY_HIDDEN),
             forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
