@@ -18,9 +18,9 @@ if TYPE_CHECKING:
 class FrankyRelayReceiver(NixlKVReceiver):
     """PD's KV receiver on Ricky decode that also receives the relayed taps, and
     ends only when both have landed: in the tap pages of the KV pages it
-    registers, or in the tap pages its request reserved when requests own them.
-    Until that reservation, it reports the handshake unfinished, so PD prepares
-    no KV for the request.
+    registers, or in the tap pages its request reserved when requests own them,
+    past the whole pages its chain's last block left it. Until that reservation,
+    it reports the handshake unfinished, so PD prepares no KV for the request.
     """
 
     kv_mgr: FrankyRelayManager
@@ -57,11 +57,14 @@ class FrankyRelayReceiver(NixlKVReceiver):
         tap_pages = self._tap_pages(kv_indices)
         if tap_pages is None:
             return
+        taps_held = self._taps_held()
+        page_size = self.kv_mgr.tap_cache.page_size
         self.tap_receiver = FrankyReceiver(
             manager=self.kv_mgr.tap_relay,
             franky_room=self._relay_room(),
-            tap_pages=tap_pages,
-            num_tokens=len(tap_pages) * self.kv_mgr.tap_cache.page_size,
+            tap_pages=tap_pages[taps_held // page_size :],
+            num_tokens=len(tap_pages) * page_size,
+            prefix_len=taps_held,
         )
         self.kv_mgr.track_tap_receiver(self.bootstrap_room, self.tap_receiver)
 
@@ -105,6 +108,12 @@ class FrankyRelayReceiver(NixlKVReceiver):
             return self.kv_mgr.tap_cache.pages_of_kv_pages(kv_pages=kv_indices)
         pages = own_taps.pages_of(room=self.bootstrap_room)
         return None if pages is None else pages.numpy()
+
+    def _taps_held(self) -> int:
+        own_taps = self.kv_mgr.own_taps
+        if own_taps is None:
+            return 0
+        return own_taps.taps_held_of(room=self.bootstrap_room)
 
     def _relay_room(self) -> FrankyRoom:
         return FrankyRoom(

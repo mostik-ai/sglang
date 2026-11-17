@@ -129,8 +129,13 @@ Blocks: with `--franky-block-size 256` the router runs each answer as blocks of
 Each block sends Sandy its own rendering of the chat plus its own tokens of the
 answer so far, tokenized block by block, and tells Ricky where each block starts
 in Sandy's tokens. Sandy's cache keeps each block's prompt, so a block costs Sandy
-only its new text; Ricky prefill holds the chain's prefix between blocks, while
-decode receives the whole context's KV and all of Sandy's taps again each block.
+only its new text. Between blocks Ricky prefill keeps the chain's prefix and tap
+pages, and decode its tap pages, so Sandy sends a block only the taps past the
+last block's whole pages and prefill relays decode only those; decode still
+receives the whole context's KV each block, as it keeps no prefix cache. Chains
+waiting for their next block hold tap pages too, so a small
+`--franky-tap-pool-ratio` fits fewer of them; a request short of tap pages
+takes those of the chain whose block ended last, as it comes back last.
 
 Send a few chats through the router before taking traffic: the first Franky
 requests open the NIXL connections and compile kernels (about 10 s each).

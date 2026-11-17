@@ -7,6 +7,8 @@ from typing_extensions import override
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.own_tap_reservations import FrankyOwnTapReservations
+from sglang.srt.franky.chains.holds import FrankyChainHolds
+from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
 from sglang.srt.managers.scheduler import Scheduler
@@ -20,14 +22,18 @@ if TYPE_CHECKING:
 class RickyDecodeScheduler(Scheduler):
     """A Ricky PD decode engine. Each request's taps come from Ricky prefill in the
     room of its KV, and PD hands a request to decode only once both landed. When
-    requests own their tap pages, each reserves them before PD prepares its KV.
+    requests own their tap pages, each reserves them before PD prepares its KV,
+    and a chain's next block takes over the pages of its last block.
     """
 
     @override
     def init_request_dispatcher(self) -> None:
         super().init_request_dispatcher()
         self._request_dispatcher += TypeBasedDispatcher(
-            [(FrankyEndChainReq, self._handle_end_chain)]
+            [
+                (FrankyHoldExpired, self._handle_hold_expired),
+                (FrankyEndChainReq, self._handle_end_chain),
+            ]
         )
 
     @override
@@ -38,13 +44,21 @@ class RickyDecodeScheduler(Scheduler):
     def init_franky_relay(self) -> None:
         """PD decode's end of the tap relay from Ricky prefill: this rank's tap
         manager, given to PD's KV manager so each KV room also brings its taps,
-        and the reservations of requests that own their tap pages.
+        the reservations of requests that own their tap pages, and the chain
+        holds that keep those pages between two blocks.
         """
         parallel = get_parallel()
         tap_cache = self.tp_worker.model_runner.franky_parts.tap_cache
+        self.franky_chain_holds = FrankyChainHolds.from_config(
+            tree_cache=None,
+            max_total_num_tokens=self.max_total_num_tokens,
+            own_pages=tap_cache.own_pages,
+        )
         self.franky_own_taps = (
             FrankyOwnTapReservations(
-                own_pages=tap_cache.own_pages, page_size=tap_cache.page_size
+                own_pages=tap_cache.own_pages,
+                page_size=tap_cache.page_size,
+                chain_holds=self.franky_chain_holds,
             )
             if tap_cache.own_pages is not None
             else None
@@ -70,6 +84,17 @@ class RickyDecodeScheduler(Scheduler):
         if self.franky_own_taps is not None:
             self.franky_own_taps.poll()
         return super().ingest_requests(stop_at_pause=stop_at_pause)
+
+    @override
+    def _poll_timeout_aborts(self) -> List:
+        return (
+            super()._poll_timeout_aborts() + self.franky_chain_holds.expired_messages()
+        )
+
+    @override
+    def flush_cache(self, empty_cache: bool = True) -> bool:
+        self.franky_chain_holds.release_all()
+        return super().flush_cache(empty_cache=empty_cache)
 
     @override
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False) -> None:
@@ -122,5 +147,9 @@ class RickyDecodeScheduler(Scheduler):
                 req_pool_indices=list(req_pool_indices), pages=list(pages)
             )
 
+    def _handle_hold_expired(self, message: FrankyHoldExpired) -> None:
+        self.franky_chain_holds.on_hold_expired(message=message)
+
     def _handle_end_chain(self, recv_req: FrankyEndChainReq) -> None:
         self.abort_request(AbortReq(rid=recv_req.chain_id))
+        self.franky_chain_holds.release(chain_id=recv_req.chain_id)

@@ -41,8 +41,9 @@ class Franky(msgspec.Struct):
     franky_chain_hold_seconds: A[
         float,
         "How long a sandy or ricky engine keeps a chain's cached prefix locked "
-        "after one of its blocks, waiting for the next block. Sandy's must outlast "
-        "a block's decode on ricky. Default is 60.",
+        "after one of its blocks, waiting for the next block; a ricky whose sandy "
+        "tokenizes on its own also keeps the block's tap pages. Sandy's must "
+        "outlast a block's decode on ricky. Default is 60.",
     ] = 60.0
     franky_chain_hold_ratio: A[
         float,
@@ -52,7 +53,9 @@ class Franky(msgspec.Struct):
     franky_tap_pool_ratio: A[
         float,
         "Taps a ricky holds per KV slot when its sandy tokenizes on its own. "
-        "Requests then hold taps only while they run, but the prefix cache keeps "
-        "their KV after them, so a PD prefill engine fits far more KV with a "
-        "lower ratio. Default is 1: taps for every KV slot.",
+        "Requests then hold taps only while they run, and chains between two "
+        "blocks, but the prefix cache keeps their KV after them, so a PD prefill "
+        "engine fits far more KV with a lower ratio. A request short of tap pages "
+        "takes those of the chain whose block ended last. Default is 1: taps for "
+        "every KV slot.",
     ] = 1.0
