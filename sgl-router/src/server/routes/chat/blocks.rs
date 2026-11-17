@@ -6,7 +6,9 @@ mod output;
 
 use super::forward::{RequestDurationGuard, SelectedWorkers};
 use super::openai::sse_data;
-use super::preparation::{model_openai_settings, PreparedRequest, GENERATE_PATH};
+use super::preparation::{
+    key_cache_by_view, model_openai_settings, PreparedRequest, GENERATE_PATH,
+};
 use super::{serves_franky, ModelRouting};
 use crate::discovery::ModelId;
 use crate::server::app_context::AppContext;
@@ -256,7 +258,11 @@ impl BlockChain {
         if !self.output.generated_ids().is_empty() && body.contains_key("logprob_start_len") {
             body.insert("logprob_start_len".into(), (-1).into());
         }
-        Value::Object(body)
+        let mut body = Value::Object(body);
+        if let Some(sandy) = &self.sandy_prompt_ids {
+            key_cache_by_view(&mut body, sandy);
+        }
+        body
     }
 
     async fn collect(

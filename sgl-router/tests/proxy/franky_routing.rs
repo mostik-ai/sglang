@@ -689,6 +689,43 @@ async fn every_block_gives_sandy_her_view_and_rickys_tokens_so_far() {
     }
 }
 
+/// Every block of a chain carries one cache key, made from Sandy's view of the
+/// prompt behind the client's own key, so a block reuses the KV its chain's
+/// earlier blocks left; another view of the same prompt gets another key.
+#[tokio::test]
+async fn every_block_of_a_chain_keys_the_cache_by_the_prompts_view() {
+    async fn block_keys(sandy_view: Value) -> Vec<(Value, Value)> {
+        let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+        let body = json!({
+            "input_ids": [1, 2, 3],
+            "franky_sandy_input_ids": sandy_view,
+            "extra_key": "rollout:5",
+            "sampling_params": {"max_new_tokens": 100},
+        });
+        let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let (ricky_requests, sandy_requests) = (ricky.requests(), sandy.requests());
+        assert_eq!(ricky_requests.len(), 3);
+        ricky_requests
+            .iter()
+            .zip(&sandy_requests)
+            .map(|(r, s)| (r["extra_key"].clone(), s["extra_key"].clone()))
+            .collect()
+    }
+
+    let matched = block_keys(json!([7, 8, 9])).await;
+    let foreign = block_keys(json!([7, 6, 9])).await;
+
+    let (first, _) = &matched[0];
+    let key = first.as_str().unwrap();
+    assert!(key.starts_with("rollout:5|sandy-view:"), "{key}");
+    assert_eq!(key.matches("sandy-view:").count(), 1, "{key}");
+    for (ricky_key, sandy_key) in &matched {
+        assert_eq!((ricky_key, sandy_key), (first, first));
+    }
+    assert!(foreign.iter().all(|(ricky_key, _)| ricky_key != first));
+}
+
 /// A view of another length, a prompt sent as text, or a view that is not token
 /// ids is refused before any engine sees it.
 #[tokio::test]

@@ -354,7 +354,11 @@ impl PreparedRequest {
             None => true,
         };
         let sandy_input_ids = take_sandy_input_ids(&mut value)?;
-        if let Some(view) = &sandy_input_ids {
+        // a chain's block already carries its chain's key: its view also holds the tokens generated so far
+        if let Some(view) = sandy_input_ids
+            .as_ref()
+            .filter(|_| value.get("franky_chain").is_none())
+        {
             key_cache_by_view(&mut value, view);
         }
         rewrite |= sandy_input_ids.is_some();
@@ -1699,14 +1703,17 @@ fn take_sandy_input_ids(value: &mut Value) -> Result<Option<Vec<u32>>, ApiError>
 /// Ricky's cached KV holds what his readers added, which depends on Sandy's
 /// taps and so on her view as well as on his own tokens: requests that share
 /// his tokens but not her view must not share his cache. Appends a digest of
-/// her view to the request's `extra_key`, which SGLang's radix cache keys on,
-/// after any key of the client's own.
-fn key_cache_by_view(value: &mut Value, view: &[u32]) {
+/// her view of the prompt to the request's `extra_key`, which SGLang's radix
+/// cache keys on, after any key of the client's own. A chain keys every block
+/// by its prompt's view, so that its blocks share the cache with each other.
+pub(super) fn key_cache_by_view(value: &mut Value, view: &[u32]) {
     let mut hasher = DefaultHasher::new();
     view.hash(&mut hasher);
     let digest = format!("sandy-view:{:016x}", hasher.finish());
     let fields = value.as_object_mut().expect("parsed as an object");
     let key = match fields.get("extra_key").and_then(Value::as_str) {
+        // a chain's blocks start from its prepared request, which is keyed already
+        Some(keyed) if keyed == digest || keyed.ends_with(&format!("|{digest}")) => return,
         Some(client) if !client.is_empty() => format!("{client}|{digest}"),
         _ => digest,
     };
@@ -1736,6 +1743,9 @@ mod tests {
         assert_eq!(key(&first), key(&same));
         assert_ne!(key(&first), key(&other));
         assert_eq!(key(&keyed), format!("eval:7|{}", key(&first)));
+        let mut twice = keyed.clone();
+        key_cache_by_view(&mut twice, &[1, 9, 3]);
+        assert_eq!(key(&twice), key(&keyed));
     }
     use crate::tokenizer::TokenizerRegistry;
     use std::sync::Arc;
