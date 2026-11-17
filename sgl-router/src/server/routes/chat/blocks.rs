@@ -21,6 +21,7 @@ use futures::StreamExt;
 use output::ChainOutput;
 use serde_json::{json, Map, Value};
 use sglang_processor::openai::Responder;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -33,6 +34,8 @@ const FIELDS_BLOCKS_CANNOT_JOIN: [&str; 4] = [
     "session_params",
 ];
 const DONE_EVENT: &[u8] = b"data: [DONE]\n\n";
+/// The request field that asks for a presence penalty over the whole answer so far.
+const PRESENCE_FIELD: &str = "franky_presence_over_blocks";
 const EVENT_BUFFER: usize = 64;
 
 type Events = mpsc::Sender<Result<Bytes, axum::Error>>;
@@ -65,6 +68,12 @@ pub(super) struct BlockChain {
     earlier_answers: Vec<[usize; 2]>,
     /// Where the current answer starts among the generated tokens.
     answer_start: usize,
+    /// The presence penalty over every token the chain has generated so far, when the client
+    /// asked for one with `franky_presence_over_blocks`: SGLang counts a request's penalty only
+    /// over its own output and each block is a new request, so every block gets it as a logit
+    /// bias on the tokens of the blocks before it; a token new in a block is penalized from the
+    /// next block on.
+    presence: Option<f64>,
     streaming: bool,
     responder: Option<Responder>,
     output: ChainOutput,
@@ -115,6 +124,7 @@ impl BlockChain {
         body.remove("text");
         let sandy_prompt_ids = request.sandy_input_ids.take();
         let boundary = boundary_of(ctx, &body)?;
+        let presence = presence_of(&mut body)?;
         let client_rid = body.remove("rid");
         let total_limit = body
             .get("sampling_params")
@@ -140,6 +150,7 @@ impl BlockChain {
             boundary,
             earlier_answers: Vec::new(),
             answer_start: 0,
+            presence,
             streaming: request.streaming,
             responder: request.responder.take(),
             workers: None,
@@ -239,6 +250,26 @@ impl BlockChain {
         );
         let sampling = body.entry("sampling_params").or_insert_with(|| json!({}));
         sampling["max_new_tokens"] = max_new_tokens.into();
+        if let Some(penalty) = self.presence {
+            let seen: BTreeSet<u64> = self
+                .output
+                .generated_ids()
+                .iter()
+                .filter_map(Value::as_u64)
+                .collect();
+            if !seen.is_empty() {
+                let bias = sampling
+                    .as_object_mut()
+                    .map(|params| params.entry("logit_bias").or_insert_with(|| json!({})));
+                if let Some(Value::Object(bias)) = bias {
+                    for token in seen {
+                        let key = token.to_string();
+                        let client = bias.get(&key).and_then(Value::as_f64).unwrap_or(0.0);
+                        bias.insert(key, json!(client - penalty));
+                    }
+                }
+            }
+        }
         if let Some(boundary) = self.boundary {
             let stops = sampling
                 .as_object_mut()
@@ -470,6 +501,32 @@ fn boundary_of(ctx: &AppContext, body: &Map<String, Value>) -> Result<Option<u32
         ));
     }
     Ok(Some(boundary))
+}
+
+/// The presence penalty the client asked to carry across blocks, taken out of the body so that no
+/// engine sees the field.
+///
+/// Errors: `ApiError::BadRequest` for a penalty that is not a non-negative number, or one asked
+/// beside SGLang's own `presence_penalty`, which would penalize a block's own tokens twice.
+fn presence_of(body: &mut Map<String, Value>) -> Result<Option<f64>, ApiError> {
+    let Some(value) = body.remove(PRESENCE_FIELD) else {
+        return Ok(None);
+    };
+    let Some(penalty) = value.as_f64().filter(|penalty| *penalty >= 0.0) else {
+        return Err(refused(&format!(
+            "{PRESENCE_FIELD} that is not a non-negative number"
+        )));
+    };
+    let own = body
+        .get("sampling_params")
+        .and_then(|params| params.get("presence_penalty"))
+        .and_then(Value::as_f64);
+    if own.is_some_and(|own| own != 0.0) {
+        return Err(refused(&format!(
+            "{PRESENCE_FIELD} beside a presence_penalty"
+        )));
+    }
+    Ok(Some(penalty))
 }
 
 fn check_blocks_can_serve(body: &Map<String, Value>) -> Result<(), ApiError> {
