@@ -74,6 +74,19 @@ class TrtllmWorkspace(msgspec.Struct, frozen=True, kw_only=True):
     counters: torch.Tensor
 
 
+class RowMasks(msgspec.Struct, frozen=True, kw_only=True):
+    """Which rows of a forward read taps, padding rows reading none, made once
+    for all of its readers.
+
+    Attributes:
+        no_taps: [rows] bool, rows that read no taps.
+        has_taps: [rows, 1], 1 for rows that read taps and 0 for the rest.
+    """
+
+    no_taps: torch.Tensor
+    has_taps: torch.Tensor
+
+
 class TapView(msgspec.Struct, frozen=True, kw_only=True):
     """One encoder's taps for the rows of one forward, as the paged attention
     kernels take them.
@@ -88,6 +101,8 @@ class TapView(msgspec.Struct, frozen=True, kw_only=True):
         trtllm_workspace: TRT-LLM's workspace on Blackwell; None where FA3 runs.
         row_blocks: the prefill kernel's row blocks when the rows are every
             row of the forward, whole requests one after another; else None.
+        row_masks: when the rows are every row of the forward, the
+            ``RowMasks`` its readers share, padding rows included; else None.
     """
 
     taps: torch.Tensor
@@ -97,6 +112,7 @@ class TapView(msgspec.Struct, frozen=True, kw_only=True):
     num_tokens: int
     trtllm_workspace: Optional[TrtllmWorkspace]
     row_blocks: Optional[torch.Tensor] = None
+    row_masks: Optional[RowMasks] = None
 
     @property
     def page_table(self) -> torch.Tensor:
@@ -255,6 +271,8 @@ class FrankyTapCache:
         encoder_id: int,
         forward_batch: ForwardBatch,
         rows: Optional[torch.Tensor] = None,
+        padded_rows: Optional[int] = None,
+        mask_dtype: Optional[torch.dtype] = None,
     ) -> TapView:
         """Each row's query reads the taps that its request's spans give the token
         the row makes.
@@ -263,10 +281,18 @@ class FrankyTapCache:
             rows: the rows of ``forward_batch`` the queries belong to, as indices
                 into them; None for all of them. An index past the last row reads
                 nothing.
+            padded_rows, mask_dtype: with ``rows`` None, the rows the readers'
+                outputs have, padding included, and the dtype of their
+                ``has_taps``; the view then carries the forward's ``RowMasks``.
         """
         plan = self._plan_of(forward_batch, encoder_id=encoder_id)
         if rows is None:
             return TapView(
+                row_masks=(
+                    None
+                    if padded_rows is None
+                    else plan.row_masks(padded_rows=padded_rows, dtype=mask_dtype)
+                ),
                 taps=self._paged_taps(encoder_id),
                 request_pages=(
                     plan.request_pages[: plan.num_rows]
@@ -395,6 +421,22 @@ class _RowPlan(msgspec.Struct, frozen=True, kw_only=True):
     taps_to_read: torch.Tensor
     num_rows: int
     row_blocks: Optional[torch.Tensor] = None
+    made_masks: dict[tuple[int, torch.dtype], RowMasks] = msgspec.field(
+        default_factory=dict
+    )
+
+    def row_masks(self, *, padded_rows: int, dtype: torch.dtype) -> RowMasks:
+        key = (padded_rows, dtype)
+        if key not in self.made_masks:
+            num_rows = min(self.num_rows, padded_rows)
+            no_taps = torch.ones(
+                padded_rows, dtype=torch.bool, device=self.taps_to_read.device
+            )
+            no_taps[:num_rows] = self.taps_to_read[:num_rows] <= 0
+            self.made_masks[key] = RowMasks(
+                no_taps=no_taps, has_taps=(~no_taps).to(dtype)[:, None]
+            )
+        return self.made_masks[key]
 
 
 def _to_device(host: torch.Tensor, *, device: torch.device) -> torch.Tensor:

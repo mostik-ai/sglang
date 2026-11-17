@@ -101,7 +101,11 @@ def _attend_taps(
         attended,
         has_taps,
         view=tap_cache.view(
-            encoder_id=encoder_id, forward_batch=forward_batch, rows=rows
+            encoder_id=encoder_id,
+            forward_batch=forward_batch,
+            rows=rows,
+            padded_rows=attended.shape[0],
+            mask_dtype=has_taps.dtype,
         ),
     )
 
@@ -116,6 +120,13 @@ def attend_taps(
     """Write each row's attended taps into ``attended``, and 1 or 0 into
     ``has_taps`` by whether it read any.
     """
+    if view.row_masks is not None:
+        has_taps.copy_(view.row_masks.has_taps)
+        if view.num_tokens > 0:
+            rows = slice(0, view.num_tokens)
+            _attend(queries[rows], view, out=attended[rows])
+        attended.masked_fill_(view.row_masks.no_taps[:, None, None], 0)
+        return
     padding = slice(view.num_tokens, None)
     attended[padding].zero_()
     has_taps[padding].zero_()
