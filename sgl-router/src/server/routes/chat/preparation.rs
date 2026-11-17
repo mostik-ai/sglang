@@ -354,6 +354,9 @@ impl PreparedRequest {
             None => true,
         };
         let sandy_input_ids = take_sandy_input_ids(&mut value)?;
+        if let Some(view) = &sandy_input_ids {
+            add_write_ranges(&mut value, view);
+        }
         // a chain's block already carries its chain's key: its view also holds the tokens generated so far
         if let Some(view) = sandy_input_ids
             .as_ref()
@@ -1700,6 +1703,30 @@ fn take_sandy_input_ids(value: &mut Value) -> Result<Option<Vec<u32>>, ApiError>
     Ok(Some(view))
 }
 
+/// Ricky's aligned readers write only where Sandy's view differs from his own
+/// tokens. Lists those positions as `[start, end)` runs of `input_ids` in
+/// `franky_write_ranges`, which his engine takes its writes from; a body whose
+/// views agree gets none. Views of one length come from [`take_sandy_input_ids`].
+fn add_write_ranges(value: &mut Value, view: &[u32]) {
+    let fields = value.as_object_mut().expect("parsed as an object");
+    let Some(Value::Array(ids)) = fields.get("input_ids") else {
+        return;
+    };
+    let mut ranges: Vec<[usize; 2]> = Vec::new();
+    for (position, (ricky, &sandy)) in ids.iter().zip(view).enumerate() {
+        if ricky.as_u64() == Some(u64::from(sandy)) {
+            continue;
+        }
+        match ranges.last_mut() {
+            Some(last) if last[1] == position => last[1] = position + 1,
+            _ => ranges.push([position, position + 1]),
+        }
+    }
+    if !ranges.is_empty() {
+        fields.insert("franky_write_ranges".into(), json!(ranges));
+    }
+}
+
 /// Ricky's cached KV holds what his readers added, which depends on Sandy's
 /// taps and so on her view as well as on his own tokens: requests that share
 /// his tokens but not her view must not share his cache. Appends a digest of
@@ -1727,6 +1754,16 @@ pub(super) fn invalid_request() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ricky_writes_only_where_sandys_view_differs_from_his_tokens() {
+        let mut parted = json!({"input_ids": [1, 220, 220, 4, 220, 6]});
+        let mut same = json!({"input_ids": [1, 2, 3]});
+        add_write_ranges(&mut parted, &[1, 7, 8, 4, 9, 6]);
+        add_write_ranges(&mut same, &[1, 2, 3]);
+        assert_eq!(parted["franky_write_ranges"], json!([[1, 3], [4, 5]]));
+        assert!(same.get("franky_write_ranges").is_none());
+    }
 
     #[test]
     fn a_sandy_view_keys_the_cache_after_the_clients_own_key() {

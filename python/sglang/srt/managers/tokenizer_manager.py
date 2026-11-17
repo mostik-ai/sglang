@@ -71,7 +71,10 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
-from sglang.srt.franky.cache.generated_spans import checked_earlier_answers
+from sglang.srt.franky.cache.generated_spans import (
+    checked_earlier_answers,
+    checked_write_ranges,
+)
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.layers.joint_schema_head import (
@@ -1702,6 +1705,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if obj.franky_generated_spans is not None
                 else ()
             )
+            franky_write_ranges = (
+                checked_write_ranges(
+                    obj.franky_write_ranges, prompt_length=len(input_ids_arr or ())
+                )
+                if obj.franky_write_ranges is not None
+                else ()
+            )
 
             tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
@@ -1728,6 +1738,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ),
                 franky_chain=franky_chain,
                 franky_generated_spans=franky_generated_spans,
+                franky_write_ranges=franky_write_ranges,
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,

@@ -70,6 +70,7 @@ class RickyDecodeScheduler(Scheduler):
                             earlier_answers=req.franky_generated_spans,
                             num_input_tokens=len(req.origin_input_ids),
                             chain=req.franky_chain,
+                            write_ranges=req.franky_write_ranges,
                         )
                         if req.franky_room is not None
                         else None

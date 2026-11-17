@@ -1,7 +1,8 @@
-"""An aligned reader writes into Ricky's prompt: each row whose input token is
-outside its request's answers adds a map of the tap Sandy wrote at that same
-token. Every other row - answer tokens, requests without taps, CUDA graph padding,
-every decode row - must add exactly zero, bias included.
+"""An aligned reader writes into Ricky's prompt where Sandy's view differs from
+it: each row whose input token is in its request's write ranges adds a map of the
+tap Sandy wrote at that same token. Every other row - prompt rows outside the
+ranges, answer tokens, requests without taps, CUDA graph padding, every decode
+row - must add exactly zero, bias included.
 """
 
 import unittest
@@ -14,6 +15,7 @@ from torch.nn import functional
 from sglang.srt.franky.cache.generated_spans import (
     FrankyGeneratedSpans,
     GeneratedSpan,
+    checked_write_ranges,
 )
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, AlignedTaps, FrankyTapCache
 from sglang.srt.franky.config import FrankyConfig
@@ -70,7 +72,9 @@ class TestAlignedTaps(CustomTestCase):
         cache.set_generated_spans(
             req_pool_indices=[1, 2],
             generated_spans=[
-                FrankyGeneratedSpans(spans=(GeneratedSpan(start=5),)),
+                FrankyGeneratedSpans(
+                    spans=(GeneratedSpan(start=5),), write_ranges=((2, 5),)
+                ),
                 None,
             ],
             num_input_tokens=[5, 0],
@@ -93,7 +97,11 @@ class TestAlignedTaps(CustomTestCase):
         cache.set_generated_spans(
             req_pool_indices=[1],
             generated_spans=[
-                FrankyGeneratedSpans(spans=(GeneratedSpan(start=40),), block_size=32)
+                FrankyGeneratedSpans(
+                    spans=(GeneratedSpan(start=40),),
+                    block_size=32,
+                    write_ranges=((30, 40),),
+                )
             ],
             num_input_tokens=[50],
         )
@@ -108,7 +116,8 @@ class TestAlignedTaps(CustomTestCase):
     def test_earlier_answers_read_none_and_the_turn_between_them_reads(self):
         cache = _tap_cache()
         spans = FrankyGeneratedSpans(
-            spans=(GeneratedSpan(start=3, end=6), GeneratedSpan(start=8))
+            spans=(GeneratedSpan(start=3, end=6), GeneratedSpan(start=8)),
+            write_ranges=((0, 3), (6, 8)),
         )
         cache.set_generated_spans(
             req_pool_indices=[1], generated_spans=[spans], num_input_tokens=[8]
@@ -124,6 +133,24 @@ class TestAlignedTaps(CustomTestCase):
             [True, True, True, False, False, False, True, True, False, False],
         )
 
+    def test_a_prompt_row_outside_the_write_ranges_reads_none(self):
+        cache = _tap_cache()
+        spans = FrankyGeneratedSpans(
+            spans=(GeneratedSpan(start=6),), write_ranges=((1, 2), (4, 5))
+        )
+        cache.set_generated_spans(
+            req_pool_indices=[1], generated_spans=[spans], num_input_tokens=[6]
+        )
+        batch = _extend(
+            requests=[1], prefix_lens=[0], counts=[6], slots=list(range(10, 16))
+        )
+
+        aligned = cache.aligned_taps(encoder_id=0, forward_batch=batch, num_rows=6)
+
+        self.assertEqual(
+            aligned.reads.tolist(), [False, True, False, False, True, False]
+        )
+
     def test_a_decode_forward_reads_none(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE, req_pool_indices=torch.tensor([1])
@@ -132,6 +159,18 @@ class TestAlignedTaps(CustomTestCase):
         self.assertIsNone(
             _tap_cache().aligned_taps(encoder_id=0, forward_batch=batch, num_rows=1)
         )
+
+
+class TestWriteRanges(CustomTestCase):
+    def test_runs_in_order_inside_the_prompt_are_kept(self):
+        self.assertEqual(
+            checked_write_ranges([[0, 2], [5, 9]], prompt_length=9), ((0, 2), (5, 9))
+        )
+
+    def test_runs_out_of_order_empty_or_past_the_prompt_are_refused(self):
+        for ranges in ([[5, 9], [0, 2]], [[2, 2]], [[3, 10]], [[1, 2, 3]]):
+            with self.assertRaises(ValueError):
+                checked_write_ranges(ranges, prompt_length=9)
 
 
 class _FixedTaps:

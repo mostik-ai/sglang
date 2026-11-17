@@ -23,10 +23,13 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
 
     Attributes:
         block_size: tokens per block, counted from each answer's start; None: one.
+        write_ranges: the [start, end) runs of the prompt where Sandy's view
+            differs from it, which an aligned reader writes at.
     """
 
     spans: tuple[GeneratedSpan, ...]
     block_size: Optional[int] = None
+    write_ranges: tuple[tuple[int, int], ...] = ()
 
     @staticmethod
     def of(
@@ -34,15 +37,20 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
         earlier_answers: tuple[GeneratedSpan, ...],
         num_input_tokens: int,
         chain: Optional[FrankyChain],
+        write_ranges: tuple[tuple[int, int], ...] = (),
     ) -> FrankyGeneratedSpans:
         """The spans of a request whose new answer starts after the chain's
         earlier blocks, or right after its input without a chain."""
         if chain is None:
             current = GeneratedSpan(start=num_input_tokens)
-            return FrankyGeneratedSpans(spans=(*earlier_answers, current))
+            return FrankyGeneratedSpans(
+                spans=(*earlier_answers, current), write_ranges=write_ranges
+            )
         current = GeneratedSpan(start=num_input_tokens - chain.num_generated_before)
         return FrankyGeneratedSpans(
-            spans=(*earlier_answers, current), block_size=chain.block_size
+            spans=(*earlier_answers, current),
+            block_size=chain.block_size,
+            write_ranges=write_ranges,
         )
 
     def taps_to_read(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -59,6 +67,19 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
                 inside &= tokens < span.end
             taps = torch.where(inside, self._block_start(tokens, span.start), taps)
         return taps
+
+    def written_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            tokens: indices of tokens of the request.
+        Returns:
+            Per token, whether an aligned reader writes at it: inside a write
+            range and outside every answer.
+        """
+        inside = torch.zeros_like(tokens, dtype=torch.bool)
+        for start, end in self.write_ranges:
+            inside |= (tokens >= start) & (tokens < end)
+        return inside & ~self.answer_tokens(tokens)
 
     def answer_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         """
@@ -107,3 +128,25 @@ def checked_earlier_answers(
             f"{answers}."
         )
     return tuple(GeneratedSpan(start=start, end=end) for start, end in answers)
+
+
+def checked_write_ranges(
+    ranges: list[list[int]], *, prompt_length: int
+) -> tuple[tuple[int, int], ...]:
+    """
+    Returns:
+        The ranges as [start, end) pairs.
+    Raises:
+        ValueError: the ranges are not non-empty runs in order inside the prompt.
+    """
+    bounds = [0, *(position for run in ranges for position in run), prompt_length]
+    if (
+        any(len(run) != 2 for run in ranges)
+        or any(lower > upper for lower, upper in zip(bounds, bounds[1:]))
+        or any(start == end for start, end in ranges)
+    ):
+        raise ValueError(
+            "franky_write_ranges must be non-empty [start, end) runs in order "
+            f"inside a prompt of {prompt_length} tokens, got {ranges}."
+        )
+    return tuple((start, end) for start, end in ranges)

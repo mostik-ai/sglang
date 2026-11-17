@@ -60,8 +60,8 @@ class AlignedTaps(msgspec.Struct, frozen=True, kw_only=True):
 
     Attributes:
         taps: [rows, output_size], the tap Sandy wrote at each row's input token.
-        reads: [rows] bool, whether the row reads it: its input token is outside
-            its request's answers. CUDA graph padding and answer rows read none.
+        reads: [rows] bool, whether the row reads it: its input token is in its
+            request's write ranges. Answer rows and CUDA graph padding read none.
     """
 
     taps: torch.Tensor
@@ -204,7 +204,8 @@ class FrankyTapCache:
     ) -> Optional[AlignedTaps]:
         """Each row's tap at its own input token, which Sandy wrote on the KV slot
         the row's chunk runs on: a prompt chunk runs only once its tokens' taps
-        landed. None in a decode forward, whose rows are all answer tokens.
+        landed. A row reads it where its request's write ranges hold its token.
+        None in a decode forward, whose rows are all answer tokens.
 
         Args:
             num_rows: the forward's rows, CUDA graph padding included.
@@ -226,7 +227,7 @@ class FrankyTapCache:
                 reads.extend([False] * count)
                 continue
             tokens = torch.arange(first_row, first_row + count)
-            reads.extend((~spans.answer_tokens(tokens)).tolist())
+            reads.extend(spans.written_tokens(tokens).tolist())
         reads.extend([False] * (num_rows - len(reads)))
         device = self._decode_taps_to_read.device
         slots = self.slots_of(kv_slots=forward_batch.out_cache_loc)
