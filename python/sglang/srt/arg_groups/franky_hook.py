@@ -83,9 +83,6 @@ def _shared_checks(*, cfg: Any, model_config: ModelConfig) -> dict[str, bool]:
         f"--franky-chain-hold-seconds {cfg.franky_chain_hold_seconds}": (
             cfg.franky_chain_hold_seconds <= 0
         ),
-        f"--franky-chain-hold-ratio {cfg.franky_chain_hold_ratio}, it is a share": (
-            not 0 <= cfg.franky_chain_hold_ratio <= 1
-        ),
         f"--franky-tap-pool-ratio {cfg.franky_tap_pool_ratio}, it must be above 0": (
             cfg.franky_tap_pool_ratio <= 0
         ),

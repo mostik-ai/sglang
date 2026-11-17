@@ -132,10 +132,12 @@ in Sandy's tokens. Sandy's cache keeps each block's prompt, so a block costs San
 only its new text. Between blocks Ricky prefill keeps the chain's prefix and tap
 pages, and decode its tap pages, so Sandy sends a block only the taps past the
 last block's whole pages and prefill relays decode only those; decode still
-receives the whole context's KV each block, as it keeps no prefix cache. Chains
-waiting for their next block hold tap pages too, so a small
-`--franky-tap-pool-ratio` fits fewer of them; a request short of tap pages
-takes those of the chain whose block ended last, as it comes back last.
+receives the whole context's KV each block, as it keeps no prefix cache. A chain
+between two blocks is in flight, as a decoding request is: nothing caps what its
+holds keep, and other chats wait for room rather than take it, so Sandy never
+prefills a held chain again. A next block that cannot fit releases the hold of
+the chain with the fewest blocks done. Sandy's KV pool and Ricky's tap pages
+therefore set how many chats answer at once; the rest wait.
 
 Send a few chats through the router before taking traffic: the first Franky
 requests open the NIXL connections and compile kernels (about 10 s each).

@@ -68,7 +68,6 @@ class RickyScheduler(Scheduler):
     def init_franky_chain_holds(self) -> None:
         self.franky_chain_holds = FrankyChainHolds.from_config(
             tree_cache=self.tree_cache,
-            max_total_num_tokens=self.max_total_num_tokens,
             own_pages=self.tp_worker.model_runner.franky_parts.tap_cache.own_pages,
         )
 

@@ -50,9 +50,7 @@ class RickyDecodeScheduler(Scheduler):
         parallel = get_parallel()
         tap_cache = self.tp_worker.model_runner.franky_parts.tap_cache
         self.franky_chain_holds = FrankyChainHolds.from_config(
-            tree_cache=None,
-            max_total_num_tokens=self.max_total_num_tokens,
-            own_pages=tap_cache.own_pages,
+            tree_cache=None, own_pages=tap_cache.own_pages
         )
         self.franky_own_taps = (
             FrankyOwnTapReservations(
