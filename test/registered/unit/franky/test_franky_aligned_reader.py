@@ -21,6 +21,7 @@ from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, AlignedTaps, FrankyTapC
 from sglang.srt.franky.config import FrankyConfig
 from sglang.srt.franky.parts.encoder.normed.encoder import SingularNormedEncoder
 from sglang.srt.franky.parts.reader.aligned.reader import AlignedReader
+from sglang.srt.franky.parts.reader.config import ReaderConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -278,7 +279,7 @@ class TestAlignedConfig(CustomTestCase):
         with self.assertRaises(msgspec.ValidationError):
             msgspec.json.decode(
                 b'{"type": "aligned", "layers": [8], "output_scale": 0}',
-                type=FrankyConfig.__annotations__["reader"],
+                type=ReaderConfig,
             )
 
 
