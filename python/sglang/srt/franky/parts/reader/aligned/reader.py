@@ -6,7 +6,15 @@ import torch
 from torch import nn
 from typing_extensions import override
 
+from sglang.srt.franky.cache.tap_cache import TAP_DTYPE
 from sglang.srt.franky.parts.reader.reader import Reader
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.franky.cache.tap_cache import FrankyTapCache
@@ -37,12 +45,44 @@ class AlignedReader(Reader):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         num_rows = residual.shape[0]
-        aligned = tap_cache.aligned_taps(
-            encoder_id=encoder_id, forward_batch=forward_batch, num_rows=num_rows
-        )
-        if aligned is None:
+        if forward_batch.forward_mode.is_decode_or_idle():
             return residual.new_zeros(num_rows, self.projection.out_features)
+        taps = residual.new_empty(
+            (num_rows, self.projection.in_features), dtype=TAP_DTYPE
+        )
+        reads = residual.new_empty((num_rows, 1))
+        _aligned_taps(
+            taps,
+            reads,
+            tap_cache=tap_cache,
+            encoder_id=encoder_id,
+            forward_batch=forward_batch,
+        )
         weight = self.projection.weight
-        added = self.projection(aligned.taps.to(weight.dtype)) * self.output_scale
-        added = added.to(residual.dtype)
-        return torch.where(aligned.reads[:, None], added, torch.zeros_like(added))
+        added = self.projection(taps.to(weight.dtype)) * self.output_scale
+        return added.to(residual.dtype) * reads.to(residual.dtype)
+
+
+@eager_on_graph
+def _aligned_taps(
+    taps: torch.Tensor,
+    reads: torch.Tensor,
+    *,
+    tap_cache: FrankyTapCache,
+    encoder_id: int,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Write each row's own tap into ``taps``, and 1 or 0 into ``reads`` by
+    whether it reads it."""
+    # A prefill CUDA graph replays this break with the batch of the replay.
+    if is_in_prefill_graph_scope():
+        forward_batch = get_forward_batch()
+    aligned = tap_cache.aligned_taps(
+        encoder_id=encoder_id, forward_batch=forward_batch, num_rows=taps.shape[0]
+    )
+    if aligned is None:
+        taps.zero_()
+        reads.zero_()
+        return
+    taps.copy_(aligned.taps)
+    reads[:, 0] = aligned.reads.to(reads.dtype)

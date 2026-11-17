@@ -161,11 +161,12 @@ class TestAlignedReader(CustomTestCase):
             tap_cache=_FixedTaps(AlignedTaps(taps=taps, reads=reads)),
             encoder_id=0,
             residual=torch.zeros(4, _RICKY_HIDDEN),
-            forward_batch=None,
+            forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
         )
 
-        expected = 2.0 * reader.projection(taps)
-        self.assertTrue(torch.allclose(added[reads], expected[reads]))
+        # the taps pass through the tap dtype, as the tap cache holds them
+        expected = 2.0 * reader.projection(taps.to(TAP_DTYPE).float())
+        self.assertTrue(torch.allclose(added[reads], expected[reads], atol=1e-6))
         self.assertTrue(torch.all(added[~reads] == 0))
 
     def test_a_decode_forward_adds_zeros(self):
@@ -173,7 +174,7 @@ class TestAlignedReader(CustomTestCase):
             tap_cache=_FixedTaps(None),
             encoder_id=0,
             residual=torch.ones(3, _RICKY_HIDDEN),
-            forward_batch=None,
+            forward_batch=SimpleNamespace(forward_mode=ForwardMode.DECODE),
         )
 
         self.assertEqual(tuple(added.shape), (3, _RICKY_HIDDEN))
