@@ -131,6 +131,14 @@ NIXL needs `UCX_NET_DEVICES` set to the devices of `NCCL_IB_HCA`, each with
 `:1`, on every engine. RoCE rails (Emma) also need `UCX_IB_GID_INDEX=3`;
 InfiniBand rails have no GID 3, and with it set UCX finds no usable device.
 
+When Sandy falls behind, Ricky's requests wait minutes between PD's bootstrap and
+the KV transfer, and past PD's 300 s defaults Ricky fails them. Set
+`SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600` and
+`SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600` on both Ricky workers, as long as
+the router's request timeout. On the Mooncake trace with one PP2 x TP4 Sandy,
+a run whose TTFT p90 stayed at 270 s served all 2,728 requests, and one at 443 s
+lost 1,161 of them this way.
+
 ## Battery
 
 AIPerf 0.12.0 against the router's chat route, as in the GLM Kolupalka runs,
