@@ -190,6 +190,13 @@ class FrankyChainHolds:
         if hold is not None and hold.order == message.order:
             self.release(chain_id=message.chain_id)
 
+    def num_held_tap_pages(self) -> int:
+        return sum(
+            len(hold.taps.pages)
+            for hold in self._holds.values()
+            if hold.taps is not None
+        )
+
     def locked_nodes(self) -> set[Any]:
         """The tree nodes the holds lock, each once."""
         return {

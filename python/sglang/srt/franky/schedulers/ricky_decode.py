@@ -49,6 +49,7 @@ class RickyDecodeScheduler(Scheduler):
     def init_franky_own_tap_pages_metrics(self) -> None:
         self.franky_own_tap_pages_metrics = FrankyOwnTapPagesMetrics.of_scheduler(
             own_pages=self.tp_worker.model_runner.franky_parts.tap_cache.own_pages,
+            chain_holds=self.franky_chain_holds,
             metrics_collector_context=self.metrics_collector_context,
             interval_seconds=STALL_METRICS_INTERVAL_S,
         )
