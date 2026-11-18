@@ -19,6 +19,8 @@ from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
 from sglang.srt.franky.parts.encoder.all.encoder import AllEncoder
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
+from sglang.srt.franky.parts.injector.residual.output import StreamOutput
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -42,10 +44,14 @@ def _pr_linear_encoder(captured_hiddens, weight):
 
 
 class _LanguageModel(FrankyMixin, nn.Module):
+    franky_output_cls = StreamOutput
+
     def __init__(self, *, start_layer, end_layer):
         super().__init__()
         self.start_layer, self.end_layer = start_layer, end_layer
-        self.config = SimpleNamespace(hidden_size=_HIDDEN_SIZE)
+        self.config = SimpleNamespace(
+            hidden_size=_HIDDEN_SIZE, num_hidden_layers=_NUM_LAYERS
+        )
         self.embed_tokens = nn.Embedding(10, _HIDDEN_SIZE)
 
 
@@ -57,6 +63,13 @@ class _Model(nn.Module):
             self.model.embed_tokens if tied else nn.Linear(_HIDDEN_SIZE, 10, bias=False)
         )
         self.logits_processor = nn.Identity()
+
+
+class _VisionModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.vision_tower = nn.Linear(2, 2)
+        self.language_model = _Model()
 
 
 class _Files(CustomTestCase):
@@ -71,7 +84,7 @@ class _Files(CustomTestCase):
         }
         self.kv_slots = torch.arange(_PAGE_SIZE, _PAGE_SIZE + _NUM_TOKENS)
 
-    def _write(self, *, encoder_type, layers, weights=None):
+    def _write(self, *, encoder_type, layers, weights=None, sandy_injector="residual"):
         config_path = os.path.join(self.directory, "franky.json")
         with open(config_path, "w") as file:
             json.dump(
@@ -87,7 +100,10 @@ class _Files(CustomTestCase):
                         "num_queries": 1,
                         "mlp_hidden_size": 4,
                     },
-                    "injector": {"type": "residual"},
+                    "injector": {
+                        "sandy": {"type": sandy_injector},
+                        "ricky": {"type": "residual"},
+                    },
                     "tap_page_size": _PAGE_SIZE,
                 },
                 file,
@@ -129,10 +145,12 @@ class _Files(CustomTestCase):
         if proxies is not None:
             model.model.franky_read_pp(pp_proxy_tensors=proxies)
         for layer_idx in range(start_layer, end_layer):
-            model.model.franky_after_layer_with_residual(
+            hidden_states = residual_batch.set_written(
+                self.hiddens[layer_idx + 1], forward_batch
+            )
+            model.model.franky_after_layer(
                 layer_idx=layer_idx,
-                hidden_states=self.hiddens[layer_idx + 1],
-                residual=None,
+                hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
         proxies = PPProxyTensors({})
@@ -141,7 +159,9 @@ class _Files(CustomTestCase):
 
 
 def _kv_allocator():
-    return FrankyKvAllocator.__new__(FrankyKvAllocator)
+    allocator = FrankyKvAllocator.__new__(FrankyKvAllocator)
+    allocator.page_size = _PAGE_SIZE
+    return allocator
 
 
 def _taps(parts: FrankyParts, index: int, kv_slots) -> torch.Tensor:
@@ -268,6 +288,30 @@ class TestAttach(_Files):
 
         self.assertIsNone(separate.lm_head)
         self.assertIs(tied.lm_head, tied.model.embed_tokens)
+
+    def test_sandy_drops_the_head_of_the_causal_lm_a_vision_model_wraps(self):
+        """Kimi K3's vision model runs its causal LM, which keeps its own head."""
+        config_path, weights_path, _ = self._write(encoder_type="singular", layers=[3])
+        model = _VisionModel()
+
+        self._attach(model=model, config_path=config_path, weights_path=weights_path)
+
+        causal_lm = model.language_model
+        self.assertIsNone(causal_lm.lm_head)
+        output = causal_lm.logits_processor(
+            None, torch.zeros(_NUM_TOKENS, _HIDDEN_SIZE), causal_lm.lm_head, None
+        )
+        self.assertEqual(output.next_token_logits.shape, (_NUM_TOKENS, 0))
+
+    def test_an_injector_for_another_residual_form_is_refused(self):
+        config_path, weights_path, _ = self._write(
+            encoder_type="singular", layers=[3], sandy_injector="attention_bank"
+        )
+
+        with self.assertRaisesRegex(ValueError, "takes AttentionBankOutput"):
+            self._attach(
+                model=_Model(), config_path=config_path, weights_path=weights_path
+            )
 
     def test_bad_weights_name_the_encoder(self):
         for name, weights in {

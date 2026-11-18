@@ -832,6 +832,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+        self._observe_device_eviction_ages()
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
@@ -1056,6 +1057,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _observe_device_eviction_ages(self) -> None:
+        ages = self.tree_core.take_device_eviction_ages()
+        if self.metrics_collector is not None and ages:
+            self.metrics_collector.observe_evicted_kv_ages(ages)
 
     def _tracks_write_through_unbacked_evictions(self) -> bool:
         return (

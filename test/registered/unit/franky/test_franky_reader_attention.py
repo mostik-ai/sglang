@@ -45,7 +45,8 @@ def _spans(generation_start, block_size):
     if generation_start is None:
         return None
     return FrankyGeneratedSpans(
-        spans=(GeneratedSpan(start=generation_start),), block_size=block_size
+        spans=(GeneratedSpan(start=generation_start, sandy_start=generation_start),),
+        block_size=block_size,
     )
 
 
@@ -83,6 +84,7 @@ class TestReaderAttention(CustomTestCase):
             encoder_ids=(0,),
             output_size=256,
             page_size=_PAGE_SIZE,
+            kv_page_size=_PAGE_SIZE,
             num_tokens=num_pages * _PAGE_SIZE + _PAGE_SIZE,
             req_to_token=req_to_token,
             device="cuda",
@@ -103,6 +105,7 @@ class TestReaderAttention(CustomTestCase):
             tap_cache=self.tap_cache,
             encoder_id=0,
             forward_batch=batch,
+            rows=None,
         )
         return queries, attended, has_taps
 
@@ -191,6 +194,7 @@ class TestReaderAttention(CustomTestCase):
                 tap_cache=self.tap_cache,
                 encoder_id=0,
                 forward_batch=batch,
+                rows=None,
             )
 
         step()

@@ -78,6 +78,36 @@ def convert_time_to_realtime_ns(time_value: float) -> int:
     return int((time_value + global_diff_realtime_monotonic) * 1e9)
 
 
+# What a request's last output carries for the per-request export: its stage
+# boundaries (perf_counter, rebased like every "time" field) and stage values.
+STAGE_TIME_FIELDS = (
+    "scheduler_recv_time",
+    "prefill_bootstrap_queue_entry_time",
+    "bootstrap_done_time",
+    "franky_pages_taken_time",
+    "franky_taps_ready_time",
+    "wait_queue_entry_time",
+    "forward_entry_time",
+    "prefill_finished_time",
+    "prefill_transfer_queue_entry_time",
+    "prefill_kv_transfer_finish_time",
+    "decode_prealloc_queue_entry_time",
+    "decode_transfer_queue_entry_time",
+    "decode_prebuilt_finish_time",
+    "completion_time",
+)
+STAGE_VALUE_FIELDS = (
+    "queue_duration_s",
+    "franky_parked_s",
+    "franky_parked_landed_s",
+    "franky_tap_len",
+    "franky_taps_held",
+    "transfer_total_mb",
+    "transfer_speed_gb_s",
+)
+FINAL_STAGE_FIELDS = STAGE_TIME_FIELDS + STAGE_VALUE_FIELDS
+
+
 def convert_time_cross_thread(
     time_value: float, old_diff: float, new_diff: float
 ) -> float:
@@ -665,6 +695,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # re-enters it). Must not end in "time": __setstate__ clock-rebases those.
     queue_duration_s: float = 0.0
 
+    # Franky Ricky: when the request took its KV and own tap pages, and when the
+    # taps of its first chunk were ready; seconds its chunks sat parked until
+    # their taps landed, and seconds they stayed parked after that, until the
+    # scheduler, which runs one chunked request at a time, took the request;
+    # how many of Sandy's taps it reads, and how many it already held at arrival.
+    franky_pages_taken_time: float = 0.0
+    franky_taps_ready_time: float = 0.0
+    franky_parked_s: float = 0.0
+    franky_parked_landed_s: float = 0.0
+    franky_tap_len: int = 0
+    franky_taps_held: int = 0
+
     # Poll-observed waits; staging can include a re-prefetch and overlap prefetch.
     # None means unmeasured (including stats received from an older scheduler).
     storage_prefetch_wait_s: Optional[float] = None
@@ -702,7 +744,40 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             ),
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
+        if self.completion_time > 0.0:
+            # The request's last output: every stage it went through is known.
+            state.update({name: getattr(self, name) for name in FINAL_STAGE_FIELDS})
         return state
+
+    def convert_to_stage_times(self) -> Dict[str, float]:
+        """
+        Returns:
+            The request's stage boundaries in wall-clock seconds, keyed by the
+            field name without "_time", and its per-request stage values; fields
+            the request never set are left out.
+        """
+        stage_times = {
+            name.removesuffix("_time"): convert_time_to_realtime(getattr(self, name))
+            for name in STAGE_TIME_FIELDS
+            if getattr(self, name) > 0.0
+        }
+        stage_times.update({name: getattr(self, name) for name in STAGE_VALUE_FIELDS})
+        return stage_times
+
+    def set_franky_pages_taken_time(self, *, tap_len: int, taps_held: int, ts=None):
+        self.franky_pages_taken_time = ts or time.perf_counter()
+        self.franky_tap_len = tap_len
+        self.franky_taps_held = taps_held
+
+    def set_franky_taps_ready_time(self, ts=None):
+        if self.franky_taps_ready_time == 0.0:
+            self.franky_taps_ready_time = ts or time.perf_counter()
+
+    def add_franky_parked_seconds(
+        self, *, waiting_for_taps: float, after_taps_landed: float
+    ):
+        self.franky_parked_s += waiting_for_taps
+        self.franky_parked_landed_s += after_taps_landed
 
     def set_scheduler_recv_time(self, ts=None):
         calibrate_time_diff()
@@ -759,6 +834,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_prefill_finished_time = 0.0
         self.last_chunked_prefill_finish_time = 0.0
         self.queue_duration_s = 0.0
+        self.franky_taps_ready_time = 0.0
+        self.franky_parked_s = 0.0
+        self.franky_parked_landed_s = 0.0
         self.storage_prefetch_wait_s = None
         self.storage_staging_wait_s = None
         self._storage_prefetch_wait = None

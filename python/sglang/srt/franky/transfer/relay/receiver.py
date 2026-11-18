@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-import numpy as np
 import numpy.typing as npt
 from typing_extensions import override
 
@@ -17,8 +16,11 @@ if TYPE_CHECKING:
 
 
 class FrankyRelayReceiver(NixlKVReceiver):
-    """PD's KV receiver on Ricky decode that also receives the relayed taps of
-    the pages it registers, and ends only when both have landed.
+    """PD's KV receiver on Ricky decode that also receives the relayed taps, and
+    ends only when both have landed: in the tap pages of the KV pages it
+    registers, or in the tap pages its request reserved when requests own them,
+    past the whole pages its chain's last block left it. Until that reservation,
+    it reports the handshake unfinished, so PD prepares no KV for the request.
     """
 
     kv_mgr: FrankyRelayManager
@@ -52,17 +54,33 @@ class FrankyRelayReceiver(NixlKVReceiver):
         )
         if self.conclude_state == KVPoll.Failed:
             return
-        tap_pages = self.kv_mgr.tap_cache.pages_of(kv_pages=kv_indices)
+        tap_pages = self._tap_pages(kv_indices)
+        if tap_pages is None:
+            return
+        taps_held = self._taps_held()
+        page_size = self.kv_mgr.tap_cache.page_size
         self.tap_receiver = FrankyReceiver(
             manager=self.kv_mgr.tap_relay,
             franky_room=self._relay_room(),
-            tap_pages=np.asarray(tap_pages, dtype=np.int32),
-            num_tokens=len(tap_pages) * self.kv_mgr.tap_cache.page_size,
+            tap_pages=tap_pages[taps_held // page_size :],
+            num_tokens=len(tap_pages) * page_size,
+            prefix_len=taps_held,
         )
         self.kv_mgr.track_tap_receiver(self.bootstrap_room, self.tap_receiver)
 
     @override
     def poll(self) -> int:
+        own_taps = self.kv_mgr.own_taps
+        if own_taps is not None and self.conclude_state is None:
+            if own_taps.too_large(room=self.bootstrap_room):
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "Sandy's tokens of the request need more tap pages than a "
+                    "request may own on Ricky decode.",
+                )
+                self.conclude_state = KVPoll.Failed
+            elif own_taps.waits(room=self.bootstrap_room):
+                return KVPoll.Bootstrapping
         state = super().poll()
         return (
             state if self.tap_receiver is None else min(state, self.tap_receiver.poll())
@@ -80,6 +98,22 @@ class FrankyRelayReceiver(NixlKVReceiver):
         if self.tap_receiver is not None:
             self.tap_receiver.close()
             self.kv_mgr.forget_tap_receiver(self.bootstrap_room)
+
+    def _tap_pages(self, kv_indices: npt.NDArray) -> Optional[npt.NDArray]:
+        """The tap pages to land in, or None when the request owns none: it reads
+        no taps.
+        """
+        own_taps = self.kv_mgr.own_taps
+        if own_taps is None:
+            return self.kv_mgr.tap_cache.pages_of_kv_pages(kv_pages=kv_indices)
+        pages = own_taps.pages_of(room=self.bootstrap_room)
+        return None if pages is None else pages.numpy()
+
+    def _taps_held(self) -> int:
+        own_taps = self.kv_mgr.own_taps
+        if own_taps is None:
+            return 0
+        return own_taps.taps_held_of(room=self.bootstrap_room)
 
     def _relay_room(self) -> FrankyRoom:
         return FrankyRoom(

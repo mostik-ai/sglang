@@ -8,38 +8,42 @@ from typing_extensions import override
 
 from sglang.srt.franky.parts.franky_parts import FrankyParts, load_part
 from sglang.srt.franky.parts.reader.query.reader import attention_workspace
+from sglang.srt.runtime_context import get_franky
 
 if TYPE_CHECKING:
+    from sglang.srt.franky.cache.tap_cache import TrtllmWorkspace
     from sglang.srt.franky.config import FrankyConfig
     from sglang.srt.franky.parts.franky_mixin import FrankyMixin
     from sglang.srt.franky.parts.injector.injector import Injector
+    from sglang.srt.franky.parts.injector.layer_output import LayerOutput
     from sglang.srt.franky.parts.reader.reader import Reader
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class RickyParts(FrankyParts):
-    """Ricky's side on this rank: the readers of this PP stage, each with its
-    injector. Reader ``i`` reads encoder ``i``'s taps.
+    """Ricky's side on this rank: the readers of this PP stage. Reader ``i``
+    reads encoder ``i``'s taps, and the injector adds its result.
     """
 
     def __init__(
         self,
         *,
         config: FrankyConfig,
+        injector: Injector,
         readers: dict[int, Reader],
-        injectors: dict[int, Injector],
         device: str,
+        tap_pool_ratio: float = 1.0,
     ) -> None:
         self._readers = readers
-        self._injectors = injectors
         # Reader layers count from 1, the layer loop from 0.
         self._index_of_layer = {
             config.reader.layers[index] - 1: index for index in readers
         }
         super().__init__(
             config=config,
+            injector=injector,
             layer_indices=frozenset(self._index_of_layer),
             device=device,
+            tap_pool_ratio=tap_pool_ratio,
         )
 
     @classmethod
@@ -50,11 +54,12 @@ class RickyParts(FrankyParts):
         model: nn.Module,
         language_model: FrankyMixin,
         config: FrankyConfig,
+        injector: Injector,
         weights: dict[str, torch.Tensor],
         dtype: torch.dtype,
         device: str,
     ) -> RickyParts:
-        readers, injectors = {}, {}
+        readers = {}
         for index, layer in enumerate(config.reader.layers):
             if language_model.start_layer < layer <= language_model.end_layer:
                 readers[index] = load_part(
@@ -67,12 +72,22 @@ class RickyParts(FrankyParts):
                     dtype=dtype,
                     device=device,
                 )
-                injectors[index] = config.injector.build()
-        return cls(config=config, readers=readers, injectors=injectors, device=device)
+        return cls(
+            config=config,
+            injector=injector,
+            readers=readers,
+            device=device,
+            tap_pool_ratio=get_franky().franky_tap_pool_ratio,
+        )
 
     @override
-    def _attention_workspace(self) -> Optional[torch.Tensor]:
+    def _attention_workspace(self) -> Optional[TrtllmWorkspace]:
         return attention_workspace(device=self.device)
+
+    @override
+    def _owns_tap_pages(self) -> bool:
+        # Taps then count Sandy's tokens, which have no KV slots here.
+        return not self.config.shared_tokenizer
 
     @override
     def _tap_encoder_ids(self) -> tuple[int, ...]:
@@ -81,16 +96,13 @@ class RickyParts(FrankyParts):
         return tuple(range(len(self.config.encoder.layers)))
 
     @override
-    def _after_layer(
-        self, *, layer_idx: int, residual: torch.Tensor, forward_batch: ForwardBatch
-    ) -> Optional[torch.Tensor]:
+    def _after_layer(self, *, layer_idx: int, output: LayerOutput) -> LayerOutput:
         index = self._index_of_layer[layer_idx]
         reader_output = self._readers[index](
             tap_cache=self.tap_cache,
             encoder_id=index,
-            residual=residual,
-            forward_batch=forward_batch,
+            residual=self.injector.read(output=output),
+            forward_batch=output.forward_batch,
+            rows=output.rows,
         )
-        return self._injectors[index].inject(
-            reader_output=reader_output, residual=residual
-        )
+        return self.injector.inject(output=output, addition=reader_output)

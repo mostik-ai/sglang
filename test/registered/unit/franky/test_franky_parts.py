@@ -1,5 +1,5 @@
-"""``FrankyParts`` turns each model's layer output into one residual tensor and back,
-so a wrong sum here would silently change every token after a Franky layer.
+"""``FrankyParts`` reads and changes a model's residual only through its injector,
+so a wrong sum there would silently change every token after a Franky layer.
 """
 
 import unittest
@@ -8,8 +8,12 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
+from sglang.srt.franky.cache.swa_kv_allocator import FrankySwaKvAllocator
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE
+from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
+from sglang.srt.franky.parts.injector.residual.injector import ResidualInjector
+from sglang.srt.franky.parts.injector.residual.output import StreamOutput
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
@@ -25,16 +29,19 @@ _OTHER_LAYER = 4
 class _Parts(FrankyParts):
     """Adds ``extra`` after its layer; None reads only, as Sandy's encoders do."""
 
-    def __init__(self, *, extra=None):
+    def __init__(self, *, extra=None, own_pages=False, tap_pool_ratio=1.0):
         super().__init__(
             config=SimpleNamespace(
                 encoder=SimpleNamespace(output_size=256), tap_page_size=4
             ),
+            injector=ResidualInjector(),
             layer_indices=frozenset({_PART_LAYER}),
             device="cpu",
+            tap_pool_ratio=tap_pool_ratio,
         )
         self.extra = extra
         self.seen = None
+        self.own_pages = own_pages
 
     @classmethod
     def build(cls, **kwargs):
@@ -43,135 +50,170 @@ class _Parts(FrankyParts):
     def _tap_encoder_ids(self):
         return (0, 2)
 
-    def _after_layer(self, *, layer_idx, residual, forward_batch):
-        self.seen = residual.clone()
-        return self.extra
+    def _owns_tap_pages(self):
+        return self.own_pages
+
+    def _after_layer(self, *, layer_idx, output):
+        self.seen = self.injector.read(output=output)
+        if self.extra is None:
+            return output
+        return self.injector.inject(output=output, addition=self.extra)
+
+
+class _Model(FrankyMixin):
+    franky_output_cls = StreamOutput
 
 
 def _stream_output(*, layer_output, residual):
     """The state a layer leaves behind: its output, and a residual not yet added."""
     stream = ResidualStream(residual)
-    return stream.record(layer_output, PLAIN_ADD), SimpleNamespace(
-        residual_stream=stream
-    )
+    forward_batch = SimpleNamespace(residual_stream=stream)
+    hidden_states = stream.record(layer_output, PLAIN_ADD)
+    return StreamOutput(hidden_states=hidden_states, forward_batch=forward_batch)
+
+
+class TestResidualInjector(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.layer_output = torch.tensor([[1.0, 2.0]])
+        self.residual = torch.tensor([[10.0, 20.0]])
+        self.full_residual = torch.tensor([[11.0, 22.0]])
+
+    def test_read_is_the_whole_stream_and_leaves_it_as_it_is(self):
+        output = _stream_output(layer_output=self.layer_output, residual=self.residual)
+
+        read = ResidualInjector().read(output=output)
+
+        self.assertTrue(torch.equal(read, self.full_residual))
+        self.assertTrue(
+            torch.equal(
+                residual_batch.fold(output.hidden_states, output.forward_batch),
+                self.full_residual,
+            )
+        )
+
+    def test_inject_adds_to_the_layer_output_and_the_next_layer_adds_the_rest(self):
+        output = _stream_output(layer_output=self.layer_output, residual=self.residual)
+        addition = torch.tensor([[100.0, 200.0]])
+
+        injected = ResidualInjector().inject(output=output, addition=addition)
+
+        self.assertTrue(
+            torch.equal(
+                residual_batch.fold(injected.hidden_states, injected.forward_batch),
+                self.full_residual + addition,
+            )
+        )
 
 
 class TestFrankyParts(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.extra = torch.tensor([[100.0, 200.0]])
-        self.parts = _Parts(extra=self.extra)
         self.layer_output = torch.tensor([[1.0, 2.0]])
         self.residual = torch.tensor([[10.0, 20.0]])
         self.full_residual = torch.tensor([[11.0, 22.0]])
 
-    def test_stream_form_adds_to_the_layer_output(self):
-        hidden_states, forward_batch = _stream_output(
-            layer_output=self.layer_output, residual=self.residual
-        )
-        # The add happens in place, as the model's own add_to_output calls do.
-        expected_output = self.layer_output + self.extra
+    def test_a_part_reads_and_injects_through_the_injector(self):
+        parts = _Parts(extra=self.extra)
+        model = _Model()
+        model.franky_parts = parts
+        output = _stream_output(layer_output=self.layer_output, residual=self.residual)
 
-        result = self.parts.after_layer(
+        hidden_states = model.franky_after_layer(
             layer_idx=_PART_LAYER,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
+            hidden_states=output.hidden_states,
+            forward_batch=output.forward_batch,
         )
 
-        self.assertTrue(torch.equal(self.parts.seen, self.full_residual))
-        self.assertTrue(torch.equal(result, expected_output))
-        # The residual is still added by the next layer, as without Franky.
+        self.assertTrue(torch.equal(parts.seen, self.full_residual))
         self.assertTrue(
             torch.equal(
-                residual_batch.fold(result, forward_batch),
+                residual_batch.fold(hidden_states, output.forward_batch),
                 self.full_residual + self.extra,
             )
         )
 
-    def test_pair_form_adds_to_the_layer_output(self):
-        """The output gets the addition; the residual stays the residual."""
-        hidden_states, residual = self.parts.after_layer_with_residual(
-            layer_idx=_PART_LAYER,
-            hidden_states=self.layer_output,
-            residual=self.residual,
-            forward_batch=None,
-        )
-
-        self.assertTrue(torch.equal(self.parts.seen, self.full_residual))
-        self.assertTrue(torch.equal(hidden_states, self.layer_output + self.extra))
-        self.assertIs(residual, self.residual)
-
-    def test_pair_form_without_a_residual_adds_to_the_output(self):
-        """With no residual yet, the output is the whole residual."""
-        hidden_states, residual = self.parts.after_layer_with_residual(
-            layer_idx=_PART_LAYER,
-            hidden_states=self.full_residual,
-            residual=None,
-            forward_batch=None,
-        )
-
-        self.assertTrue(torch.equal(self.parts.seen, self.full_residual))
-        self.assertTrue(torch.equal(hidden_states, self.full_residual + self.extra))
-        self.assertIsNone(residual)
-
     def test_a_part_that_only_reads_changes_nothing(self):
         parts = _Parts(extra=None)
-        hidden_states, forward_batch = _stream_output(
-            layer_output=self.layer_output, residual=self.residual
-        )
+        output = _stream_output(layer_output=self.layer_output, residual=self.residual)
 
-        result = parts.after_layer(
-            layer_idx=_PART_LAYER,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-        pair = parts.after_layer_with_residual(
-            layer_idx=_PART_LAYER,
-            hidden_states=self.layer_output,
-            residual=self.residual,
-            forward_batch=None,
-        )
+        result = parts.after_layer(layer_idx=_PART_LAYER, output=output)
 
-        self.assertIs(result, hidden_states)
+        self.assertIs(result, output)
         self.assertTrue(
-            torch.equal(residual_batch.fold(result, forward_batch), self.full_residual)
+            torch.equal(
+                residual_batch.fold(result.hidden_states, result.forward_batch),
+                self.full_residual,
+            )
         )
-        self.assertIs(pair[0], self.layer_output)
-        self.assertIs(pair[1], self.residual)
 
     def test_a_layer_without_a_part_is_left_alone(self):
-        hidden_states, forward_batch = _stream_output(
-            layer_output=self.layer_output, residual=self.residual
-        )
+        parts = _Parts(extra=self.extra)
+        model = _Model()
+        model.franky_parts = parts
+        hidden_states = object()
 
-        result = self.parts.after_layer(
-            layer_idx=_OTHER_LAYER,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-        pair = self.parts.after_layer_with_residual(
-            layer_idx=_OTHER_LAYER,
-            hidden_states=self.layer_output,
-            residual=self.residual,
-            forward_batch=None,
+        result = model.franky_after_layer(
+            layer_idx=_OTHER_LAYER, hidden_states=hidden_states, forward_batch=None
         )
 
         self.assertIs(result, hidden_states)
-        self.assertIs(pair[0], self.layer_output)
-        self.assertIs(pair[1], self.residual)
-        self.assertIsNone(self.parts.seen)
+        self.assertIsNone(parts.seen)
 
     def test_the_budget_charges_the_encoders_of_this_stage(self):
-        options = self.parts.kv_options()
+        options = _Parts().kv_options()
 
         self.assertEqual(options.tap_bytes_per_token, 2 * 256 * TAP_DTYPE.itemsize)
         self.assertIs(options.paged_allocator_cls, FrankyKvAllocator)
+        self.assertIs(options.swa_allocator_cls, FrankySwaKvAllocator)
 
     def test_any_other_kv_allocator_is_refused_at_start(self):
-        with self.assertRaisesRegex(ValueError, "plain paged KV allocator"):
-            self.parts.init_tap_cache(
+        with self.assertRaisesRegex(ValueError, "with a full pool, got object"):
+            _Parts().init_tap_cache(
                 num_tokens=8, kv_allocator=object(), req_to_token_pool=object()
             )
+
+
+class TestTapPool(CustomTestCase):
+    """Requests that own tap pages hold them only while they run, and the prefix
+    cache keeps KV after them, so the budget may charge taps for a share of the
+    KV slots; a share too small for one request would park it for good.
+    """
+
+    def _init(self, parts, *, context_len):
+        allocator = FrankyKvAllocator.__new__(FrankyKvAllocator)
+        allocator.page_size = 8
+        parts.init_tap_cache(
+            num_tokens=64,
+            kv_allocator=allocator,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((2, context_len), dtype=torch.int32)
+            ),
+        )
+        return parts.tap_cache
+
+    def test_the_budget_charges_the_ratio_of_the_taps_per_kv_slot(self):
+        options = _Parts(own_pages=True, tap_pool_ratio=0.25).kv_options()
+
+        self.assertEqual(options.tap_bytes_per_token, 2 * 256 * TAP_DTYPE.itemsize // 4)
+
+    def test_owned_tap_pages_fit_the_ratio_of_the_kv_slots(self):
+        tap_cache = self._init(
+            _Parts(own_pages=True, tap_pool_ratio=0.25), context_len=16
+        )
+
+        # A quarter of 64 KV slots is 16 tokens: four tap pages of four tokens.
+        self.assertEqual(tap_cache.own_pages.num_free(), 4)
+        self.assertEqual(tap_cache.transfer_buffers()[0][1], (16 + 8) * 256 * 2)
+
+    def test_a_ratio_is_refused_where_taps_live_at_kv_slots(self):
+        with self.assertRaisesRegex(ValueError, "taps live at KV slots"):
+            self._init(_Parts(tap_pool_ratio=0.25), context_len=16)
+
+    def test_a_pool_short_of_one_request_at_the_context_length_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "fewer than one request"):
+            self._init(_Parts(own_pages=True, tap_pool_ratio=0.25), context_len=32)
 
 
 if __name__ == "__main__":

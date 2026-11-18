@@ -1,71 +1,70 @@
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, Optional
 
 from typing_extensions import override
 
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
-class FrankyPrefillBudget(PrefillBudget):
-    """Ricky's prefill takes no KV memory, since each request took its pages at
-    arrival, so only chunk sizes bound a batch.
-    """
-
-    @override
-    def has_capacity(self) -> bool:
-        return True
-
-    @override
-    def check_prefill(
-        self,
-        *,
-        extend_input_len: int,
-        total_tokens: int,
-        max_new_tokens: int,
-        input_tokens: int,
-        swa_host_hit_length: int,
-        chunk_limit: Optional[int],
-        auxiliary_swa_host_hit_length: int = 0,
-    ) -> tuple[bool, Optional[int]]:
-        return True, chunk_limit
-
-    @override
-    def can_allocate_prefill(
-        self,
-        *,
-        paged_input: int,
-        extend_input_len: int,
-        max_new_tokens: int,
-        chunk_limit: Optional[int],
-    ) -> bool:
-        return True
-
-    @override
-    def available_chunk_tokens(self, chunk_limit: int) -> int:
-        return chunk_limit
-
-
 class FrankyPrefillAdder(PrefillAdder):
-    """Ricky's admission: a chunk ends at the landed taps and runs on the slots
-    its request took at arrival. While a chunked request goes on, another
-    request joins only if it ends in this batch: the scheduler keeps one
-    chunked request.
+    """Ricky's admission: a chunk ends at the first row whose taps have not
+    landed, and runs on the slots its request took at arrival. While a chunked
+    request goes on, another request joins only if it ends in this batch: the
+    scheduler keeps one chunked request.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.memory_budget = FrankyPrefillBudget(
-            self.token_to_kv_pool_allocator, self.tree_cache
+        self.memory_budget = self.token_to_kv_pool_allocator.prefill_budget(
+            tree_cache=self.tree_cache, num_mixed_decode_tokens=0
+        )
+        # Mamba checkpoints land only on page ends, so their chunks end there.
+        self._chunks_may_end_inside_pages = not (
+            self.tree_cache.supports_mamba()
+            and self.tree_cache.supports_prefix_sharing()
         )
 
     @override
+    def _select_prefill_admission(
+        self,
+        req: Req,
+        *,
+        total_tokens: int,
+        host_hit_length: int,
+        swa_host_hit_length: int,
+        truncation_align_size: Optional[int],
+        has_chunked_req: bool = False,
+    ):
+        """A new request whose taps have not all landed runs every row whose
+        taps it does not wait for. Cut to whole pages, the rows past the last
+        whole page would take one more forward, and a forward's fixed cost holds
+        the scheduler for every request while the taps land.
+        """
+        select = functools.partial(
+            super()._select_prefill_admission,
+            req,
+            total_tokens=total_tokens,
+            host_hit_length=host_hit_length,
+            swa_host_hit_length=swa_host_hit_length,
+            truncation_align_size=truncation_align_size,
+            has_chunked_req=has_chunked_req,
+        )
+        if _taps_complete(req) or not self._chunks_may_end_inside_pages:
+            return select()
+        exact_chunk_fill, self.exact_chunk_fill = self.exact_chunk_fill, True
+        try:
+            return select()
+        finally:
+            self.exact_chunk_fill = exact_chunk_fill
+
+    @override
     def add_chunked_req(self, req: Req) -> Optional[Req]:
-        taps_limit = req.franky.taps_ready - req.prefix_len
+        taps_limit = req.franky.rows_ready() - req.prefix_len
         self.chunked_req_limit = (
             taps_limit
             if self.chunked_req_limit is None
@@ -97,7 +96,7 @@ class FrankyPrefillAdder(PrefillAdder):
     ) -> tuple[bool, Optional[int]]:
         if _taps_complete(req):
             return True, chunk_limit
-        taps_limit = req.franky.taps_ready - req.prefix_len
+        taps_limit = req.franky.rows_ready() - req.prefix_len
         return True, taps_limit if chunk_limit is None else min(chunk_limit, taps_limit)
 
     def _can_start(self, req: Req, *, has_chunked_req: bool) -> bool:
@@ -119,9 +118,9 @@ class FrankyPrefillAdder(PrefillAdder):
 
 
 def taps_landed(req: Req) -> bool:
-    """Whether taps have landed for some of the request's tokens still to run."""
-    return req.franky is not None and req.franky.taps_ready > req.prefix_len
+    """Whether some of the request's rows still to run read only landed taps."""
+    return req.franky is not None and req.franky.rows_ready() > req.prefix_len
 
 
 def _taps_complete(req: Req) -> bool:
-    return req.franky.taps_ready >= len(req.full_untruncated_fill_ids)
+    return req.franky.rows_ready() >= len(req.full_untruncated_fill_ids)

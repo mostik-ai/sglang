@@ -152,6 +152,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
+    client_request_id,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
@@ -1592,18 +1593,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     franky_chain=obj.franky_chain,
                     rid=obj.rid,
                     prompt_len=len(input_ids_arr or ()),
+                    sandy_input_len=obj.franky_sandy_input_len,
+                    on_sandy=get_franky().franky_side == "sandy",
                 )
                 if obj.franky_chain is not None
                 else None
             )
-            franky_generated_spans = (
-                checked_earlier_answers(
-                    obj.franky_generated_spans,
-                    generation_start=len(input_ids_arr or ())
-                    - (franky_chain.num_generated_before if franky_chain else 0),
-                )
-                if obj.franky_generated_spans is not None
-                else ()
+            franky_generated_spans = checked_earlier_answers(
+                obj.franky_generated_spans or [],
+                generation_start=len(input_ids_arr or ())
+                - (franky_chain.num_generated_before if franky_chain else 0),
+                sandy_answers=obj.franky_sandy_spans,
+                sandy_generation_start=(
+                    franky_chain.sandy_answer_start(
+                        sandy_input_len=obj.franky_sandy_input_len
+                    )
+                    if franky_chain is not None
+                    and obj.franky_sandy_input_len is not None
+                    else obj.franky_sandy_input_len
+                ),
             )
 
             tokenized_obj = self.tokenized_generate_req_type(
@@ -1631,6 +1639,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ),
                 franky_chain=franky_chain,
                 franky_generated_spans=franky_generated_spans,
+                franky_sandy_input_len=obj.franky_sandy_input_len,
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,
@@ -2066,6 +2075,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
+                    out["meta_info"]["client_request_id"] = client_request_id(request)
                     asyncio.create_task(
                         self.request_metrics_exporter_manager.write_record(obj, out)
                     )
@@ -2557,6 +2567,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
                     meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
+                    if (
+                        recv_obj.finished_reasons[i] is not None
+                        and self.request_metrics_exporter_manager.exporter_enabled()
+                    ):
+                        meta_info["stage_times"] = (
+                            scheduler_time_stats.convert_to_stage_times()
+                        )
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(

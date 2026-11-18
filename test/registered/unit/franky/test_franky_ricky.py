@@ -24,8 +24,12 @@ from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
+from sglang.srt.franky.parts.injector.residual.output import StreamOutput
 from sglang.srt.franky.parts.reader.query import reader as query_reader
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -46,10 +50,14 @@ _TAP_LENS = {1: 5, 2: 3, 3: 0, 4: 13}
 
 
 class _LanguageModel(FrankyMixin, nn.Module):
+    franky_output_cls = StreamOutput
+
     def __init__(self, *, start_layer, end_layer):
         super().__init__()
         self.start_layer, self.end_layer = start_layer, end_layer
-        self.config = SimpleNamespace(hidden_size=_HIDDEN_SIZE)
+        self.config = SimpleNamespace(
+            hidden_size=_HIDDEN_SIZE, num_hidden_layers=_NUM_LAYERS
+        )
 
 
 class _Model(nn.Module):
@@ -79,6 +87,18 @@ def _flash_attention_on_cpu(
         scores = q[row, 0].float() @ keys.T * softmax_scale
         out[row, 0] = (torch.softmax(scores, dim=-1) @ keys).to(out.dtype)
     return out
+
+
+def _after_layer(model, *, layer_idx, layer_output, residual, forward_batch):
+    """Runs Franky after a layer whose output is ``layer_output`` and whose
+    ``residual`` the next layer adds; returns the output Franky hands back."""
+    stream = ResidualStream(residual)
+    forward_batch.residual_stream = stream
+    return model.model.franky_after_layer(
+        layer_idx=layer_idx,
+        hidden_states=stream.record(layer_output.clone(), PLAIN_ADD),
+        forward_batch=forward_batch,
+    )
 
 
 def _nan_filled(tensor, size, *, dtype=None):
@@ -115,6 +135,9 @@ class _Files(CustomTestCase):
         super().setUp()
         self.directory = tempfile.mkdtemp(prefix="franky_ricky_")
         self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        server_args = get_context().override_server_args()
+        server_args.install()
+        self.addCleanup(server_args.restore)
         torch.manual_seed(0)
         attention = patch.object(
             query_reader, "flash_attn_with_kvcache", _flash_attention_on_cpu
@@ -143,7 +166,10 @@ class _Files(CustomTestCase):
                         "output_size": _TAP_SIZE,
                     },
                     "reader": reader,
-                    "injector": {"type": "residual"},
+                    "injector": {
+                        "sandy": {"type": "residual"},
+                        "ricky": {"type": "residual"},
+                    },
                     "tap_page_size": _PAGE_SIZE,
                 },
                 file,
@@ -177,7 +203,7 @@ class _Files(CustomTestCase):
         )
         parts.init_tap_cache(
             num_tokens=8 * len(self.req_to_token) + _CONTEXT,
-            kv_allocator=FrankyKvAllocator.__new__(FrankyKvAllocator),
+            kv_allocator=_kv_allocator(),
             req_to_token_pool=SimpleNamespace(req_to_token=self.req_to_token),
         )
         self.taps = {}
@@ -192,7 +218,9 @@ class _Files(CustomTestCase):
                 parts.tap_cache.set_generated_spans(
                     req_pool_indices=[row],
                     generated_spans=[
-                        FrankyGeneratedSpans(spans=(GeneratedSpan(start=tap_len),))
+                        FrankyGeneratedSpans(
+                            spans=(GeneratedSpan(start=tap_len, sandy_start=tap_len),)
+                        )
                         if tap_len
                         else None
                     ],
@@ -200,6 +228,12 @@ class _Files(CustomTestCase):
                 )
                 self.taps[encoder_id, row] = taps
         return parts
+
+
+def _kv_allocator():
+    allocator = FrankyKvAllocator.__new__(FrankyKvAllocator)
+    allocator.page_size = _PAGE_SIZE
+    return allocator
 
 
 def _extend_batch(*, rows, prefix_lens, extend_lens):
@@ -242,13 +276,13 @@ class TestReaders(_Files):
         residual = torch.randn(11, _HIDDEN_SIZE)
 
         for encoder_id, layer in enumerate(_READER_LAYERS):
-            hidden_states, residual_out = model.model.franky_after_layer_with_residual(
+            hidden_states = _after_layer(
+                model,
                 layer_idx=layer - 1,
-                hidden_states=layer_output,
+                layer_output=layer_output,
                 residual=residual,
                 forward_batch=batch,
             )
-            self.assertIs(residual_out, residual)
             queries = (
                 functional.linear(
                     layer_output + residual,
@@ -289,15 +323,18 @@ class TestReaders(_Files):
         parts.tap_cache.set_generated_spans(
             req_pool_indices=[4],
             generated_spans=[
-                FrankyGeneratedSpans(spans=(GeneratedSpan(start=5),), block_size=4)
+                FrankyGeneratedSpans(
+                    spans=(GeneratedSpan(start=5, sandy_start=5),), block_size=4
+                )
             ],
             num_input_tokens=[13],
         )
         layer_output = torch.randn(10, _HIDDEN_SIZE)
 
-        hidden_states, _ = model.model.franky_after_layer_with_residual(
+        hidden_states = _after_layer(
+            model,
             layer_idx=0,
-            hidden_states=layer_output,
+            layer_output=layer_output,
             residual=None,
             forward_batch=_extend_batch(rows=[4], prefix_lens=[3], extend_lens=[10]),
         )
@@ -316,6 +353,38 @@ class TestReaders(_Files):
             hidden_states - layer_output, expected, atol=2e-3, rtol=2e-3
         )
 
+    def test_a_reader_on_some_rows_reads_each_rows_own_taps(self):
+        """DeepSeek V4.1 runs its late layers only on each request's last rows; a
+        reader there gets those rows and must read what they would read in a
+        forward of every row. An index past the last row reads nothing."""
+        config_path, weights_path, _ = self._write()
+        model = _Model()
+        parts = self._attach(
+            model=model, config_path=config_path, weights_path=weights_path
+        )
+        batch = _extend_batch(rows=[1, 2], prefix_lens=[0, 2], extend_lens=[5, 4])
+        residual = torch.randn(9, _HIDDEN_SIZE)
+        reader = parts._readers[0]
+        everything = reader(
+            tap_cache=parts.tap_cache,
+            encoder_id=0,
+            residual=residual,
+            forward_batch=batch,
+            rows=None,
+        )
+        rows = torch.tensor([4, 8, 9])
+
+        some = reader(
+            tap_cache=parts.tap_cache,
+            encoder_id=0,
+            residual=torch.cat([residual[[4, 8]], residual[:1]]),
+            forward_batch=batch,
+            rows=rows,
+        )
+
+        torch.testing.assert_close(some[:2], everything[[4, 8]])
+        self.assertTrue(torch.equal(some[2], torch.zeros(_HIDDEN_SIZE)))
+
     def test_tokens_without_taps_and_padded_tokens_get_exactly_zero(self):
         """A CUDA graph pads the batch with tokens of no request."""
         config_path, weights_path, _ = self._write()
@@ -324,9 +393,10 @@ class TestReaders(_Files):
         layer_output = torch.randn(4, _HIDDEN_SIZE)
 
         with patch.object(torch.Tensor, "new_empty", _nan_filled):
-            hidden_states, _ = model.model.franky_after_layer_with_residual(
+            hidden_states = _after_layer(
+                model,
                 layer_idx=0,
-                hidden_states=layer_output,
+                layer_output=layer_output,
                 residual=None,
                 forward_batch=_extend_batch(rows=[3], prefix_lens=[0], extend_lens=[2]),
             )
@@ -338,8 +408,12 @@ class TestReaders(_Files):
             forward_mode=ForwardMode.DECODE, req_pool_indices=torch.tensor(rows)
         )
         layer_output = torch.randn(len(rows), _HIDDEN_SIZE)
-        hidden_states, _ = model.model.franky_after_layer_with_residual(
-            layer_idx=0, hidden_states=layer_output, residual=None, forward_batch=batch
+        hidden_states = _after_layer(
+            model,
+            layer_idx=0,
+            layer_output=layer_output,
+            residual=None,
+            forward_batch=batch,
         )
         return hidden_states - layer_output, layer_output
 
@@ -372,10 +446,9 @@ class TestReaders(_Files):
         layer_output = torch.randn(5, _HIDDEN_SIZE)
 
         for layer_idx in (1, 3):
-            hidden_states, _ = model.model.franky_after_layer_with_residual(
+            hidden_states = model.model.franky_after_layer(
                 layer_idx=layer_idx,
                 hidden_states=layer_output,
-                residual=None,
                 forward_batch=_extend_batch(rows=[1], prefix_lens=[0], extend_lens=[5]),
             )
             self.assertIs(hidden_states, layer_output)

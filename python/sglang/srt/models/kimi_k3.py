@@ -30,6 +30,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.franky.parts.franky_mixin import FrankyMixin
+from sglang.srt.franky.parts.injector.attention_bank.output import (
+    AttentionBankOutput,
+    AttentionBankRead,
+)
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
@@ -2716,7 +2721,9 @@ class KimiK3DecoderLayer(nn.Module):
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
-class KimiK3LinearModel(nn.Module):
+class KimiK3LinearModel(FrankyMixin, nn.Module):
+    franky_output_cls = AttentionBankOutput
+
     """K3 language-model backbone."""
 
     def __init__(
@@ -2860,6 +2867,8 @@ class KimiK3LinearModel(nn.Module):
                 else pp_proxy_tensors["attn_res_bank"]
             )
             self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
+        if not self.pp_group.is_first_rank:
+            self.franky_read_pp(pp_proxy_tensors=pp_proxy_tensors)
 
         packs_aux = self.packs_aux_hidden_states
         aux_hidden_states: AuxHiddenStateAccumulator = (
@@ -2900,6 +2909,12 @@ class KimiK3LinearModel(nn.Module):
                         else None
                     ),
                 )
+            hidden_states = self.franky_after_attention_bank_layer(
+                layer_idx=i,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                next_read=self._next_attention_bank_read,
+            )
             if (
                 not captures_at_input
                 and i in captures
@@ -2923,6 +2938,7 @@ class KimiK3LinearModel(nn.Module):
                 proxy_tensors.tensors["dspark_hidden_states"] = torch.cat(
                     aux_hidden_states, dim=-1
                 )
+            self.franky_write_pp(pp_proxy_tensors=proxy_tensors)
             return proxy_tensors
 
         hidden_states = residual_batch.final_norm(
@@ -2962,23 +2978,37 @@ class KimiK3LinearModel(nn.Module):
         mixture its next consumer would compute (next layer's attention side;
         output side for the last layer). The standard path captures at the
         next input instead."""
-        hidden_states = residual_batch.snapshot(hidden_states, forward_batch)
+        read = self._next_attention_bank_read(layer_idx)
+        return aggregate_stream(
+            residual_batch.snapshot(hidden_states, forward_batch),
+            read.bank.block_residual,
+            read.num_valid_blocks,
+            read.score_proj,
+            read.score_norm,
+        )
+
+    def _next_attention_bank_read(self, layer_idx: int) -> AttentionBankRead:
+        """How the consumer after `layer_idx` mixes the bank: the next layer's
+        attention side, or the model's output side after the last layer."""
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
             score_proj = next_layer.self_attention_res_proj
             score_norm = next_layer.self_attention_res_norm
-            nvb = next_layer.prev_valid_blocks
-        else:
-            # Last layer: the model's own output-side aggregation weights.
+            num_valid_blocks = next_layer.prev_valid_blocks
+        elif self.pp_group.is_last_rank:
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
-            nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
-        return aggregate_stream(
-            hidden_states,
-            self.attn_bank.require().block_residual,
-            nvb,
-            score_proj,
-            score_norm,
+            num_valid_blocks = _cdiv(self.end_layer, self.config.attn_res_block_size)
+        else:
+            raise ValueError(
+                f"Layer {layer_idx + 1} is the last of its pipeline stage; the next "
+                "stage's first layer mixes its output, so nothing here can read it."
+            )
+        return AttentionBankRead(
+            bank=self.attn_bank.require(),
+            score_proj=score_proj,
+            score_norm=score_norm,
+            num_valid_blocks=num_valid_blocks,
         )
 
 

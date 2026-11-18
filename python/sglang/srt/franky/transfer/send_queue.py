@@ -178,14 +178,8 @@ class FrankySendQueue:
             end -= end % self._page_size
         if end <= send.landed_end:
             return
-        # The first KV slot of each page from landed_end, which is page aligned.
-        first_slots = self._req_to_token[
-            send.req.kv.req_pool_idx, send.landed_end : end : self._page_size
-        ]
-        kv_pages = first_slots // self._page_size
-        send.copying.append(
-            FrankyHostPages(self._tap_cache.pages_of(kv_pages=kv_pages))
-        )
+        slots = self._req_to_token[send.req.kv.req_pool_idx, send.landed_end : end]
+        send.copying.append(FrankyHostPages(self._tap_cache.pages_of(slots=slots)))
         send.landed_end = end
         self._hand_over(send)
 

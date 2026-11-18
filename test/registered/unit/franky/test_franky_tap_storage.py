@@ -1,4 +1,4 @@
-"""Taps share KV's life because each KV page has one fixed tap page, and Ricky's
+"""Taps share KV's life because a token's tap lives at its KV slot, and Ricky's
 chunks run on slots taken at arrival. A wrong slot here silently feeds a reader
 another token's tap.
 """
@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
@@ -45,6 +46,7 @@ def _tap_cache() -> FrankyTapCache:
         encoder_ids=(0, 1),
         output_size=_OUTPUT_SIZE,
         page_size=_PAGE_SIZE,
+        kv_page_size=_PAGE_SIZE,
         num_tokens=_NUM_TOKENS,
         req_to_token=torch.zeros((_NUM_REQUEST_ROWS, _NUM_TOKENS), dtype=torch.int32),
         device="cpu",
@@ -107,6 +109,71 @@ class TestFrankyTapCache(CustomTestCase):
         self.assertEqual(
             [size for _, size in buffers.values()], [page_bytes * num_pages] * 2
         )
+
+
+class TestTapPagesOverLargerKvPages(CustomTestCase):
+    """Two engines may run different KV pages; taps then travel and are read in
+    tap pages that are views of parts of a KV page, never copies.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.cache = FrankyTapCache(
+            encoder_ids=(0,),
+            output_size=_OUTPUT_SIZE,
+            page_size=_PAGE_SIZE,
+            kv_page_size=4 * _PAGE_SIZE,
+            num_tokens=_NUM_TOKENS,
+            req_to_token=torch.zeros(
+                (_NUM_REQUEST_ROWS, _NUM_TOKENS), dtype=torch.int32
+            ),
+            device="cpu",
+        )
+
+    def test_slots_map_to_the_tap_pages_that_hold_them(self):
+        slots = torch.arange(16, 32)
+
+        self.assertEqual(self.cache.pages_of(slots=slots).tolist(), [4, 5, 6, 7])
+
+    def test_a_kv_page_is_its_tap_pages_in_order(self):
+        tap_pages = self.cache.pages_of_kv_pages(kv_pages=np.array([1, 0]))
+
+        self.assertEqual(tap_pages.dtype, np.int32)
+        self.assertEqual(tap_pages.tolist(), [4, 5, 6, 7, 0, 1, 2, 3])
+
+    def test_a_tap_page_is_the_bytes_of_its_slots(self):
+        """NIXL writes tap page ``p`` at ``address + p * page_bytes``; that must be
+        exactly the taps of slots ``p * page_size`` onward.
+        """
+        values = torch.arange(_NUM_TOKENS, dtype=TAP_DTYPE)[:, None]
+        self.cache.write(
+            encoder_id=0,
+            taps=values.expand(-1, _OUTPUT_SIZE),
+            kv_slots=torch.arange(_NUM_TOKENS),
+        )
+        page = 5
+        start = page * self.cache.page_bytes // TAP_DTYPE.itemsize
+        flat = self.cache._buffers[0].view(-1)
+
+        seen = flat[start : start + _PAGE_SIZE * _OUTPUT_SIZE].view(_PAGE_SIZE, -1)
+
+        self.assertTrue(
+            torch.equal(
+                seen[:, 0], torch.arange(5 * _PAGE_SIZE, 6 * _PAGE_SIZE).to(TAP_DTYPE)
+            )
+        )
+
+    def test_a_kv_page_that_is_not_whole_tap_pages_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "not whole tap pages"):
+            FrankyTapCache(
+                encoder_ids=(0,),
+                output_size=_OUTPUT_SIZE,
+                page_size=_PAGE_SIZE,
+                kv_page_size=_PAGE_SIZE + 2,
+                num_tokens=_NUM_TOKENS,
+                req_to_token=torch.zeros((1, _NUM_TOKENS), dtype=torch.int32),
+                device="cpu",
+            )
 
 
 class TestFrankyKvAllocator(CustomTestCase):

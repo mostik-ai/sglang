@@ -50,6 +50,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
+from sglang.srt.franky.parts.injector.residual.output import StreamOutput
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -1705,6 +1706,8 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 
 class Qwen3_5ForCausalLM(FrankyMixin, nn.Module):
     """Qwen3.5 Model with support for dense variant."""
+
+    franky_output_cls = StreamOutput
 
     decoder_layer_types = ALL_DECODER_LAYER_TYPES
 

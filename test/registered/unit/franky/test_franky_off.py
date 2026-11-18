@@ -24,22 +24,13 @@ class TestFrankyOff(CustomTestCase):
 
     def test_the_mixin_hands_back_the_same_objects(self):
         model = FrankyMixin()
-        hidden_states, residual = object(), object()
+        hidden_states = object()
 
         self.assertIs(
             model.franky_after_layer(
                 layer_idx=0, hidden_states=hidden_states, forward_batch=None
             ),
             hidden_states,
-        )
-        self.assertEqual(
-            model.franky_after_layer_with_residual(
-                layer_idx=0,
-                hidden_states=hidden_states,
-                residual=residual,
-                forward_batch=None,
-            ),
-            (hidden_states, residual),
         )
         model.franky_read_pp(pp_proxy_tensors=None)
         model.franky_write_pp(pp_proxy_tensors=None)

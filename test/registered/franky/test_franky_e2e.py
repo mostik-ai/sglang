@@ -186,7 +186,7 @@ class TestFrankyEndToEnd(CustomTestCase):
                 "num_queries": 1,
                 "mlp_hidden_size": _MLP_SIZE,
             },
-            "injector": {"type": "residual"},
+            "injector": {"sandy": {"type": "residual"}, "ricky": {"type": "residual"}},
             "tap_page_size": _PAGE_SIZE,
         }
         with open(os.path.join(cls.directory, "franky.json"), "w") as file:

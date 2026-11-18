@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import nn
@@ -29,8 +29,10 @@ class Reader(nn.Module, ABC):
         encoder_id: int,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
+        rows: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Return ``[tokens, ricky_hidden_size]``. ``residual`` is the whole
-        residual after the reader's layer, for readers that use it.
+        residual after the reader's layer, for readers that use it; ``rows`` are
+        the rows of ``forward_batch`` it holds, as indices, or None for all.
         """
         raise NotImplementedError

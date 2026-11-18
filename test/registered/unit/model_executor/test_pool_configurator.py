@@ -269,7 +269,9 @@ class TestDefaultConfigurator(CustomTestCase):
 
         mr = _make_model_runner(self)
         mr.franky_kv_options = FrankyKvOptions(
-            tap_bytes_per_token=tap_bytes, paged_allocator_cls=object
+            tap_bytes_per_token=tap_bytes,
+            paged_allocator_cls=object,
+            swa_allocator_cls=object,
         )
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
@@ -1701,6 +1703,7 @@ class TestSWAPoolFloor(CustomTestCase):
             spec_aux_config=SimpleNamespace(
                 dflash_draft_num_layers=40, dspark_num_stages=3
             ),
+            franky_kv_options=None,
         )
         with patch(
             "sglang.srt.model_executor.pool_configurator.uses_draft_swa_ring",

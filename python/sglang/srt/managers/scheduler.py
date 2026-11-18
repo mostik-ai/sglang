@@ -3019,6 +3019,7 @@ class Scheduler(
                 franky_room=recv_req.franky_room,
                 franky_chain=recv_req.franky_chain,
                 franky_generated_spans=recv_req.franky_generated_spans,
+                franky_sandy_input_len=recv_req.franky_sandy_input_len,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -5263,6 +5264,7 @@ class Scheduler(
         fully_idle = self.is_fully_idle()
         if not fully_idle:
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+            self.metrics_reporter.maybe_log_stall_metrics()
             now = time.monotonic()
             if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
                 self._last_stall_publish_ts = now
