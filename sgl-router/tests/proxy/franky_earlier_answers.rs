@@ -20,6 +20,7 @@ use sgl_router::tokenizer::chat_template_adapter::{self, ChatTemplateAdapter};
 use sgl_router::tokenizer::franky_sandy::FrankySandyTokens;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -339,6 +340,7 @@ async fn pair_with_kimi_sandy() -> (FrankyPair, tempfile::TempDir) {
     let sandy = FrankySandyConfig {
         tokenizer_path: kimi.path().join("tiktoken.model").display().to_string(),
         chat_adapter: ChatTemplateAdapterKind::KimiK3,
+        keep_every: NonZeroUsize::MIN,
     };
     pair.ctx.franky_sandy = Some(Arc::new(
         FrankySandyTokens::load(&sandy, Default::default()).unwrap(),

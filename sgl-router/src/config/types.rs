@@ -1,7 +1,7 @@
 use crate::config::sampling::SamplingOverrides;
 use reqwest::header::HeaderValue;
 use serde::Deserialize;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 /// Single-model configuration built and validated by [`crate::config::Cli::into_config`].
 #[derive(Debug, Clone)]
@@ -56,6 +56,9 @@ pub struct FrankySandyConfig {
     pub tokenizer_path: String,
     /// Sandy's chat template, whose earlier answers the router marks.
     pub chat_adapter: ChatTemplateAdapterKind,
+    /// Sandy reads its earlier answers whole and, outside them, every
+    /// `keep_every`-th token of its rendering; 1 reads every token.
+    pub keep_every: NonZeroUsize,
 }
 
 impl ProxyConfig {
