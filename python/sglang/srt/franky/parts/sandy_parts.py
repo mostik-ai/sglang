@@ -156,10 +156,28 @@ class _NoLogits(nn.Module):
 
 
 def _drop_head(*, model: nn.Module, language_model: FrankyMixin) -> None:
-    model.logits_processor = _NoLogits()
+    owner = _head_owner(model=model, language_model=language_model)
+    owner.logits_processor = _NoLogits()
     # A tied head is the language model's own embedding, so only a separate one goes.
-    if all(module is not model.lm_head for module in language_model.modules()):
-        model.lm_head = None
+    if all(module is not owner.lm_head for module in language_model.modules()):
+        owner.lm_head = None
+
+
+def _head_owner(*, model: nn.Module, language_model: FrankyMixin) -> nn.Module:
+    """The innermost module around the language model with the head; a vision
+    model can wrap the causal LM that holds it."""
+    owners = [
+        module
+        for module in model.modules()
+        if any(name == "logits_processor" for name, _ in module.named_children())
+        and any(inner is language_model for inner in module.modules())
+    ]
+    if not owners:
+        raise ValueError(
+            f"{type(model).__name__} has no logits_processor around "
+            f"{type(language_model).__name__} for Sandy to drop."
+        )
+    return owners[-1]
 
 
 def _open_at(all_inputs: list[tuple[int, ...]], *, edge: int) -> tuple[int, ...]:
