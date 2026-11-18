@@ -3,8 +3,9 @@ from types import SimpleNamespace
 
 import msgspec
 
+from sglang.srt.franky.cache.own_tap_pages import FrankyOwnTapPages
 from sglang.srt.franky.chains.chain import FrankyChain, put_continuations_first
-from sglang.srt.franky.chains.holds import FrankyChainHolds
+from sglang.srt.franky.chains.holds import FrankyChainHolds, FrankyHeldTaps
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -144,6 +145,99 @@ class TestFrankyChainHolds(CustomTestCase):
         holds.on_hold_expired(message=FrankyHoldExpired(chain_id="a", order=0))
 
         self.assertEqual(self.tree.locked, ["block-2"])
+
+
+class TestFrankyChainHoldsOfTapPages(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.tree = _Tree()
+        self.own_pages = FrankyOwnTapPages(
+            first_page=1,
+            num_pages=9,
+            max_pages_per_request=8,
+            num_request_rows=2,
+            device="cpu",
+        )
+        self.holds = self._holds()
+
+    def _holds(self):
+        return FrankyChainHolds(
+            tree_cache=self.tree,
+            max_held_tokens=100,
+            hold_seconds=60.0,
+            own_pages=self.own_pages,
+        )
+
+    def _taps(self, num_pages, *, num_taps):
+        return FrankyHeldTaps(
+            pages=self.own_pages.take(num_pages=num_pages), num_taps=num_taps
+        )
+
+    def test_a_hold_keeps_its_blocks_tap_pages_for_the_next_block_once(self):
+        taps = self._taps(3, num_taps=40)
+
+        self.holds.hold_for_next_block(_block("c", node="c"), taps=taps)
+
+        self.assertEqual(self.holds.held_tap_pages, 3)
+        self.assertIs(self.holds.take_taps(chain_id="c"), taps)
+        self.assertIsNone(self.holds.take_taps(chain_id="c"))
+        self.assertEqual(self.holds.held_tap_pages, 0)
+        self.assertEqual(self.tree.locked, ["c"], "the KV hold stays")
+        self.assertEqual(self.own_pages.num_free(), 5)
+
+    def test_every_way_a_hold_ends_gives_its_tap_pages_back(self):
+        ends = {
+            "release": lambda holds: holds.release(chain_id="c"),
+            "release_oldest": lambda holds: holds.release_oldest(),
+            "release_all": lambda holds: holds.release_all(),
+            "expiry": lambda holds: holds.on_hold_expired(
+                message=FrankyHoldExpired(chain_id="c", order=0)
+            ),
+            "next hold": lambda holds: holds.hold_for_next_block(
+                _block("c", node="c-2")
+            ),
+        }
+        for name, end in ends.items():
+            with self.subTest(name):
+                holds = self._holds()
+                holds.hold_for_next_block(
+                    _block("c", node="c"), taps=self._taps(3, num_taps=40)
+                )
+
+                end(holds)
+
+                self.assertEqual(self.own_pages.num_free(), 8)
+                holds.release_all()
+
+    def test_tap_pages_go_back_newest_first_while_prompts_stay_locked(self):
+        self.holds.hold_for_next_block(
+            _block("a", node="a"), taps=self._taps(2, num_taps=20)
+        )
+        self.holds.hold_for_next_block(
+            _block("b", node="b"), taps=self._taps(3, num_taps=40)
+        )
+        self.holds.hold_for_next_block(_block("c", node="c"))
+
+        self.assertTrue(self.holds.release_newest_taps())
+
+        self.assertEqual(self.own_pages.num_free(), 6)
+        self.assertIsNone(self.holds.take_taps(chain_id="b"))
+        self.assertEqual(self.tree.locked, ["a", "b", "c"])
+        self.assertTrue(self.holds.release_newest_taps())
+        self.assertFalse(self.holds.release_newest_taps())
+
+    def test_a_last_block_or_one_outside_chains_gives_its_tap_pages_back(self):
+        plain = SimpleNamespace(franky_chain=None, last_node="n", origin_input_ids=[0])
+        last = _block("c", node="c-2", last_block=True)
+        self.holds.hold_for_next_block(
+            _block("c", node="c-1"), taps=self._taps(2, num_taps=20)
+        )
+
+        self.holds.hold_for_next_block(plain, taps=self._taps(2, num_taps=20))
+        self.holds.hold_for_next_block(last, taps=self._taps(2, num_taps=30))
+
+        self.assertEqual(self.own_pages.num_free(), 8)
+        self.assertEqual(self.tree.locked, [])
 
 
 class TestFrankyChain(CustomTestCase):

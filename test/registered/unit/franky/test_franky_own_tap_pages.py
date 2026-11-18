@@ -17,10 +17,17 @@ from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans, Genera
 from sglang.srt.franky.cache.own_tap_pages import FrankyOwnTapPages
 from sglang.srt.franky.cache.own_tap_reservations import FrankyOwnTapReservations
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
+from sglang.srt.franky.chains.chain import FrankyChain
+from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.transfer.relay import receiver as relay_receiver_module
 from sglang.srt.franky.transfer.relay import sender as relay_sender_module
 from sglang.srt.franky.transfer.relay.receiver import FrankyRelayReceiver
 from sglang.srt.franky.transfer.relay.sender import FrankyRelaySender
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    FINISH_MATCHED_TOKEN,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -133,15 +140,29 @@ class TestReadingOwnTapPages(CustomTestCase):
         self.assertTrue(bool((view.taps[page] == 7).all()))
 
 
-def _request(room, *, sandy_input_len):
+def _request(room, *, sandy_input_len, chain=None):
     request = SimpleNamespace(
         bootstrap_room=room,
         franky_sandy_input_len=sandy_input_len,
+        franky_chain=chain,
         kv=SimpleNamespace(holds_kv=False),
         done=False,
+        finished_reason=None,
     )
     request.finished = lambda: request.done
     return request
+
+
+def _decode_holds(own_pages):
+    return FrankyChainHolds(
+        tree_cache=None, max_held_tokens=0, hold_seconds=60.0, own_pages=own_pages
+    )
+
+
+def _reservations(own_pages, *, holds):
+    return FrankyOwnTapReservations(
+        own_pages=own_pages, page_size=_PAGE_SIZE, chain_holds=holds
+    )
 
 
 class TestOwnTapReservations(CustomTestCase):
@@ -149,35 +170,45 @@ class TestOwnTapReservations(CustomTestCase):
         super().setUp()
         self.own_pages = FrankyOwnTapPages(
             first_page=1,
-            num_pages=9,
-            max_pages_per_request=4,
+            num_pages=13,
+            max_pages_per_request=6,
             num_request_rows=2,
             device="cpu",
         )
-        self.reservations = FrankyOwnTapReservations(
-            own_pages=self.own_pages, page_size=_PAGE_SIZE
-        )
+        self.holds = _decode_holds(self.own_pages)
+        self.reservations = _reservations(self.own_pages, holds=self.holds)
 
-    def _expect(self, room, *, sandy_input_len):
-        request = _request(room, sandy_input_len=sandy_input_len)
+    def _expect(self, room, *, sandy_input_len, chain=None):
+        request = _request(room, sandy_input_len=sandy_input_len, chain=chain)
         self.reservations.expect(request)
         return request
 
+    def _block(self, block, *, room, sandy_input_len, starts=()):
+        chain = FrankyChain(
+            id="c", block=block, block_size=8, sandy_block_starts=starts
+        )
+        return self._expect(room, sandy_input_len=sandy_input_len, chain=chain)
+
+    def _end(self, request, reason):
+        request.done = True
+        request.finished_reason = reason
+        self.reservations.poll()
+
     def test_requests_take_pages_in_arrival_order(self):
-        self._expect(1, sandy_input_len=16)
-        self._expect(2, sandy_input_len=13)
+        self._expect(1, sandy_input_len=24)
+        self._expect(2, sandy_input_len=21)
         self._expect(3, sandy_input_len=1)
 
         self.reservations.poll()
 
-        self.assertEqual(len(self.reservations.pages_of(room=1)), 4)
-        self.assertEqual(len(self.reservations.pages_of(room=2)), 4)
+        self.assertEqual(len(self.reservations.pages_of(room=1)), 6)
+        self.assertEqual(len(self.reservations.pages_of(room=2)), 6)
         self.assertIsNone(self.reservations.pages_of(room=3))
         self.assertTrue(self.reservations.waits(room=3))
 
     def test_pages_come_back_once_the_request_ended_and_released_its_kv(self):
-        first = self._expect(1, sandy_input_len=16)
-        self._expect(2, sandy_input_len=16)
+        first = self._expect(1, sandy_input_len=24)
+        self._expect(2, sandy_input_len=24)
         self._expect(3, sandy_input_len=4)
         self.reservations.poll()
         first.done = True
@@ -191,8 +222,58 @@ class TestOwnTapReservations(CustomTestCase):
         self.assertIsNone(self.reservations.pages_of(room=1))
         self.assertIsNotNone(self.reservations.pages_of(room=3))
 
+    def test_a_block_at_its_length_leaves_its_pages_to_the_next_block(self):
+        first = self._block(1, room=1, sandy_input_len=13)
+        self.reservations.poll()
+        first_pages = self.reservations.pages_of(room=1).tolist()
+        self._end(first, FINISH_LENGTH(length=8))
+        self.assertEqual(self.own_pages.num_free(), 8)
+
+        self._block(2, room=2, sandy_input_len=22, starts=(13,))
+        self.reservations.poll()
+
+        pages = self.reservations.pages_of(room=2).tolist()
+        self.assertEqual(pages[:4], first_pages)
+        self.assertEqual(len(pages), 6)
+        self.assertEqual(self.own_pages.num_free(), 6)
+        self.assertEqual(
+            self.reservations.taps_held_of(room=2), 12, "3 whole pages of 13 taps"
+        )
+
+    def test_a_block_that_stopped_or_waited_in_vain_gives_its_pages_back(self):
+        stopped = self._block(1, room=1, sandy_input_len=13)
+        self.reservations.poll()
+        self._end(stopped, FINISH_MATCHED_TOKEN(matched=0))
+        self.assertEqual(self.own_pages.num_free(), 12)
+
+        first = self._block(1, room=2, sandy_input_len=13)
+        self.reservations.poll()
+        self._end(first, FINISH_LENGTH(length=8))
+        aborted = self._block(2, room=3, sandy_input_len=22, starts=(13,))
+        self._end(aborted, FINISH_ABORT("Aborted"))
+
+        self.assertEqual(self.own_pages.num_free(), 12)
+
+    def test_a_request_short_of_pages_takes_the_newest_held_ones(self):
+        for room, chain_id in ((1, "a"), (2, "b")):
+            block = self._expect(
+                room,
+                sandy_input_len=24,
+                chain=FrankyChain(id=chain_id, block_size=8),
+            )
+            self.reservations.poll()
+            self._end(block, FINISH_LENGTH(length=8))
+
+        self._expect(3, sandy_input_len=24)
+        self.reservations.poll()
+
+        self.assertIsNotNone(self.reservations.pages_of(room=3))
+        self.assertEqual(self.holds.held_tap_pages, 6)
+        self.assertIsNone(self.holds.take_taps(chain_id="b"))
+        self.assertIsNotNone(self.holds.take_taps(chain_id="a"))
+
     def test_a_request_past_the_pages_one_may_own_is_too_large(self):
-        too_large = self._expect(1, sandy_input_len=17)
+        too_large = self._expect(1, sandy_input_len=25)
         self._expect(2, sandy_input_len=4)
 
         self.reservations.poll()
@@ -253,17 +334,18 @@ class TestRelayOfOwnTapPages(CustomTestCase):
         receiver.tap_receiver = None
         return receiver
 
-    def test_decode_registers_the_pages_its_request_reserved(self):
-        own_pages = FrankyOwnTapPages(
+    def _own_pages(self, *, max_pages_per_request):
+        return FrankyOwnTapPages(
             first_page=1,
             num_pages=9,
-            max_pages_per_request=4,
+            max_pages_per_request=max_pages_per_request,
             num_request_rows=2,
             device="cpu",
         )
-        reservations = FrankyOwnTapReservations(
-            own_pages=own_pages, page_size=_PAGE_SIZE
-        )
+
+    def test_decode_registers_the_pages_its_request_reserved(self):
+        own_pages = self._own_pages(max_pages_per_request=4)
+        reservations = _reservations(own_pages, holds=_decode_holds(own_pages))
         reservations.expect(_request(7, sandy_input_len=6))
         receiver = self._receiver(reservations)
 
@@ -284,18 +366,39 @@ class TestRelayOfOwnTapPages(CustomTestCase):
         tap_pages = tap_receiver.call_args.kwargs["tap_pages"]
         self.assertEqual(tap_pages.tolist(), reservations.pages_of(room=7).tolist())
         self.assertEqual(tap_receiver.call_args.kwargs["num_tokens"], 2 * _PAGE_SIZE)
+        self.assertEqual(tap_receiver.call_args.kwargs["prefix_len"], 0)
+
+    def test_decode_receives_only_the_pages_past_its_chains_whole_held_pages(self):
+        own_pages = self._own_pages(max_pages_per_request=6)
+        reservations = _reservations(own_pages, holds=_decode_holds(own_pages))
+        first = _request(6, sandy_input_len=13, chain=FrankyChain(id="c", block_size=8))
+        reservations.expect(first)
+        reservations.poll()
+        first.done = True
+        first.finished_reason = FINISH_LENGTH(length=8)
+        reservations.poll()
+        second_chain = FrankyChain(
+            id="c", block=2, block_size=8, sandy_block_starts=(13,)
+        )
+        reservations.expect(_request(7, sandy_input_len=22, chain=second_chain))
+        reservations.poll()
+        receiver = self._receiver(reservations)
+
+        with (
+            patch.object(NixlKVReceiver, "send_metadata"),
+            patch.object(relay_receiver_module, "FrankyReceiver") as tap_receiver,
+        ):
+            receiver.send_metadata(np.array([3, 4, 5]), 0)
+
+        pages = reservations.pages_of(room=7).tolist()
+        kwargs = tap_receiver.call_args.kwargs
+        self.assertEqual(kwargs["tap_pages"].tolist(), pages[3:])
+        self.assertEqual(kwargs["prefix_len"], 3 * _PAGE_SIZE)
+        self.assertEqual(kwargs["num_tokens"], 6 * _PAGE_SIZE)
 
     def test_decode_fails_a_request_with_more_taps_than_one_may_own(self):
-        own_pages = FrankyOwnTapPages(
-            first_page=1,
-            num_pages=9,
-            max_pages_per_request=1,
-            num_request_rows=2,
-            device="cpu",
-        )
-        reservations = FrankyOwnTapReservations(
-            own_pages=own_pages, page_size=_PAGE_SIZE
-        )
+        own_pages = self._own_pages(max_pages_per_request=1)
+        reservations = _reservations(own_pages, holds=_decode_holds(own_pages))
         reservations.expect(_request(7, sandy_input_len=6))
         receiver = self._receiver(reservations)
 
