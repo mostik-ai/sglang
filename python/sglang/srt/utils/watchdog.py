@@ -144,6 +144,10 @@ class WatchdogRaw:
                 else:
                     watchdog_last_counter = current_counter
                     watchdog_last_time = current
+            else:
+                # Idle time must not count toward a stuck batch: forget the last
+                # counter, so the next active check restarts the clock.
+                watchdog_last_counter = None
             time.sleep(self.watchdog_timeout / 2)
 
         if self.dump_info is not None and (info_msg := self.dump_info()):
