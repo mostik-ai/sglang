@@ -9,6 +9,7 @@ import torch.distributed as dist
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
+from sglang.srt.franky.cache.prefill_budget import FrankyPrefillBudget
 from sglang.srt.franky.cache.tap_cache import FrankyTapCache
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
@@ -585,6 +586,13 @@ class TestFrankyPrefillAdder(CustomTestCase):
         self.allocator.page_size = _PAGE_SIZE
         self.allocator.available_size.return_value = 0
         self.allocator.request_slot_reserve.return_value = 0
+        self.allocator.prefill_budget.side_effect = (
+            lambda *, tree_cache, num_mixed_decode_tokens: FrankyPrefillBudget(
+                self.allocator,
+                tree_cache,
+                num_mixed_decode_tokens=num_mixed_decode_tokens,
+            )
+        )
 
     def _adder(self, *, rem_chunk_tokens=256):
         running_batch = MagicMock()

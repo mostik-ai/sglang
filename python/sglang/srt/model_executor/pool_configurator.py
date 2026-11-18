@@ -1251,6 +1251,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
+        if isinstance(kvc.franky_kv_options, FrankyKvOptions):
+            # A full-pool slot also holds the token's taps.
+            self.bytes_per_full_token += kvc.franky_kv_options.tap_bytes_per_token
         if self.is_speculative and not self.encoder_replay:
             # Reserve the draft worker by inflating per-token bytes by
             # (target+draft)/target, as scale_kv_cell_size_per_token_for_dflash does.

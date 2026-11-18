@@ -8,6 +8,7 @@ from safetensors.torch import load_file
 
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.kv_options import FrankyKvOptions
+from sglang.srt.franky.cache.swa_kv_allocator import FrankySwaKvAllocator
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
 from sglang.srt.franky.config import FrankyConfig
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
@@ -102,6 +103,7 @@ class FrankyParts(ABC):
                 * TAP_DTYPE.itemsize
             ),
             paged_allocator_cls=FrankyKvAllocator,
+            swa_allocator_cls=FrankySwaKvAllocator,
         )
 
     def init_tap_cache(
@@ -112,10 +114,10 @@ class FrankyParts(ABC):
         req_to_token_pool: ReqToTokenPool,
     ) -> None:
         """Build the tap cache, once the KV budget has set ``num_tokens``."""
-        if not isinstance(kv_allocator, FrankyKvAllocator):
+        if not isinstance(kv_allocator, (FrankyKvAllocator, FrankySwaKvAllocator)):
             raise ValueError(
-                "Franky needs the plain paged KV allocator, got "
-                f"{type(kv_allocator).__name__}."
+                "Franky needs the paged KV allocator or the sliding-window one with "
+                f"a full pool, got {type(kv_allocator).__name__}."
             )
         self.tap_cache = FrankyTapCache(
             encoder_ids=self._tap_encoder_ids(),

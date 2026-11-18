@@ -18,6 +18,7 @@ themselves. A side whose injector does not take the model's form is refused at s
 | --- | --- | --- | --- | --- |
 | `StreamOutput` | one stream that `residual_batch` keeps in `forward_batch` | `residual` | the stream's sum | add to the layer's output |
 | `AttentionBankOutput` | attention residuals (Kimi K3): a bank of block sums and the running sum | `attention_bank` | the mix the next layer reads, as DSpark's capture | add to every row of that mix |
+| `HyperConnectionOutput` | manifold hyper-connections (DeepSeek V4): several streams | `hyper_connection` | the mean of the streams, as DSpark's capture | add to every stream |
 
 **2. In the layer loop, right after the layer runs,** call the method of the model's form:
 
@@ -28,7 +29,12 @@ hidden_states = self.franky_after_layer(
 ```
 
 `franky_after_attention_bank_layer` also takes `next_read`, which says how the consumer after a layer mixes the bank
-(`KimiK3LinearModel._next_attention_bank_read`).
+(`KimiK3LinearModel._next_attention_bank_read`). `franky_after_hyper_connection_layer` takes the complete stream state
+and the rows it holds: DeepSeek V4.1 runs its layers past the tail switch only on each request's last rows, and a
+reader there reads the taps of those rows.
+
+**KV.** Taps live at the token's KV slot, so Ricky needs an allocator whose slots last as long as a token's KV: the
+paged one, or the sliding-window one with a full pool, whose full-pool slots hold the taps (DeepSeek V4).
 
 **3. For Sandy under PP, at the stage edges:**
 

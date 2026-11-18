@@ -13,17 +13,17 @@ from sglang.srt.franky.transfer.host_pages import FrankyHostPages
 from sglang.srt.franky.transfer.messages import FrankyRoomClosed, FrankyTapsReady
 from sglang.srt.franky.transfer.receiver import FrankyReceiver
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
+    from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
     from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
+    from sglang.srt.franky.cache.swa_kv_allocator import FrankySwaKvAllocator
     from sglang.srt.franky.cache.tap_cache import FrankyTapCache
     from sglang.srt.franky.chains.holds import FrankyChainHolds
     from sglang.srt.franky.transfer.manager import FrankyTapManager
     from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, TreeLock
 
 logger = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ class FrankyReceiveQueue:
         self,
         *,
         tap_cache: FrankyTapCache,
-        kv_allocator: BaseTokenToKVPoolAllocator,
+        kv_allocator: FrankyKvAllocator | FrankySwaKvAllocator,
         tree_cache: BasePrefixCache,
         tap_manager: FrankyTapManager,
         rank_reports: FrankyRankReports,
@@ -194,7 +194,10 @@ class FrankyReceiveQueue:
         num_tokens = len(req.full_untruncated_fill_ids)
         num_taken = num_tokens - req.prefix_len
         num_page_slots = ceil_div(num_taken, self.page_size) * self.page_size
-        if num_page_slots + self.reserved_decode_tokens > self.kv_allocator.size:
+        if (
+            num_page_slots + self.reserved_decode_tokens
+            > self.kv_allocator.arrival_size
+        ):
             self.fail_request(
                 req, f"Request {req.rid} does not fit in Ricky's KV memory."
             )
@@ -290,17 +293,18 @@ class FrankyReceiveQueue:
         return nodes | self.chain_holds.locked_nodes()
 
     def _free_slots(self) -> int:
-        free = self.kv_allocator.available_size() + self.tree_cache.evictable_size()
+        free = self.kv_allocator.free_at_arrival(tree_cache=self.tree_cache)
         return free - self.reserved_decode_tokens * (len(self.receptions) + 1)
 
     def _take_slots(self, num_page_slots: int) -> torch.Tensor:
-        if self.kv_allocator.available_size() < num_page_slots:
-            evict_from_tree_cache(self.tree_cache, num_page_slots)
-        slots = self.kv_allocator.alloc(num_page_slots)
+        slots = self.kv_allocator.take_at_arrival(
+            tree_cache=self.tree_cache, num_slots=num_page_slots
+        )
         if slots is None:
             raise RuntimeError(
                 f"Franky could not take {num_page_slots} KV slots that fit: "
-                f"{self.kv_allocator.available_size()} available."
+                f"{self.kv_allocator.free_at_arrival(tree_cache=self.tree_cache)} "
+                "free."
             )
         return slots
 

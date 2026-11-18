@@ -177,7 +177,6 @@ class TestHandleFranky(_WithFiles):
             "--enable-hisparse": {"enable_hisparse": True},
             "--enable-kv-cache-sharding": {"enable_kv_cache_sharding": True},
             "--dcp-size": {"dcp_size": 2},
-            "hybrid SWA": {"is_hybrid_swa": True},
             "--enable-hierarchical-cache": {"enable_hierarchical_cache": True},
             "--enable-lmcache": {"enable_lmcache": True},
         }.items():

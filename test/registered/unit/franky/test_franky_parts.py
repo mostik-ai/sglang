@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
+from sglang.srt.franky.cache.swa_kv_allocator import FrankySwaKvAllocator
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
@@ -160,9 +161,10 @@ class TestFrankyParts(CustomTestCase):
 
         self.assertEqual(options.tap_bytes_per_token, 2 * 256 * TAP_DTYPE.itemsize)
         self.assertIs(options.paged_allocator_cls, FrankyKvAllocator)
+        self.assertIs(options.swa_allocator_cls, FrankySwaKvAllocator)
 
     def test_any_other_kv_allocator_is_refused_at_start(self):
-        with self.assertRaisesRegex(ValueError, "plain paged KV allocator"):
+        with self.assertRaisesRegex(ValueError, "with a full pool, got object"):
             _Parts().init_tap_cache(
                 num_tokens=8, kv_allocator=object(), req_to_token_pool=object()
             )

@@ -59,6 +59,7 @@ class QueryReader(Reader):
         encoder_id: int,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
+        rows: Optional[torch.Tensor],
     ) -> torch.Tensor:
         num_tokens = residual.shape[0]
         attended = residual.new_empty(
@@ -72,6 +73,7 @@ class QueryReader(Reader):
             tap_cache=tap_cache,
             encoder_id=encoder_id,
             forward_batch=forward_batch,
+            rows=rows,
         )
         return self._map(attended, has_taps)
 
@@ -89,6 +91,7 @@ def _attend_taps(
     tap_cache: FrankyTapCache,
     encoder_id: int,
     forward_batch: ForwardBatch,
+    rows: Optional[torch.Tensor],
 ) -> None:
     # A prefill CUDA graph replays this break with the batch of the replay.
     if is_in_prefill_graph_scope():
@@ -97,7 +100,9 @@ def _attend_taps(
         queries,
         attended,
         has_taps,
-        view=tap_cache.view(encoder_id=encoder_id, forward_batch=forward_batch),
+        view=tap_cache.view(
+            encoder_id=encoder_id, forward_batch=forward_batch, rows=rows
+        ),
     )
 
 

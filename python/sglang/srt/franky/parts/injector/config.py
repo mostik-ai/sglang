@@ -7,9 +7,14 @@ import msgspec
 from sglang.srt.franky.parts.injector.attention_bank.config import (
     AttentionBankInjectorConfig,
 )
+from sglang.srt.franky.parts.injector.hyper_connection.config import (
+    HyperConnectionInjectorConfig,
+)
 from sglang.srt.franky.parts.injector.residual.config import ResidualInjectorConfig
 
-InjectorConfig = Union[AttentionBankInjectorConfig, ResidualInjectorConfig]
+InjectorConfig = Union[
+    AttentionBankInjectorConfig, HyperConnectionInjectorConfig, ResidualInjectorConfig
+]
 
 
 class InjectorsConfig(
