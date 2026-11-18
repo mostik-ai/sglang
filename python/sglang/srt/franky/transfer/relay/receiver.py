@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-import numpy as np
 import numpy.typing as npt
 from typing_extensions import override
 
@@ -52,11 +51,11 @@ class FrankyRelayReceiver(NixlKVReceiver):
         )
         if self.conclude_state == KVPoll.Failed:
             return
-        tap_pages = self.kv_mgr.tap_cache.pages_of(kv_pages=kv_indices)
+        tap_pages = self.kv_mgr.tap_cache.pages_of_kv_pages(kv_pages=kv_indices)
         self.tap_receiver = FrankyReceiver(
             manager=self.kv_mgr.tap_relay,
             franky_room=self._relay_room(),
-            tap_pages=np.asarray(tap_pages, dtype=np.int32),
+            tap_pages=tap_pages,
             num_tokens=len(tap_pages) * self.kv_mgr.tap_cache.page_size,
         )
         self.kv_mgr.track_tap_receiver(self.bootstrap_room, self.tap_receiver)

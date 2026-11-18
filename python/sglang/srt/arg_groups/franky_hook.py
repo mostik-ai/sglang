@@ -15,6 +15,9 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
+_READER_PAGE_SIZES = (16, 32, 64, 128)
+
+
 def handle_franky(server_args: ServerArgs) -> None:
     """Refuse what Franky does not support."""
     cfg = resolving_view(server_args)
@@ -79,8 +82,10 @@ def _kv_allocator_checks(
     one that builds ``FrankyKvAllocator``.
     """
     return {
-        f"page size {cfg.page_size} after model and backend rules, it must equal "
-        f"tap_page_size {config.tap_page_size}": cfg.page_size != config.tap_page_size,
+        f"page size {cfg.page_size} after model and backend rules, it must be a "
+        f"multiple of tap_page_size {config.tap_page_size}": (
+            cfg.page_size % config.tap_page_size != 0
+        ),
         "--enable-unified-memory": cfg.enable_unified_memory,
         "--enable-hisparse": cfg.enable_hisparse,
         "--enable-kv-cache-sharding": cfg.enable_kv_cache_sharding,
@@ -137,6 +142,10 @@ def _ricky_checks(
         # Readers attend over taps with FlashAttention, whose heads are this size.
         f"encoder output_size {tap_size}, readers need a multiple of 8 up to 256": (
             tap_size % 8 != 0 or tap_size > 256
+        ),
+        # Readers attend over tap pages with TRT-LLM's decode kernels on Blackwell.
+        f"tap_page_size {config.tap_page_size}, readers need 16, 32, 64 or 128": (
+            config.tap_page_size not in _READER_PAGE_SIZES
         ),
         # Readers take each prefill's lengths from the host, and a full graph
         # replays the lengths it was captured with.

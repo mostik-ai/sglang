@@ -150,7 +150,9 @@ class _Files(CustomTestCase):
 
 
 def _kv_allocator():
-    return FrankyKvAllocator.__new__(FrankyKvAllocator)
+    allocator = FrankyKvAllocator.__new__(FrankyKvAllocator)
+    allocator.page_size = _PAGE_SIZE
+    return allocator
 
 
 def _taps(parts: FrankyParts, index: int, kv_slots) -> torch.Tensor:

@@ -197,7 +197,7 @@ class _Files(CustomTestCase):
         )
         parts.init_tap_cache(
             num_tokens=8 * len(self.req_to_token) + _CONTEXT,
-            kv_allocator=FrankyKvAllocator.__new__(FrankyKvAllocator),
+            kv_allocator=_kv_allocator(),
             req_to_token_pool=SimpleNamespace(req_to_token=self.req_to_token),
         )
         self.taps = {}
@@ -220,6 +220,12 @@ class _Files(CustomTestCase):
                 )
                 self.taps[encoder_id, row] = taps
         return parts
+
+
+def _kv_allocator():
+    allocator = FrankyKvAllocator.__new__(FrankyKvAllocator)
+    allocator.page_size = _PAGE_SIZE
+    return allocator
 
 
 def _extend_batch(*, rows, prefix_lens, extend_lens):

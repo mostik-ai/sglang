@@ -121,6 +121,7 @@ class FrankyParts(ABC):
             encoder_ids=self._tap_encoder_ids(),
             output_size=self.config.encoder.output_size,
             page_size=self.config.tap_page_size,
+            kv_page_size=kv_allocator.page_size,
             num_tokens=num_tokens,
             req_to_token=req_to_token_pool.req_to_token,
             device=self.device,

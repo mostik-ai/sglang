@@ -26,7 +26,8 @@ class FrankyConfig(
     encoder: EncoderConfig
     reader: ReaderConfig
     injector: InjectorsConfig
-    # Each KV page pairs with one tap page, so both sides run this --page-size.
+    # Tokens of a tap page, the unit taps are sent and read in; each side's
+    # --page-size is a multiple of it.
     tap_page_size: Annotated[int, msgspec.Meta(gt=1)]
 
     def __post_init__(self) -> None:
