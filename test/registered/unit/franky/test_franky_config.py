@@ -179,6 +179,7 @@ class TestHandleFranky(_WithFiles):
             "--dcp-size": {"dcp_size": 2},
             "--enable-hierarchical-cache": {"enable_hierarchical_cache": True},
             "--enable-lmcache": {"enable_lmcache": True},
+            "--franky-tap-pool-ratio 0.0": {"franky_tap_pool_ratio": 0.0},
         }.items():
             for side in ("sandy", "ricky"):
                 with self.subTest(reason, side=side):
@@ -228,6 +229,22 @@ class TestHandleFranky(_WithFiles):
                     handle_franky(server_args)
                 handle_franky(self._server_args(side="sandy", **fields))
 
+    def test_a_tap_pool_ratio_needs_a_ricky_that_owns_tap_pages(self):
+        own_tokenizer = copy.deepcopy(_CONFIG)
+        own_tokenizer["shared_tokenizer"] = False
+        handle_franky(
+            self._server_args(
+                side="ricky", config=own_tokenizer, franky_tap_pool_ratio=0.1
+            )
+        )
+        for side, config in (("ricky", _CONFIG), ("sandy", own_tokenizer)):
+            with self.subTest(side=side):
+                server_args = self._server_args(
+                    side=side, config=config, franky_tap_pool_ratio=0.1
+                )
+                with self.assertRaisesRegex(ValueError, "--franky-tap-pool-ratio 0.1"):
+                    handle_franky(server_args)
+
     def test_kv_pages_may_be_any_multiple_of_the_tap_page(self):
         for side in ("sandy", "ricky"):
             with self.subTest(side=side):
@@ -273,20 +290,21 @@ class TestHandleFranky(_WithFiles):
             server_args._resolved_overrides,
         )
 
-    def test_sandy_runs_without_overlap_scheduling(self):
+    def test_sandy_runs_without_overlap_scheduling_or_decode_graphs(self):
         sandy = self._server_args(side="sandy")
         ricky = self._server_args(side="ricky")
 
         handle_franky(sandy)
         handle_franky(ricky)
 
-        self.assertIn(
-            ("handle_franky", {"disable_overlap_schedule": True}),
-            sandy._resolved_overrides,
+        resolved = dict(sandy._resolved_overrides)["handle_franky"]
+        self.assertTrue(resolved["disable_overlap_schedule"])
+        self.assertEqual(resolved["cuda_graph_config"].decode.backend, Backend.DISABLED)
+        self.assertEqual(
+            resolved["cuda_graph_config"].prefill, CudaGraphConfig().prefill
         )
         self.assertNotIn(
-            ("handle_franky", {"disable_overlap_schedule": True}),
-            getattr(ricky, "_resolved_overrides", []),
+            "handle_franky", dict(getattr(ricky, "_resolved_overrides", []))
         )
 
     def test_each_side_picks_its_own_attention_dp_size(self):

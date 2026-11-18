@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, Optional
 
 from typing_extensions import override
@@ -22,6 +23,44 @@ class FrankyPrefillAdder(PrefillAdder):
         self.memory_budget = self.token_to_kv_pool_allocator.prefill_budget(
             tree_cache=self.tree_cache, num_mixed_decode_tokens=0
         )
+        # Mamba checkpoints land only on page ends, so their chunks end there.
+        self._chunks_may_end_inside_pages = not (
+            self.tree_cache.supports_mamba()
+            and self.tree_cache.supports_prefix_sharing()
+        )
+
+    @override
+    def _select_prefill_admission(
+        self,
+        req: Req,
+        *,
+        total_tokens: int,
+        host_hit_length: int,
+        swa_host_hit_length: int,
+        truncation_align_size: Optional[int],
+        has_chunked_req: bool = False,
+    ):
+        """A new request whose taps have not all landed runs every row whose
+        taps it does not wait for. Cut to whole pages, the rows past the last
+        whole page would take one more forward, and a forward's fixed cost holds
+        the scheduler for every request while the taps land.
+        """
+        select = functools.partial(
+            super()._select_prefill_admission,
+            req,
+            total_tokens=total_tokens,
+            host_hit_length=host_hit_length,
+            swa_host_hit_length=swa_host_hit_length,
+            truncation_align_size=truncation_align_size,
+            has_chunked_req=has_chunked_req,
+        )
+        if _taps_complete(req) or not self._chunks_may_end_inside_pages:
+            return select()
+        exact_chunk_fill, self.exact_chunk_fill = self.exact_chunk_fill, True
+        try:
+            return select()
+        finally:
+            self.exact_chunk_fill = exact_chunk_fill
 
     @override
     def add_chunked_req(self, req: Req) -> Optional[Req]:

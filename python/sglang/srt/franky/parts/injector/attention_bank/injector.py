@@ -43,6 +43,18 @@ class AttentionBankInjector(Injector):
         )
 
     @override
+    def check_stage(
+        self, *, layer_indices: frozenset[int], end_layer: int, num_layers: int
+    ) -> None:
+        if end_layer < num_layers and end_layer - 1 in layer_indices:
+            raise ValueError(
+                f"A Franky part reads after layer {end_layer}, the last of its "
+                "pipeline stage, but the next stage's first layer mixes that layer's "
+                "output, so this stage cannot read it. Set SGLANG_PP_LAYER_PARTITION "
+                "so that no stage but the last ends at a layer with a part."
+            )
+
+    @override
     def inject(
         self, *, output: AttentionBankOutput, addition: torch.Tensor
     ) -> AttentionBankOutput:

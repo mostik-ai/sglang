@@ -8,8 +8,10 @@ from typing_extensions import override
 
 from sglang.srt.franky.parts.franky_parts import FrankyParts, load_part
 from sglang.srt.franky.parts.reader.query.reader import attention_workspace
+from sglang.srt.runtime_context import get_franky
 
 if TYPE_CHECKING:
+    from sglang.srt.franky.cache.tap_cache import TrtllmWorkspace
     from sglang.srt.franky.config import FrankyConfig
     from sglang.srt.franky.parts.franky_mixin import FrankyMixin
     from sglang.srt.franky.parts.injector.injector import Injector
@@ -29,6 +31,7 @@ class RickyParts(FrankyParts):
         injector: Injector,
         readers: dict[int, Reader],
         device: str,
+        tap_pool_ratio: float = 1.0,
     ) -> None:
         self._readers = readers
         # Reader layers count from 1, the layer loop from 0.
@@ -40,6 +43,7 @@ class RickyParts(FrankyParts):
             injector=injector,
             layer_indices=frozenset(self._index_of_layer),
             device=device,
+            tap_pool_ratio=tap_pool_ratio,
         )
 
     @classmethod
@@ -68,10 +72,16 @@ class RickyParts(FrankyParts):
                     dtype=dtype,
                     device=device,
                 )
-        return cls(config=config, injector=injector, readers=readers, device=device)
+        return cls(
+            config=config,
+            injector=injector,
+            readers=readers,
+            device=device,
+            tap_pool_ratio=get_franky().franky_tap_pool_ratio,
+        )
 
     @override
-    def _attention_workspace(self) -> Optional[torch.Tensor]:
+    def _attention_workspace(self) -> Optional[TrtllmWorkspace]:
         return attention_workspace(device=self.device)
 
     @override

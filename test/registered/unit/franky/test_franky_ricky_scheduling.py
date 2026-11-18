@@ -766,10 +766,35 @@ class TestFrankyPrefillAdder(CustomTestCase):
     ):
         """Ricky's 100 prompt tokens hold an answer at 40..59 whose copy starts at
         Sandy's token 30; Sandy's input is 80 tokens. With 30 taps landed, the
-        rows before the one making the new answer's first token may run, and a
-        first chunk ends on a page.
+        rows before the one making the new answer's first token may run. Mamba
+        checkpoints land on page ends, so with a Mamba prefix cache a first chunk
+        ends on a page.
         """
+        self.tree_cache.supports_mamba.return_value = True
+        self.tree_cache.supports_prefix_sharing.return_value = True
         adder = self._adder()
+        req = self._own_tokens_req()
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(req.franky.rows_ready(), 99)
+        self.assertEqual(req.extend_end, 96)
+        self.assertIs(adder.new_chunked_req, req)
+
+    def test_without_mamba_a_first_chunk_runs_every_row_its_taps_allow(self):
+        """A first chunk cut to a page would leave rows 96..98 for one more
+        forward before the taps land; each forward holds the scheduler."""
+        self.tree_cache.supports_mamba.return_value = False
+        adder = self._adder()
+        req = self._own_tokens_req()
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(req.extend_end, 99)
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertFalse(adder.exact_chunk_fill)
+
+    def _own_tokens_req(self):
         req = self._req("r", prompt_len=100, taps_ready=30)
         req.franky = _landed(
             30,
@@ -781,12 +806,7 @@ class TestFrankyPrefillAdder(CustomTestCase):
             ),
             own_tap_pages=torch.arange(4, 9, dtype=torch.int32),
         )
-
-        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
-
-        self.assertEqual(req.franky.rows_ready(), 99)
-        self.assertEqual(req.extend_end, 96)
-        self.assertIs(adder.new_chunked_req, req)
+        return req
 
     def test_a_continuing_chunk_ends_at_the_landed_taps(self):
         adder = self._adder()

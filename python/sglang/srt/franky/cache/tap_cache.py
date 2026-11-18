@@ -7,6 +7,9 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.kernels.ops.attention.franky_reader_blocks import (
+    franky_reader_row_blocks,
+)
 from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.own_tap_pages import FrankyOwnTapPages
 from sglang.srt.utils.common import async_h2d
@@ -56,23 +59,67 @@ class FrankyReqState(msgspec.Struct, kw_only=True):
         return self.taken_kv_slots[start - self.taken_from : end - self.taken_from]
 
 
+class TrtllmWorkspace(msgspec.Struct, frozen=True, kw_only=True):
+    """What the readers' TRT-LLM kernels keep across launches on Blackwell.
+
+    Attributes:
+        buffer: scratch for split-KV partials, zeroed once.
+        counters: the split-KV completion tickets, zeroed once; every launch
+            resets them. Without them FlashInfer allocates fresh tickets per
+            launch, whose memory the allocator, or a CUDA graph's pool, hands
+            to a later kernel while the launch may still run.
+    """
+
+    buffer: torch.Tensor
+    counters: torch.Tensor
+
+
+class RowMasks(msgspec.Struct, frozen=True, kw_only=True):
+    """Which rows of a forward read taps, padding rows reading none, made once
+    for all of its readers.
+
+    Attributes:
+        no_taps: [rows] bool, rows that read no taps.
+        has_taps: [rows, 1], 1 for rows that read taps and 0 for the rest.
+    """
+
+    no_taps: torch.Tensor
+    has_taps: torch.Tensor
+
+
 class TapView(msgspec.Struct, frozen=True, kw_only=True):
     """One encoder's taps for the rows of one forward, as the paged attention
     kernels take them.
 
     Attributes:
         taps: [pages, page_size, 1, output_size], both the keys and the values.
-        page_table: [rows, pages] int32, the pages of each row's request.
+        request_pages: [requests, pages] int32, the tap pages of each request.
+        row_requests: [rows], the request of each row; None when row i is
+            request i.
         taps_to_read: [rows] int32, the taps each row's query reads, from tap 0.
         num_tokens: the real rows; a CUDA graph pads after them.
         trtllm_workspace: TRT-LLM's workspace on Blackwell; None where FA3 runs.
+        row_blocks: the prefill kernel's row blocks when the rows are every
+            row of the forward, whole requests one after another; else None.
+        row_masks: when the rows are every row of the forward, the
+            ``RowMasks`` its readers share, padding rows included; else None.
     """
 
     taps: torch.Tensor
-    page_table: torch.Tensor
+    request_pages: torch.Tensor
+    row_requests: Optional[torch.Tensor]
     taps_to_read: torch.Tensor
     num_tokens: int
-    trtllm_workspace: Optional[torch.Tensor]
+    trtllm_workspace: Optional[TrtllmWorkspace]
+    row_blocks: Optional[torch.Tensor] = None
+    row_masks: Optional[RowMasks] = None
+
+    @property
+    def page_table(self) -> torch.Tensor:
+        """[rows, pages] int32, the pages of each row's request."""
+        if self.row_requests is None:
+            return self.request_pages
+        return self.request_pages[self.row_requests]
 
 
 class FrankyTapCache:
@@ -103,12 +150,13 @@ class FrankyTapCache:
         req_to_token: torch.Tensor,
         device: str,
         own_pages: bool = False,
-        attention_workspace: Optional[torch.Tensor] = None,
+        attention_workspace: Optional[TrtllmWorkspace] = None,
     ) -> None:
         """
         Args:
             page_size: tokens of a tap page; it divides ``kv_page_size``.
-            num_tokens: KV slots past the KV pool's first page.
+            num_tokens: tokens whose taps fit past the first KV page: the KV
+                slots, or with ``own_pages`` as many as the tap budget holds.
             own_pages: whether requests own tap pages apart from their KV slots.
         """
         if kv_page_size % page_size != 0:
@@ -129,6 +177,7 @@ class FrankyTapCache:
             None
         ] * req_to_token.shape[0]
         self._plan: Optional[_RowPlan] = None
+        self._last_encoder_id = -1
         self._max_pages = -(-req_to_token.shape[1] // page_size)
         self.own_pages = (
             FrankyOwnTapPages(
@@ -222,6 +271,8 @@ class FrankyTapCache:
         encoder_id: int,
         forward_batch: ForwardBatch,
         rows: Optional[torch.Tensor] = None,
+        padded_rows: Optional[int] = None,
+        mask_dtype: Optional[torch.dtype] = None,
     ) -> TapView:
         """Each row's query reads the taps that its request's spans give the token
         the row makes.
@@ -230,37 +281,65 @@ class FrankyTapCache:
             rows: the rows of ``forward_batch`` the queries belong to, as indices
                 into them; None for all of them. An index past the last row reads
                 nothing.
+            padded_rows, mask_dtype: with ``rows`` None, the rows the readers'
+                outputs have, padding included, and the dtype of their
+                ``has_taps``; the view then carries the forward's ``RowMasks``.
         """
-        plan = self._plan_of(forward_batch)
+        plan = self._plan_of(forward_batch, encoder_id=encoder_id)
         if rows is None:
-            page_table = plan.page_table[: plan.num_rows]
-            taps_to_read = plan.taps_to_read[: plan.num_rows]
-            num_tokens = plan.num_rows
-        else:
-            selected = rows.clamp(max=plan.num_rows)
-            page_table = plan.page_table[selected]
-            taps_to_read = plan.taps_to_read[selected]
-            num_tokens = rows.shape[0]
+            return TapView(
+                row_masks=(
+                    None
+                    if padded_rows is None
+                    else plan.row_masks(padded_rows=padded_rows, dtype=mask_dtype)
+                ),
+                taps=self._paged_taps(encoder_id),
+                request_pages=(
+                    plan.request_pages[: plan.num_rows]
+                    if plan.row_requests is None
+                    else plan.request_pages
+                ),
+                row_requests=(
+                    None
+                    if plan.row_requests is None
+                    else plan.row_requests[: plan.num_rows]
+                ),
+                taps_to_read=plan.taps_to_read[: plan.num_rows],
+                num_tokens=plan.num_rows,
+                trtllm_workspace=self._attention_workspace,
+                row_blocks=plan.row_blocks,
+            )
+        selected = rows.clamp(max=plan.num_rows)
         return TapView(
             taps=self._paged_taps(encoder_id),
-            page_table=page_table,
-            taps_to_read=taps_to_read,
-            num_tokens=num_tokens,
+            request_pages=(
+                plan.request_pages[selected]
+                if plan.row_requests is None
+                else plan.request_pages
+            ),
+            row_requests=(
+                None if plan.row_requests is None else plan.row_requests[selected]
+            ),
+            taps_to_read=plan.taps_to_read[selected],
+            num_tokens=rows.shape[0],
             trtllm_workspace=self._attention_workspace,
         )
 
-    def _plan_of(self, forward_batch: ForwardBatch) -> _RowPlan:
-        """The rows' pages and tap counts of one forward, built once for all of
-        its readers."""
-        is_decode = forward_batch.forward_mode.is_decode_or_idle()
-        # A decode CUDA graph replays one index tensor, so its plan is captured once.
-        source = forward_batch.req_pool_indices if is_decode else forward_batch
-        if self._plan is None or self._plan.source is not source:
+    def _plan_of(self, forward_batch: ForwardBatch, *, encoder_id: int) -> _RowPlan:
+        """The rows' pages and tap counts of one forward, built by its first reader
+        for all of them. Readers view their encoders in increasing order within a
+        forward, so an encoder at or below the last one starts the next forward.
+        A CUDA graph runner warms a batch up and captures it on the same tensors;
+        a plan kept across forwards would leave the captured forward reading the
+        warmup's freed plan instead of building its own.
+        """
+        if self._plan is None or encoder_id <= self._last_encoder_id:
             self._plan = (
                 self._decode_plan(forward_batch)
-                if is_decode
+                if forward_batch.forward_mode.is_decode_or_idle()
                 else self._extend_plan(forward_batch)
             )
+        self._last_encoder_id = encoder_id
         return self._plan
 
     def _extend_plan(self, forward_batch: ForwardBatch) -> _RowPlan:
@@ -281,7 +360,8 @@ class FrankyTapCache:
             + [torch.zeros(1, dtype=torch.int64)]
         )
         row_requests = torch.repeat_interleave(
-            torch.arange(len(num_rows)), torch.tensor(num_rows, dtype=torch.int64)
+            torch.arange(len(num_rows) + 1),
+            torch.tensor(num_rows + [1], dtype=torch.int64),
         )
         device = self._decode_taps_to_read.device
         num_pages = max(1, -(-int(taps_to_read.max()) // self.page_size))
@@ -289,15 +369,11 @@ class FrankyTapCache:
             forward_batch.req_pool_indices, num_pages=num_pages
         )
         return _RowPlan(
-            source=forward_batch,
-            page_table=torch.cat(
-                [
-                    page_table[_to_device(row_requests, device=device)],
-                    page_table.new_zeros((1, num_pages)),
-                ]
-            ),
+            request_pages=torch.cat([page_table, page_table.new_zeros((1, num_pages))]),
+            row_requests=_to_device(row_requests.to(torch.int32), device=device),
             taps_to_read=_to_device(taps_to_read.to(torch.int32), device=device),
-            num_rows=int(row_requests.shape[0]),
+            num_rows=sum(num_rows),
+            row_blocks=franky_reader_row_blocks(num_rows, device=device),
         )
 
     def _decode_plan(self, forward_batch: ForwardBatch) -> _RowPlan:
@@ -305,8 +381,8 @@ class FrankyTapCache:
         page_table = self._page_table(req_pool_indices, num_pages=self._max_pages)
         taps_to_read = self._decode_taps_to_read[req_pool_indices]
         return _RowPlan(
-            source=req_pool_indices,
-            page_table=torch.cat([page_table, page_table[:1] * 0]),
+            request_pages=torch.cat([page_table, page_table[:1] * 0]),
+            row_requests=None,
             taps_to_read=torch.cat([taps_to_read, taps_to_read[:1] * 0]),
             num_rows=req_pool_indices.shape[0],
         )
@@ -337,14 +413,30 @@ class FrankyTapCache:
 
 class _RowPlan(msgspec.Struct, frozen=True, kw_only=True):
     """Per row of one forward: its request's tap pages and how many taps its query
-    reads, with one more row that reads nothing. Holding ``source``, what the plan
-    was built from, keeps its identity from being reused by a later forward.
+    reads, with one more row that reads nothing.
     """
 
-    source: object
-    page_table: torch.Tensor
+    request_pages: torch.Tensor
+    row_requests: Optional[torch.Tensor]
     taps_to_read: torch.Tensor
     num_rows: int
+    row_blocks: Optional[torch.Tensor] = None
+    made_masks: dict[tuple[int, torch.dtype], RowMasks] = msgspec.field(
+        default_factory=dict
+    )
+
+    def row_masks(self, *, padded_rows: int, dtype: torch.dtype) -> RowMasks:
+        key = (padded_rows, dtype)
+        if key not in self.made_masks:
+            num_rows = min(self.num_rows, padded_rows)
+            no_taps = torch.ones(
+                padded_rows, dtype=torch.bool, device=self.taps_to_read.device
+            )
+            no_taps[:num_rows] = self.taps_to_read[:num_rows] <= 0
+            self.made_masks[key] = RowMasks(
+                no_taps=no_taps, has_taps=(~no_taps).to(dtype)[:, None]
+            )
+        return self.made_masks[key]
 
 
 def _to_device(host: torch.Tensor, *, device: torch.device) -> torch.Tensor:

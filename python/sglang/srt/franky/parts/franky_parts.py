@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -9,7 +10,7 @@ from safetensors.torch import load_file
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.kv_options import FrankyKvOptions
 from sglang.srt.franky.cache.swa_kv_allocator import FrankySwaKvAllocator
-from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
+from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache, TrtllmWorkspace
 from sglang.srt.franky.config import FrankyConfig
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 
@@ -35,11 +36,13 @@ class FrankyParts(ABC):
         injector: Injector,
         layer_indices: frozenset[int],
         device: str,
+        tap_pool_ratio: float = 1.0,
     ) -> None:
         self.config = config
         self.injector = injector
         self.device = device
         self.tap_cache: Optional[FrankyTapCache] = None
+        self._tap_pool_ratio = tap_pool_ratio
         # The layers of this PP stage that have a part, counted from 0.
         self._layer_indices = layer_indices
 
@@ -76,6 +79,13 @@ class FrankyParts(ABC):
             dtype=dtype,
             device=device,
         )
+        # At load, before the KV pools: a part this stage cannot run fails here,
+        # not at the first request.
+        injector.check_stage(
+            layer_indices=parts._layer_indices,
+            end_layer=language_model.end_layer,
+            num_layers=language_model.config.num_hidden_layers,
+        )
         language_model.franky_parts = parts
         return parts
 
@@ -97,8 +107,9 @@ class FrankyParts(ABC):
 
     def kv_options(self) -> FrankyKvOptions:
         return FrankyKvOptions(
-            tap_bytes_per_token=(
-                len(self._tap_encoder_ids())
+            tap_bytes_per_token=math.ceil(
+                self._tap_pool_ratio
+                * len(self._tap_encoder_ids())
                 * self.config.encoder.output_size
                 * TAP_DTYPE.itemsize
             ),
@@ -113,7 +124,10 @@ class FrankyParts(ABC):
         kv_allocator: BaseTokenToKVPoolAllocator,
         req_to_token_pool: ReqToTokenPool,
     ) -> None:
-        """Build the tap cache, once the KV budget has set ``num_tokens``."""
+        """Build the tap cache, once the KV budget has set ``num_tokens``: taps for
+        each of those KV slots, or for ``tap_pool_ratio`` of them in tap pages
+        that requests own.
+        """
         if not isinstance(kv_allocator, (FrankyKvAllocator, FrankySwaKvAllocator)):
             raise ValueError(
                 "Franky needs the paged KV allocator or the sliding-window one with "
@@ -124,12 +138,38 @@ class FrankyParts(ABC):
             output_size=self.config.encoder.output_size,
             page_size=self.config.tap_page_size,
             kv_page_size=kv_allocator.page_size,
-            num_tokens=num_tokens,
+            num_tokens=self._num_tap_tokens(
+                num_kv_tokens=num_tokens,
+                kv_page_size=kv_allocator.page_size,
+                context_len=req_to_token_pool.req_to_token.shape[1],
+            ),
             req_to_token=req_to_token_pool.req_to_token,
             device=self.device,
             own_pages=self._owns_tap_pages(),
             attention_workspace=self._attention_workspace(),
         )
+
+    def _num_tap_tokens(
+        self, *, num_kv_tokens: int, kv_page_size: int, context_len: int
+    ) -> int:
+        if self._tap_pool_ratio == 1:
+            return num_kv_tokens
+        if not self._owns_tap_pages():
+            raise ValueError(
+                f"Tap pool ratio {self._tap_pool_ratio}: taps live at KV slots unless "
+                "requests own tap pages, so they fit in exactly the KV slots."
+            )
+        tap_page_size = self.config.tap_page_size
+        num_tokens = (
+            int(self._tap_pool_ratio * num_kv_tokens) // kv_page_size * kv_page_size
+        )
+        if num_tokens // tap_page_size < -(-context_len // tap_page_size):
+            raise ValueError(
+                f"Tap pool ratio {self._tap_pool_ratio} holds the taps of {num_tokens} "
+                f"tokens, fewer than one request at the context length {context_len}; "
+                "raise --franky-tap-pool-ratio."
+            )
+        return num_tokens
 
     def runs_after(self, *, layer_idx: int) -> bool:
         """Whether a part of this PP stage runs after layer ``layer_idx``,
@@ -149,7 +189,7 @@ class FrankyParts(ABC):
     def read_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         """Take what an earlier PP stage carried."""
 
-    def _attention_workspace(self) -> Optional[torch.Tensor]:
+    def _attention_workspace(self) -> Optional[TrtllmWorkspace]:
         """The buffer the readers' attention kernel needs, if any."""
         return None
 

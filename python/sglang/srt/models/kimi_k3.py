@@ -30,6 +30,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.franky.parts.franky_mixin import FrankyMixin
+from sglang.srt.franky.parts.injector.attention_bank.output import (
+    AttentionBankOutput,
+    AttentionBankRead,
+)
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
@@ -37,11 +42,6 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
     AuxHiddenStatePacker,
-)
-from sglang.srt.franky.parts.franky_mixin import FrankyMixin
-from sglang.srt.franky.parts.injector.attention_bank.output import (
-    AttentionBankOutput,
-    AttentionBankRead,
 )
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata

@@ -29,6 +29,7 @@ from sglang.srt.franky.parts.reader.query import reader as query_reader
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -54,7 +55,9 @@ class _LanguageModel(FrankyMixin, nn.Module):
     def __init__(self, *, start_layer, end_layer):
         super().__init__()
         self.start_layer, self.end_layer = start_layer, end_layer
-        self.config = SimpleNamespace(hidden_size=_HIDDEN_SIZE)
+        self.config = SimpleNamespace(
+            hidden_size=_HIDDEN_SIZE, num_hidden_layers=_NUM_LAYERS
+        )
 
 
 class _Model(nn.Module):
@@ -132,6 +135,9 @@ class _Files(CustomTestCase):
         super().setUp()
         self.directory = tempfile.mkdtemp(prefix="franky_ricky_")
         self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        server_args = get_context().override_server_args()
+        server_args.install()
+        self.addCleanup(server_args.restore)
         torch.manual_seed(0)
         attention = patch.object(
             query_reader, "flash_attn_with_kvcache", _flash_attention_on_cpu

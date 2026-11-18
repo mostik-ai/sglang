@@ -105,6 +105,7 @@ class TestReaderAttention(CustomTestCase):
             tap_cache=self.tap_cache,
             encoder_id=0,
             forward_batch=batch,
+            rows=None,
         )
         return queries, attended, has_taps
 
@@ -193,6 +194,7 @@ class TestReaderAttention(CustomTestCase):
                 tap_cache=self.tap_cache,
                 encoder_id=0,
                 forward_batch=batch,
+                rows=None,
             )
 
         step()

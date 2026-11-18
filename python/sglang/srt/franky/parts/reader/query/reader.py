@@ -8,7 +8,7 @@ from torch import nn
 from typing_extensions import override
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
-from sglang.srt.franky.cache.tap_cache import TAP_DTYPE
+from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, TrtllmWorkspace
 from sglang.srt.franky.parts.reader.reader import Reader
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
@@ -101,7 +101,11 @@ def _attend_taps(
         attended,
         has_taps,
         view=tap_cache.view(
-            encoder_id=encoder_id, forward_batch=forward_batch, rows=rows
+            encoder_id=encoder_id,
+            forward_batch=forward_batch,
+            rows=rows,
+            padded_rows=attended.shape[0],
+            mask_dtype=has_taps.dtype,
         ),
     )
 
@@ -116,6 +120,13 @@ def attend_taps(
     """Write each row's attended taps into ``attended``, and 1 or 0 into
     ``has_taps`` by whether it read any.
     """
+    if view.row_masks is not None:
+        has_taps.copy_(view.row_masks.has_taps)
+        if view.num_tokens > 0:
+            rows = slice(0, view.num_tokens)
+            _attend(queries[rows], view, out=attended[rows])
+        attended.masked_fill_(view.row_masks.no_taps[:, None, None], 0)
+        return
     padding = slice(view.num_tokens, None)
     attended[padding].zero_()
     has_taps[padding].zero_()
@@ -128,25 +139,51 @@ def attend_taps(
     has_taps[rows, 0] = reads.to(has_taps.dtype)
 
 
-def attention_workspace(*, device: str) -> Optional[torch.Tensor]:
+# Split-KV completion tickets, one int32 a query head of a row, for 2^18 rows of
+# 8 heads: a forward's rows stay far below.
+_TRTLLM_COUNTER_BYTES = (1 << 18) * 8 * 4
+
+
+def attention_workspace(*, device: str) -> Optional[TrtllmWorkspace]:
     """
     Returns:
-        A zeroed workspace for the TRT-LLM kernels the readers run on Blackwell,
-        or None where they run FA3.
+        The zeroed workspace for the TRT-LLM kernels the readers run on
+        Blackwell, or None where they run FA3.
     """
     if torch.device(device).type != "cuda":
         return None
     if torch.cuda.get_device_capability(device)[0] < 10:
         return None
-    # Arbitrary size; the kernels need it zeroed once.
-    return torch.zeros(256 << 20, dtype=torch.uint8, device=device)
+    return TrtllmWorkspace(
+        # Arbitrary size; the kernels need it zeroed once.
+        buffer=torch.zeros(256 << 20, dtype=torch.uint8, device=device),
+        counters=torch.zeros(_TRTLLM_COUNTER_BYTES, dtype=torch.uint8, device=device),
+    )
 
 
 def _attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
-    if view.trtllm_workspace is None:
+    if view.row_blocks is not None and queries.shape[1] == 1 and queries.is_cuda:
+        _prefill_attend(queries, view, out=out)
+    elif view.trtllm_workspace is None:
         _fa3_attend(queries, view, out=out)
     else:
         _trtllm_attend(queries, view, out=out)
+
+
+def _prefill_attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
+    from sglang.kernels.ops.attention.franky_reader_prefill import (
+        franky_reader_prefill,
+    )
+
+    num_pages, page_size, _, tap_size = view.taps.shape
+    franky_reader_prefill(
+        queries.view(-1, tap_size),
+        view.taps.view(num_pages, page_size, tap_size),
+        view.request_pages,
+        view.taps_to_read,
+        view.row_blocks,
+        out=out.view(-1, tap_size),
+    )
 
 
 def _fa3_attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -> None:
@@ -172,7 +209,8 @@ def _trtllm_attend(queries: torch.Tensor, view: TapView, *, out: torch.Tensor) -
     result = decode.trtllm_batch_decode_with_kv_cache(
         query=queries,
         kv_cache=(taps, taps),
-        workspace_buffer=view.trtllm_workspace,
+        workspace_buffer=view.trtllm_workspace.buffer,
+        multi_ctas_kv_counter_buffer=view.trtllm_workspace.counters,
         block_tables=view.page_table,
         seq_lens=view.taps_to_read,
         max_seq_len=view.page_table.shape[1] * page_size,

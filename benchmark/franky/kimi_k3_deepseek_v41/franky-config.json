@@ -1,0 +1,19 @@
+{
+  "encoder": {
+    "type": "singular",
+    "layers": [5, 9, 14, 19, 23, 28, 33, 37, 42, 46, 51, 56, 60, 65, 70, 74, 79, 84, 88, 93],
+    "output_size": 256
+  },
+  "reader": {
+    "type": "residual_query",
+    "layers": [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40],
+    "num_queries": 1,
+    "mlp_hidden_size": 1024
+  },
+  "injector": {
+    "sandy": {"type": "attention_bank"},
+    "ricky": {"type": "hyper_connection"}
+  },
+  "tap_page_size": 64,
+  "shared_tokenizer": false
+}
