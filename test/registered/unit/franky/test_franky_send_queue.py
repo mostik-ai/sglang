@@ -159,11 +159,7 @@ class _Queue(CustomTestCase):
                 attn_cp_cpu_group=dist.group.WORLD,
                 pp_store=self.store,
             ),
-            chain_holds=FrankyChainHolds(
-                tree_cache=self.lock_tree,
-                max_held_tokens=1000,
-                hold_seconds=60,
-            ),
+            chain_holds=FrankyChainHolds(tree_cache=self.lock_tree, hold_seconds=60),
             page_size=_PAGE_SIZE,
             open_room=lambda req: self.sender,
         )

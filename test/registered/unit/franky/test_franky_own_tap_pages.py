@@ -154,9 +154,7 @@ def _request(room, *, sandy_input_len, chain=None):
 
 
 def _decode_holds(own_pages):
-    return FrankyChainHolds(
-        tree_cache=None, max_held_tokens=0, hold_seconds=60.0, own_pages=own_pages
-    )
+    return FrankyChainHolds(tree_cache=None, hold_seconds=60.0, own_pages=own_pages)
 
 
 def _reservations(own_pages, *, holds):
@@ -254,23 +252,49 @@ class TestOwnTapReservations(CustomTestCase):
 
         self.assertEqual(self.own_pages.num_free(), 12)
 
-    def test_a_request_short_of_pages_takes_the_newest_held_ones(self):
-        for room, chain_id in ((1, "a"), (2, "b")):
-            block = self._expect(
-                room,
-                sandy_input_len=24,
-                chain=FrankyChain(id=chain_id, block_size=8),
-            )
-            self.reservations.poll()
-            self._end(block, FINISH_LENGTH(length=8))
+    def _held_block(self, room, chain_id, *, block, sandy_input_len):
+        request = self._expect(
+            room,
+            sandy_input_len=sandy_input_len,
+            chain=FrankyChain(id=chain_id, block=block, block_size=8),
+        )
+        self.reservations.poll()
+        self._end(request, FINISH_LENGTH(length=8))
+
+    def test_a_new_request_short_of_pages_waits_and_the_holds_stay(self):
+        self._held_block(1, "a", block=1, sandy_input_len=24)
+        self._held_block(2, "b", block=1, sandy_input_len=24)
 
         self._expect(3, sandy_input_len=24)
         self.reservations.poll()
 
-        self.assertIsNotNone(self.reservations.pages_of(room=3))
-        self.assertEqual(self.holds.held_tap_pages, 6)
-        self.assertIsNone(self.holds.take_taps(chain_id="b"))
+        self.assertTrue(self.reservations.waits(room=3))
         self.assertIsNotNone(self.holds.take_taps(chain_id="a"))
+        self.assertIsNotNone(self.holds.take_taps(chain_id="b"))
+
+    def test_a_held_chains_next_block_short_of_pages_releases_another(self):
+        self._held_block(1, "c", block=1, sandy_input_len=12)
+        self._held_block(2, "far", block=3, sandy_input_len=24)
+        self._held_block(3, "early", block=1, sandy_input_len=12)
+
+        self._block(2, room=4, sandy_input_len=20, starts=(12,))
+        self.reservations.poll()
+
+        self.assertIsNotNone(self.reservations.pages_of(room=4))
+        self.assertIsNone(self.holds.take_taps(chain_id="early"))
+        self.assertIsNotNone(self.holds.take_taps(chain_id="far"))
+
+    def test_held_chains_next_blocks_take_pages_before_earlier_requests(self):
+        self._held_block(1, "c", block=1, sandy_input_len=12)
+        self._held_block(2, "x", block=1, sandy_input_len=12)
+        self._expect(3, sandy_input_len=24)
+        self._block(2, room=4, sandy_input_len=20, starts=(12,))
+
+        self.reservations.poll()
+
+        self.assertIsNotNone(self.reservations.pages_of(room=4))
+        self.assertTrue(self.reservations.waits(room=3))
+        self.assertIsNotNone(self.holds.take_taps(chain_id="x"))
 
     def test_a_request_past_the_pages_one_may_own_is_too_large(self):
         too_large = self._expect(1, sandy_input_len=25)

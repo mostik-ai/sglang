@@ -25,9 +25,11 @@ class _Tree:
         self.locked.remove(lock.node)
 
 
-def _block(chain_id, *, node, num_tokens=1, last_block=False):
+def _block(chain_id, *, node, num_tokens=1, block=1, last_block=False):
     return SimpleNamespace(
-        franky_chain=FrankyChain(id=chain_id, block_size=8, last_block=last_block),
+        franky_chain=FrankyChain(
+            id=chain_id, block=block, block_size=8, last_block=last_block
+        ),
         last_node=node,
         origin_input_ids=[0] * num_tokens,
     )
@@ -38,12 +40,8 @@ class TestFrankyChainHolds(CustomTestCase):
         super().setUp()
         self.tree = _Tree()
 
-    def _holds(self, *, max_held_tokens=100, hold_seconds=60.0):
-        return FrankyChainHolds(
-            tree_cache=self.tree,
-            max_held_tokens=max_held_tokens,
-            hold_seconds=hold_seconds,
-        )
+    def _holds(self, *, hold_seconds=60.0):
+        return FrankyChainHolds(tree_cache=self.tree, hold_seconds=hold_seconds)
 
     def test_a_chains_next_hold_replaces_its_last(self):
         holds = self._holds()
@@ -52,7 +50,6 @@ class TestFrankyChainHolds(CustomTestCase):
         holds.hold_for_next_block(_block("c", node="block-2", num_tokens=20))
 
         self.assertEqual(self.tree.locked, ["block-2"])
-        self.assertEqual(holds.held_tokens, 20)
 
     def test_a_last_block_releases_its_chains_hold(self):
         holds = self._holds()
@@ -61,7 +58,6 @@ class TestFrankyChainHolds(CustomTestCase):
         holds.hold_for_next_block(_block("c", node="block-2", last_block=True))
 
         self.assertEqual(self.tree.locked, [])
-        self.assertEqual(holds.held_tokens, 0)
 
     def test_a_request_outside_chains_holds_nothing(self):
         holds = self._holds()
@@ -72,26 +68,57 @@ class TestFrankyChainHolds(CustomTestCase):
 
         self.assertEqual(self.tree.locked, [])
 
-    def test_past_the_cap_the_oldest_holds_go(self):
-        holds = self._holds(max_held_tokens=50)
-        holds.hold_for_next_block(_block("a", node="a", num_tokens=20))
-        holds.hold_for_next_block(_block("b", node="b", num_tokens=20))
-        holds.hold_for_next_block(_block("a", node="a2", num_tokens=20))
-
-        holds.hold_for_next_block(_block("c", node="c", num_tokens=20))
-
-        self.assertEqual(self.tree.locked, ["a2", "c"])
-        self.assertEqual(holds.held_tokens, 40)
-
-    def test_release_oldest_goes_in_the_order_holds_were_taken(self):
+    def test_holds_keep_every_chain_however_many_tokens(self):
         holds = self._holds()
-        holds.hold_for_next_block(_block("a", node="a"))
-        holds.hold_for_next_block(_block("b", node="b"))
 
-        self.assertTrue(holds.release_oldest())
-        self.assertEqual(self.tree.locked, ["b"])
-        self.assertTrue(holds.release_oldest())
-        self.assertFalse(holds.release_oldest())
+        for chain_id in "abcdefgh":
+            holds.hold_for_next_block(
+                _block(chain_id, node=chain_id, num_tokens=1_000_000)
+            )
+
+        self.assertEqual(self.tree.locked, list("abcdefgh"))
+
+    def test_least_progress_goes_first_then_the_most_tokens_but_not_the_asker(self):
+        holds = self._holds()
+        holds.hold_for_next_block(_block("far", node="far", num_tokens=90, block=5))
+        holds.hold_for_next_block(_block("small", node="small", num_tokens=10))
+        holds.hold_for_next_block(_block("big", node="big", num_tokens=50))
+        holds.hold_for_next_block(_block("asker", node="asker", num_tokens=99))
+
+        released = [
+            holds.release_least_progress(sparing_chain_id="asker") for _ in range(4)
+        ]
+
+        self.assertEqual(released, [True, True, True, False])
+        self.assertEqual(self.tree.locked, ["asker"])
+
+    def test_the_first_release_frees_the_biggest_chain_of_the_fewest_blocks(self):
+        holds = self._holds()
+        holds.hold_for_next_block(_block("far", node="far", num_tokens=90, block=5))
+        holds.hold_for_next_block(_block("small", node="small", num_tokens=10))
+        holds.hold_for_next_block(_block("big", node="big", num_tokens=50))
+
+        holds.release_least_progress(sparing_chain_id=None)
+
+        self.assertEqual(self.tree.locked, ["far", "small"])
+
+    def test_held_chains_go_first_and_keep_their_order(self):
+        holds = self._holds()
+        holds.hold_for_next_block(_block("held-1", node="h1"))
+        holds.hold_for_next_block(_block("held-2", node="h2"))
+        requests = [
+            _block("new", node="n"),
+            _block("held-2", node="h2", block=2),
+            SimpleNamespace(franky_chain=None),
+            _block("held-1", node="h1", block=2),
+        ]
+
+        holds.put_held_chains_first(requests)
+
+        self.assertEqual(
+            [None if r.franky_chain is None else r.franky_chain.id for r in requests],
+            ["held-2", "held-1", "new", None],
+        )
 
     def test_locked_nodes_name_each_held_node_once(self):
         holds = self._holds()
@@ -109,7 +136,6 @@ class TestFrankyChainHolds(CustomTestCase):
         holds.release_all()
 
         self.assertEqual(self.tree.locked, [])
-        self.assertEqual(holds.held_tokens, 0)
 
     def test_releasing_a_chain_without_a_hold_does_nothing(self):
         holds = self._holds()
@@ -162,10 +188,7 @@ class TestFrankyChainHoldsOfTapPages(CustomTestCase):
 
     def _holds(self):
         return FrankyChainHolds(
-            tree_cache=self.tree,
-            max_held_tokens=100,
-            hold_seconds=60.0,
-            own_pages=self.own_pages,
+            tree_cache=self.tree, hold_seconds=60.0, own_pages=self.own_pages
         )
 
     def _taps(self, num_pages, *, num_taps):
@@ -178,17 +201,17 @@ class TestFrankyChainHoldsOfTapPages(CustomTestCase):
 
         self.holds.hold_for_next_block(_block("c", node="c"), taps=taps)
 
-        self.assertEqual(self.holds.held_tap_pages, 3)
         self.assertIs(self.holds.take_taps(chain_id="c"), taps)
         self.assertIsNone(self.holds.take_taps(chain_id="c"))
-        self.assertEqual(self.holds.held_tap_pages, 0)
         self.assertEqual(self.tree.locked, ["c"], "the KV hold stays")
         self.assertEqual(self.own_pages.num_free(), 5)
 
     def test_every_way_a_hold_ends_gives_its_tap_pages_back(self):
         ends = {
             "release": lambda holds: holds.release(chain_id="c"),
-            "release_oldest": lambda holds: holds.release_oldest(),
+            "least progress": lambda holds: holds.release_least_progress(
+                sparing_chain_id=None
+            ),
             "release_all": lambda holds: holds.release_all(),
             "expiry": lambda holds: holds.on_hold_expired(
                 message=FrankyHoldExpired(chain_id="c", order=0)
@@ -209,22 +232,23 @@ class TestFrankyChainHoldsOfTapPages(CustomTestCase):
                 self.assertEqual(self.own_pages.num_free(), 8)
                 holds.release_all()
 
-    def test_tap_pages_go_back_newest_first_while_prompts_stay_locked(self):
-        self.holds.hold_for_next_block(
-            _block("a", node="a"), taps=self._taps(2, num_taps=20)
+    def test_a_taps_only_hold_ranks_by_the_taps_it_keeps(self):
+        holds = FrankyChainHolds(
+            tree_cache=None, hold_seconds=60.0, own_pages=self.own_pages
         )
-        self.holds.hold_for_next_block(
-            _block("b", node="b"), taps=self._taps(3, num_taps=40)
+        holds.hold_for_next_block(
+            _block("few", node=None), taps=self._taps(2, num_taps=20)
         )
-        self.holds.hold_for_next_block(_block("c", node="c"))
+        holds.hold_for_next_block(
+            _block("many", node=None), taps=self._taps(3, num_taps=40)
+        )
 
-        self.assertTrue(self.holds.release_newest_taps())
+        holds.release_least_progress(sparing_chain_id=None)
 
         self.assertEqual(self.own_pages.num_free(), 6)
-        self.assertIsNone(self.holds.take_taps(chain_id="b"))
-        self.assertEqual(self.tree.locked, ["a", "b", "c"])
-        self.assertTrue(self.holds.release_newest_taps())
-        self.assertFalse(self.holds.release_newest_taps())
+        self.assertIsNone(holds.take_taps(chain_id="many"))
+        self.assertIsNotNone(holds.take_taps(chain_id="few"))
+        self.assertEqual(self.tree.locked, [], "decode's holds lock no prompt")
 
     def test_a_last_block_or_one_outside_chains_gives_its_tap_pages_back(self):
         plain = SimpleNamespace(franky_chain=None, last_node="n", origin_input_ids=[0])

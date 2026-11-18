@@ -60,8 +60,10 @@ class FrankyReceiveQueue:
     KV pages for its prompt past its cached prefix, as PD decode does, and its
     taps land from Sandy in the tap pages of those pages; when Sandy tokenizes on
     its own, in tap pages the request owns, all of its taps but those of the
-    whole pages its chain's last block left it. Decisions reach every rank and
-    stage at one step as leader messages, as Sandy's releases do.
+    whole pages its chain's last block left it. A request waits until its pages
+    fit; only a held chain's next block, which goes first, may release another
+    chain's hold for them. Decisions reach every rank and stage at one step as
+    leader messages, as Sandy's releases do.
     """
 
     def __init__(
@@ -204,6 +206,7 @@ class FrankyReceiveQueue:
         return not self.arrivals and not self.receptions
 
     def _take_pages_for_arrivals(self) -> None:
+        self.arrivals.sort(key=self._is_not_of_a_held_chain)
         while self.arrivals:
             req = self.arrivals.pop(0)
             if not self._take_pages(req):
@@ -260,8 +263,11 @@ class FrankyReceiveQueue:
         prefix_lock = (
             self.tree_cache.lock(req.last_node) if req.prefix_len > 0 else None
         )
-        if not self._fits_after_releasing_holds(
-            num_page_slots, num_own_pages=num_new_own_pages, prefix_lock=prefix_lock
+        if not self._fits_or_releases_a_hold(
+            req,
+            num_page_slots,
+            num_own_pages=num_new_own_pages,
+            prefix_lock=prefix_lock,
         ):
             self.tree_cache.unlock(prefix_lock)
             return False
@@ -391,33 +397,52 @@ class FrankyReceiveQueue:
             return req.franky_sandy_input_len
         return len(req.origin_input_ids)
 
-    def _fits_after_releasing_holds(
+    def _fits_or_releases_a_hold(
+        self,
+        req: Req,
+        num_page_slots: int,
+        *,
+        num_own_pages: int,
+        prefix_lock: Optional[TreeLock],
+    ) -> bool:
+        def fits() -> bool:
+            return self._fits(
+                num_page_slots, num_own_pages=num_own_pages, prefix_lock=prefix_lock
+            )
+
+        if not self._is_of_a_held_chain(req):
+            return fits()
+        while not fits():
+            if not self.chain_holds.release_least_progress(
+                sparing_chain_id=req.franky_chain.id
+            ):
+                return False
+        return True
+
+    def _fits(
         self,
         num_page_slots: int,
         *,
         num_own_pages: int,
         prefix_lock: Optional[TreeLock],
     ) -> bool:
-        if self._free_slots() + self.chain_holds.held_tokens < num_page_slots:
-            return False
-        if self._free_own_pages() + self.chain_holds.held_tap_pages < num_own_pages:
-            return False
-        while not self._fits(num_page_slots, prefix_lock=prefix_lock):
-            if not self.chain_holds.release_oldest():
-                return False
-        while self._free_own_pages() < num_own_pages:
-            if not self.chain_holds.release_newest_taps():
-                return False
-        return True
-
-    def _fits(self, num_page_slots: int, *, prefix_lock: Optional[TreeLock]) -> bool:
-        return self._free_slots() >= num_page_slots and self._fits_mamba_room(
-            arriving_prefix_lock=prefix_lock
+        return (
+            self._free_slots() >= num_page_slots
+            and self._free_own_pages() >= num_own_pages
+            and self._fits_mamba_room(arriving_prefix_lock=prefix_lock)
         )
+
+    def _is_of_a_held_chain(self, req: Req) -> bool:
+        return req.rid in self.taps_from_last_block or self.chain_holds.holds_chain_of(
+            req
+        )
+
+    def _is_not_of_a_held_chain(self, req: Req) -> bool:
+        return not self._is_of_a_held_chain(req)
 
     def _release_holds_past_the_mamba_room(self) -> None:
         while not self._fits_mamba_room():
-            if not self.chain_holds.release_oldest():
+            if not self.chain_holds.release_least_progress(sparing_chain_id=None):
                 return
 
     def _fits_mamba_room(

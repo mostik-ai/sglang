@@ -27,8 +27,10 @@ class FrankyOwnTapReservations:
     before PD registers its KV, so the relay has somewhere to land, and gives
     them back once it ended and PD released its KV, after which no relay writes
     them. A block that ended at its length leaves them to its chain's next block
-    instead, whose relay lands only the taps past their whole pages. Every rank
-    takes and frees at the same steps, as it decides on KV.
+    instead, whose relay lands only the taps past their whole pages. A request
+    waits until its pages fit; only a held chain's next block, which goes first,
+    may release another chain's hold for them. Every rank takes and frees at the
+    same steps, as it decides on KV.
     """
 
     def __init__(
@@ -54,17 +56,19 @@ class FrankyOwnTapReservations:
 
     def poll(self) -> None:
         """Every rank, at each step: hold or free the pages of ended requests, then
-        take pages for waiting ones in order while they fit.
+        take pages for waiting ones while they fit, held chains' next blocks
+        first, the rest in arrival order.
         """
         for room, reservation in list(self._reserved.items()):
             if reservation.req.finished() and not reservation.req.kv.holds_kv:
                 self._hold_or_give_back(reservation)
                 del self._reserved[room]
-        for room, req in list(self._waiting.items()):
+        for room in sorted(self._waiting, key=self._is_not_of_a_held_chain):
+            req = self._waiting[room]
             if req.finished():
                 self._forget_waiting(room)
                 continue
-            if self._too_large(req) or not self._fits_after_releasing_holds(room, req):
+            if self._too_large(req) or not self._fits_or_releases_a_hold(room, req):
                 return
             self._reserve(room, req)
 
@@ -122,15 +126,19 @@ class FrankyOwnTapReservations:
         if taps is not None:
             self._own_pages.free(taps.pages)
 
-    def _fits_after_releasing_holds(self, room: int, req: Req) -> bool:
+    def _fits_or_releases_a_hold(self, room: int, req: Req) -> bool:
         num_new_pages = self._num_new_pages(room, req)
-        free_pages = self._own_pages.num_free()
-        if free_pages + self._chain_holds.held_tap_pages < num_new_pages:
-            return False
+        if self._is_not_of_a_held_chain(room):
+            return self._own_pages.num_free() >= num_new_pages
         while self._own_pages.num_free() < num_new_pages:
-            if not self._chain_holds.release_newest_taps():
+            if not self._chain_holds.release_least_progress(
+                sparing_chain_id=req.franky_chain.id
+            ):
                 return False
         return True
+
+    def _is_not_of_a_held_chain(self, room: int) -> bool:
+        return room not in self._last_block_taps
 
     def _reserve(self, room: int, req: Req) -> None:
         new_pages = self._own_pages.take(num_pages=self._num_new_pages(room, req))
