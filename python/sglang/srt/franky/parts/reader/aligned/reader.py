@@ -31,15 +31,22 @@ class AlignedReader(Reader):
     """Adds, at each row whose input token is outside its request's answers, a
     linear map of the tap Sandy wrote at that same token, times a fixed scale: the
     two sides' views align token for token. Answer rows, so every decode row, add
-    zero.
+    zero. With ``replace``, a writing row adds the map minus its own residual, so
+    its residual becomes the map.
     """
 
     def __init__(
-        self, *, input_size: int, ricky_hidden_size: int, output_scale: float
+        self,
+        *,
+        input_size: int,
+        ricky_hidden_size: int,
+        output_scale: float,
+        replace: bool = False,
     ) -> None:
         super().__init__()
         self.projection = nn.Linear(input_size, ricky_hidden_size)
         self.output_scale = output_scale
+        self.replace = replace
 
     @override
     def forward(
@@ -65,8 +72,12 @@ class AlignedReader(Reader):
             forward_batch=forward_batch,
         )
         weight = self.projection.weight
-        added = self.projection(taps.to(weight.dtype)) * self.output_scale
-        return added.to(residual.dtype) * reads.to(residual.dtype)
+        mapped = self.projection(taps.to(weight.dtype)) * self.output_scale
+        mapped = mapped.to(residual.dtype)
+        if self.replace:
+            # where, not a product: a CUDA graph's padding rows may hold any residual
+            return torch.where(reads.bool(), mapped - residual, 0.0)
+        return mapped * reads.to(residual.dtype)
 
 
 @eager_on_graph

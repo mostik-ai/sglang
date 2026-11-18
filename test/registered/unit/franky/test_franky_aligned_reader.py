@@ -2,7 +2,8 @@
 it: each row whose input token is in its request's write ranges adds a map of the
 tap Sandy wrote at that same token. Every other row - prompt rows outside the
 ranges, answer tokens, requests without taps, CUDA graph padding, every decode
-row - must add exactly zero, bias included.
+row - must add exactly zero, bias included. A replacing reader sets each writing
+row's residual to the map instead, and still adds exactly zero everywhere else.
 """
 
 import unittest
@@ -185,10 +186,13 @@ class _FixedTaps:
 
 
 class TestAlignedReader(CustomTestCase):
-    def _reader(self) -> AlignedReader:
+    def _reader(self, *, replace: bool = False) -> AlignedReader:
         torch.manual_seed(0)
         reader = AlignedReader(
-            input_size=_OUTPUT_SIZE, ricky_hidden_size=_RICKY_HIDDEN, output_scale=2.0
+            input_size=_OUTPUT_SIZE,
+            ricky_hidden_size=_RICKY_HIDDEN,
+            output_scale=2.0,
+            replace=replace,
         )
         torch.nn.init.normal_(reader.projection.weight)
         torch.nn.init.ones_(reader.projection.bias)
@@ -215,16 +219,42 @@ class TestAlignedReader(CustomTestCase):
         self.assertTrue(torch.allclose(added[reads], expected[reads], atol=1e-6))
         self.assertTrue(torch.all(added[~reads] == 0))
 
-    def test_a_decode_forward_adds_zeros(self):
-        added = self._reader()(
-            tap_cache=_FixedTaps(None),
+    def test_a_replacing_row_ends_at_the_scaled_map_and_others_add_exact_zeros(self):
+        reader = self._reader(replace=True)
+        taps = torch.randn(4, _OUTPUT_SIZE)
+        reads = torch.tensor([True, False, True, False])
+        residual = 10 * torch.randn(4, _RICKY_HIDDEN)
+        # a CUDA graph's padding row may hold anything, and must still gain zero
+        residual[3] = float("nan")
+
+        added = reader(
+            tap_cache=_FixedTaps(
+                AlignedTaps(
+                    taps=taps, reads=reads, positions=[0, 1, 2, 3], requests=[0] * 4
+                )
+            ),
             encoder_id=0,
-            residual=torch.ones(3, _RICKY_HIDDEN),
-            forward_batch=SimpleNamespace(forward_mode=ForwardMode.DECODE),
+            residual=residual,
+            forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
         )
 
-        self.assertEqual(tuple(added.shape), (3, _RICKY_HIDDEN))
-        self.assertTrue(torch.all(added == 0))
+        expected = 2.0 * reader.projection(taps.to(TAP_DTYPE).float())
+        self.assertTrue(
+            torch.allclose((residual + added)[reads], expected[reads], atol=1e-5)
+        )
+        self.assertTrue(torch.all(added[~reads] == 0))
+
+    def test_a_decode_forward_adds_zeros(self):
+        for replace in (False, True):
+            added = self._reader(replace=replace)(
+                tap_cache=_FixedTaps(None),
+                encoder_id=0,
+                residual=torch.ones(3, _RICKY_HIDDEN),
+                forward_batch=SimpleNamespace(forward_mode=ForwardMode.DECODE),
+            )
+
+            self.assertEqual(tuple(added.shape), (3, _RICKY_HIDDEN))
+            self.assertTrue(torch.all(added == 0))
 
 
 class TestSingularNormedEncoder(CustomTestCase):
@@ -280,6 +310,19 @@ class TestAlignedConfig(CustomTestCase):
         self.assertEqual(reader.output_scale, 3.5)
         self.assertIsInstance(encoder, SingularNormedEncoder)
         self.assertEqual(encoder.input_layers, (16,))
+
+    def test_a_reader_replaces_only_when_its_config_says_so(self):
+        for body, replace in (
+            (
+                b'{"type": "aligned", "layers": [12], "output_scale": 1, "replace": true}',
+                True,
+            ),
+            (b'{"type": "aligned", "layers": [8], "output_scale": 3.5}', False),
+        ):
+            reader = msgspec.json.decode(body, type=ReaderConfig).build(
+                input_size=_OUTPUT_SIZE, ricky_hidden_size=_RICKY_HIDDEN
+            )
+            self.assertIs(reader.replace, replace)
 
     def test_an_aligned_reader_without_a_positive_scale_is_refused(self):
         with self.assertRaises(msgspec.ValidationError):
