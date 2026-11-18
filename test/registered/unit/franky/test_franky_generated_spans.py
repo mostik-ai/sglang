@@ -92,6 +92,50 @@ class TestFrankyGeneratedSpans(CustomTestCase):
             ),
         )
 
+    def test_with_sandy_on_its_own_each_block_reads_sandys_tokens_before_it(self):
+        # A prompt of 22 tokens and two earlier 4-token blocks; Sandy's copy of
+        # the answer starts at its token 20, its blocks at 23 and 27.
+        chain = FrankyChain(id="c", block=3, block_size=4, sandy_block_starts=(20, 23))
+
+        spans = FrankyGeneratedSpans.of(
+            earlier_answers=_SANDY_ANSWERS_FROM_3_AND_FROM_12[:1],
+            num_input_tokens=30,
+            chain=chain,
+            sandy_input_len=27,
+        )
+
+        self.assertEqual(
+            spans.spans,
+            (
+                GeneratedSpan(start=5, sandy_start=3, end=11, sandy_block_starts=()),
+                GeneratedSpan(start=22, sandy_start=20, sandy_block_starts=(23, 27)),
+            ),
+        )
+        taps = spans.taps_to_read(torch.arange(36))
+        self.assertEqual(
+            taps.tolist(),
+            [0] * 5 + [3] * 6 + [0] * 11 + [20] * 4 + [23] * 4 + [27] * 6,
+        )
+
+    def test_with_sandy_on_its_own_rows_stop_at_the_first_block_past_the_taps(self):
+        chain = FrankyChain(
+            id="c", block=4, block_size=4, sandy_block_starts=(20, 23, 23)
+        )
+        spans = FrankyGeneratedSpans.of(
+            earlier_answers=_SANDY_ANSWERS_FROM_3_AND_FROM_12[:1],
+            num_input_tokens=34,
+            chain=chain,
+            sandy_input_len=29,
+        )
+        reads = spans.taps_to_read(torch.arange(1, 60))
+
+        for num_taps in range(29):
+            with self.subTest(num_taps=num_taps):
+                rows = spans.rows_reading_at_most(num_taps)
+                self.assertTrue(bool((reads[:rows] <= num_taps).all()))
+                self.assertGreater(int(reads[rows]), num_taps)
+        self.assertEqual(spans.rows_reading_at_most(29), sys.maxsize)
+
     def test_without_a_chain_the_answer_starts_after_the_input(self):
         spans = FrankyGeneratedSpans.of(
             earlier_answers=(), num_input_tokens=356, chain=None, sandy_input_len=None

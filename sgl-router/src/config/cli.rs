@@ -199,8 +199,7 @@ pub struct ServerArgs {
         long,
         value_name = "PATH",
         requires = "franky_chat_adapter",
-        requires = "franky_sandy_chat_adapter",
-        conflicts_with = "franky_block_size"
+        requires = "franky_sandy_chat_adapter"
     )]
     pub franky_sandy_tokenizer_path: Option<String>,
     /// Franky: Sandy's chat template, as --franky-chat-adapter names the served
@@ -1582,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn franky_sandy_tokenizer_needs_both_chat_adapters_and_no_blocks() {
+    fn franky_sandy_tokenizer_needs_both_chat_adapters() {
         let base = with_model(&["--worker-urls", "http://10.0.0.1:30000"]);
         for extra in [
             vec![
@@ -1598,16 +1597,6 @@ mod tests {
                 "deepseek-v4",
             ],
             vec!["--franky-sandy-chat-adapter", "kimi-k3"],
-            vec![
-                "--franky-sandy-tokenizer-path",
-                "/k3",
-                "--franky-sandy-chat-adapter",
-                "kimi-k3",
-                "--franky-chat-adapter",
-                "deepseek-v4",
-                "--franky-block-size",
-                "64",
-            ],
         ] {
             let args = [
                 base.clone(),
