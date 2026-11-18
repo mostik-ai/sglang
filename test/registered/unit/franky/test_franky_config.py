@@ -43,7 +43,7 @@ _CONFIG = {
         "num_queries": 1,
         "mlp_hidden_size": 1024,
     },
-    "injector": {"type": "residual"},
+    "injector": {"sandy": {"type": "residual"}, "ricky": {"type": "residual"}},
     "tap_page_size": 64,
 }
 
@@ -91,7 +91,8 @@ class TestFrankyConfig(_WithFiles):
                 loaded = self._load(encoder_type=encoder_type)
                 self.assertIs(loaded.encoder.encoder_cls, encoder_cls)
         self.assertIs(self._load().reader.reader_cls, ResidualQueryReader)
-        self.assertIsInstance(self._load().injector, ResidualInjectorConfig)
+        self.assertIsInstance(self._load().injector.sandy, ResidualInjectorConfig)
+        self.assertIsInstance(self._load().injector.ricky, ResidualInjectorConfig)
 
     def test_bad_configs_are_refused(self):
         for reason, edit in {
@@ -99,7 +100,8 @@ class TestFrankyConfig(_WithFiles):
             "unknown field `output_sizes`": lambda c: c["encoder"].update(
                 output_sizes=256
             ),
-            "unknown field `scale`": lambda c: c["injector"].update(scale=2),
+            "unknown field `scale`": lambda c: c["injector"]["ricky"].update(scale=2),
+            "missing required field `sandy`": lambda c: c["injector"].pop("sandy"),
             "missing required field `tap_page_size`": lambda c: c.pop("tap_page_size"),
             "3 encoders and 2 readers": lambda c: c["reader"].update(layers=[1, 4]),
             "at `\\$.encoder.layers\\[0\\]`": lambda c: c["encoder"].update(

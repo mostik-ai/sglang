@@ -6,7 +6,7 @@ from typing import Annotated
 import msgspec
 
 from sglang.srt.franky.parts.encoder.config import EncoderConfig
-from sglang.srt.franky.parts.injector.config import InjectorConfig
+from sglang.srt.franky.parts.injector.config import InjectorsConfig
 from sglang.srt.franky.parts.reader.config import ReaderConfig
 
 
@@ -25,7 +25,7 @@ class FrankyConfig(
 
     encoder: EncoderConfig
     reader: ReaderConfig
-    injector: InjectorConfig
+    injector: InjectorsConfig
     # Each KV page pairs with one tap page, so both sides run this --page-size.
     tap_page_size: Annotated[int, msgspec.Meta(gt=1)]
 

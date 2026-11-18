@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
+from sglang.srt.franky.parts.injector.residual.output import StreamOutput
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -489,6 +490,8 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(FrankyMixin, Qwen2Model):
+    franky_output_cls = StreamOutput
+
     def __init__(
         self,
         config: Qwen3Config,

@@ -19,6 +19,8 @@ from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
 from sglang.srt.franky.parts.encoder.all.encoder import AllEncoder
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
+from sglang.srt.franky.parts.injector.residual.output import StreamOutput
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -42,6 +44,8 @@ def _pr_linear_encoder(captured_hiddens, weight):
 
 
 class _LanguageModel(FrankyMixin, nn.Module):
+    franky_output_cls = StreamOutput
+
     def __init__(self, *, start_layer, end_layer):
         super().__init__()
         self.start_layer, self.end_layer = start_layer, end_layer
@@ -87,7 +91,10 @@ class _Files(CustomTestCase):
                         "num_queries": 1,
                         "mlp_hidden_size": 4,
                     },
-                    "injector": {"type": "residual"},
+                    "injector": {
+                        "sandy": {"type": "residual"},
+                        "ricky": {"type": "residual"},
+                    },
                     "tap_page_size": _PAGE_SIZE,
                 },
                 file,
@@ -129,10 +136,12 @@ class _Files(CustomTestCase):
         if proxies is not None:
             model.model.franky_read_pp(pp_proxy_tensors=proxies)
         for layer_idx in range(start_layer, end_layer):
-            model.model.franky_after_layer_with_residual(
+            hidden_states = residual_batch.set_written(
+                self.hiddens[layer_idx + 1], forward_batch
+            )
+            model.model.franky_after_layer(
                 layer_idx=layer_idx,
-                hidden_states=self.hiddens[layer_idx + 1],
-                residual=None,
+                hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
         proxies = PPProxyTensors({})

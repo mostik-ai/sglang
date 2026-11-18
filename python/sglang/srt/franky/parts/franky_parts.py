@@ -11,17 +11,15 @@ from sglang.srt.franky.cache.kv_options import FrankyKvOptions
 from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
 from sglang.srt.franky.config import FrankyConfig
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
-from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 
 if TYPE_CHECKING:
     from torch import nn
 
+    from sglang.srt.franky.parts.injector.injector import Injector
+    from sglang.srt.franky.parts.injector.layer_output import LayerOutput
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.model_executor.forward_batch_info import (
-        ForwardBatch,
-        PPProxyTensors,
-    )
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 
 class FrankyParts(ABC):
@@ -30,9 +28,15 @@ class FrankyParts(ABC):
     """
 
     def __init__(
-        self, *, config: FrankyConfig, layer_indices: frozenset[int], device: str
+        self,
+        *,
+        config: FrankyConfig,
+        injector: Injector,
+        layer_indices: frozenset[int],
+        device: str,
     ) -> None:
         self.config = config
+        self.injector = injector
         self.device = device
         self.tap_cache: Optional[FrankyTapCache] = None
         # The layers of this PP stage that have a part, counted from 0.
@@ -56,11 +60,17 @@ class FrankyParts(ABC):
         from sglang.srt.franky.parts.sandy_parts import SandyParts
 
         language_model = _franky_module_of(model)
-        parts_cls = SandyParts if side == "sandy" else RickyParts
+        config = FrankyConfig.load(config_path)
+        is_sandy = side == "sandy"
+        injector_config = config.injector.sandy if is_sandy else config.injector.ricky
+        injector = injector_config.build()
+        _check_output_form(language_model=language_model, injector=injector, side=side)
+        parts_cls = SandyParts if is_sandy else RickyParts
         parts = parts_cls.build(
             model=model,
             language_model=language_model,
-            config=FrankyConfig.load(config_path),
+            config=config,
+            injector=injector,
             weights=load_file(weights_path),
             dtype=dtype,
             device=device,
@@ -76,6 +86,7 @@ class FrankyParts(ABC):
         model: nn.Module,
         language_model: FrankyMixin,
         config: FrankyConfig,
+        injector: Injector,
         weights: dict[str, torch.Tensor],
         dtype: torch.dtype,
         device: str,
@@ -116,48 +127,20 @@ class FrankyParts(ABC):
             attention_workspace=self._attention_workspace(),
         )
 
-    def after_layer(
-        self,
-        *,
-        layer_idx: int,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        """For models whose layers return ``hidden_states`` and keep the residual
-        in ``forward_batch``: the layer's output waits there to be added.
-        """
-        if layer_idx not in self._layer_indices:
-            return hidden_states
-        extra = self._after_layer(
-            layer_idx=layer_idx,
-            residual=residual_batch.snapshot(hidden_states, forward_batch),
-            forward_batch=forward_batch,
-        )
-        if extra is None:
-            return hidden_states
-        return residual_batch.add_to_output(hidden_states, forward_batch, extra)
+    def runs_after(self, *, layer_idx: int) -> bool:
+        """Whether a part of this PP stage runs after layer ``layer_idx``,
+        counted from 0."""
+        return layer_idx in self._layer_indices
 
-    def after_layer_with_residual(
-        self,
-        *,
-        layer_idx: int,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """For models whose layers return ``(hidden_states, residual)``: the
-        layer's output, and the residual before it. The next layer adds them.
+    def after_layer(self, *, layer_idx: int, output: LayerOutput) -> LayerOutput:
+        """Run the parts of layer ``layer_idx`` on ``output``.
+
+        Returns:
+            The residual the next layer reads.
         """
-        if layer_idx not in self._layer_indices:
-            return hidden_states, residual
-        extra = self._after_layer(
-            layer_idx=layer_idx,
-            residual=hidden_states if residual is None else hidden_states + residual,
-            forward_batch=forward_batch,
-        )
-        if extra is None:
-            return hidden_states, residual
-        return hidden_states + extra, residual
+        if not self.runs_after(layer_idx=layer_idx):
+            return output
+        return self._after_layer(layer_idx=layer_idx, output=output)
 
     def read_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         """Take what an earlier PP stage carried."""
@@ -175,13 +158,24 @@ class FrankyParts(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def _after_layer(
-        self, *, layer_idx: int, residual: torch.Tensor, forward_batch: ForwardBatch
-    ) -> Optional[torch.Tensor]:
-        """Run this layer's parts on the whole residual after it, without
-        changing it. Return what to add to the layer's output, or None.
+    def _after_layer(self, *, layer_idx: int, output: LayerOutput) -> LayerOutput:
+        """Run this layer's parts, reading and changing the residual only through
+        ``self.injector``.
         """
         raise NotImplementedError
+
+
+def _check_output_form(
+    *, language_model: FrankyMixin, injector: Injector, side: str
+) -> None:
+    output_cls = language_model.franky_output_cls
+    if not issubclass(output_cls, injector.output_cls):
+        raise ValueError(
+            f"{type(language_model).__name__} hands Franky {output_cls.__name__}, "
+            f"but the {side} injector {type(injector).__name__} takes "
+            f"{injector.output_cls.__name__}; set injector.{side} in the Franky "
+            "config to the injector of this model's residual form."
+        )
 
 
 def _franky_module_of(model: nn.Module) -> FrankyMixin:
