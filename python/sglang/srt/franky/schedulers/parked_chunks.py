@@ -3,20 +3,28 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
+
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.schedule_batch import Req
 
 
+class _Parking(msgspec.Struct, kw_only=True):
+    since: float
+    landed_at: Optional[float] = None
+
+
 class FrankyParkedChunks:
     """Ricky's chunked requests whose next chunk waits for taps. The scheduler
     runs one chunked request at a time, so a waiting one steps aside. A request
-    that leaves after its taps landed adds its time here to its time stats.
+    that leaves adds two times to its time stats: the seconds until its next
+    chunk's taps landed, and the seconds after that until the scheduler took it.
     """
 
     def __init__(self) -> None:
         self.reqs: list[Req] = []
-        self.parked_since: dict[str, float] = {}
+        self.parkings: dict[str, _Parking] = {}
 
     def pick(self, *, current: Optional[Req]) -> Optional[Req]:
         """
@@ -24,15 +32,17 @@ class FrankyParkedChunks:
             ``current`` if its next chunk's taps landed; else, after parking
             ``current``, a parked request whose next chunk's taps landed, or None.
         """
+        now = time.perf_counter()
+        self._note_landings(now=now)
         if current is not None and _next_chunk_landed(current):
             return current
         if current is not None:
             self.reqs.append(current)
-            self.parked_since[current.rid] = time.perf_counter()
+            self.parkings[current.rid] = _Parking(since=now)
         for req in self.reqs:
             if _next_chunk_landed(req):
                 self.reqs.remove(req)
-                self._unpark(req)
+                self._unpark(req, now=now)
                 return req
         return None
 
@@ -40,7 +50,7 @@ class FrankyParkedChunks:
         if req not in self.reqs:
             return False
         self.reqs.remove(req)
-        self.parked_since.pop(req.rid, None)
+        del self.parkings[req.rid]
         return True
 
     def take_matching(self, *, recv_req: AbortReq) -> list[Req]:
@@ -51,15 +61,24 @@ class FrankyParkedChunks:
         ]
         self.reqs = [req for req in self.reqs if req not in matching]
         for req in matching:
-            self.parked_since.pop(req.rid, None)
+            del self.parkings[req.rid]
         return matching
 
     def is_empty(self) -> bool:
         return not self.reqs
 
-    def _unpark(self, req: Req) -> None:
-        parked_seconds = time.perf_counter() - self.parked_since.pop(req.rid)
-        req.time_stats.add_franky_parked_seconds(parked_seconds)
+    def _note_landings(self, *, now: float) -> None:
+        for req in self.reqs:
+            parking = self.parkings[req.rid]
+            if parking.landed_at is None and _next_chunk_landed(req):
+                parking.landed_at = now
+
+    def _unpark(self, req: Req, *, now: float) -> None:
+        parking = self.parkings.pop(req.rid)
+        req.time_stats.add_franky_parked_seconds(
+            waiting_for_taps=parking.landed_at - parking.since,
+            after_taps_landed=now - parking.landed_at,
+        )
 
 
 def _next_chunk_landed(req: Req) -> bool:

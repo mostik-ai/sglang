@@ -99,6 +99,7 @@ STAGE_TIME_FIELDS = (
 STAGE_VALUE_FIELDS = (
     "queue_duration_s",
     "franky_parked_s",
+    "franky_parked_landed_s",
     "franky_tap_len",
     "franky_taps_held",
     "transfer_total_mb",
@@ -695,11 +696,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     queue_duration_s: float = 0.0
 
     # Franky Ricky: when the request took its KV and own tap pages, and when the
-    # taps of its first chunk were ready; seconds its chunks sat parked for taps;
+    # taps of its first chunk were ready; seconds its chunks sat parked until
+    # their taps landed, and seconds they stayed parked after that, until the
+    # scheduler, which runs one chunked request at a time, took the request;
     # how many of Sandy's taps it reads, and how many it already held at arrival.
     franky_pages_taken_time: float = 0.0
     franky_taps_ready_time: float = 0.0
     franky_parked_s: float = 0.0
+    franky_parked_landed_s: float = 0.0
     franky_tap_len: int = 0
     franky_taps_held: int = 0
 
@@ -769,8 +773,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.franky_taps_ready_time == 0.0:
             self.franky_taps_ready_time = ts or time.perf_counter()
 
-    def add_franky_parked_seconds(self, seconds: float):
-        self.franky_parked_s += seconds
+    def add_franky_parked_seconds(
+        self, *, waiting_for_taps: float, after_taps_landed: float
+    ):
+        self.franky_parked_s += waiting_for_taps
+        self.franky_parked_landed_s += after_taps_landed
 
     def set_scheduler_recv_time(self, ts=None):
         calibrate_time_diff()
@@ -829,6 +836,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.queue_duration_s = 0.0
         self.franky_taps_ready_time = 0.0
         self.franky_parked_s = 0.0
+        self.franky_parked_landed_s = 0.0
         self.storage_prefetch_wait_s = None
         self.storage_staging_wait_s = None
         self._storage_prefetch_wait = None

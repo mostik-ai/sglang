@@ -1,6 +1,7 @@
 """A Ricky request that waits for taps between two of its chunks is parked. The
-viewer splits a request's prefill into the time its chunks ran and the time they
-sat parked, so a parked request must report every second it waited, once.
+viewer splits a request's prefill into the time its chunks ran, the time they sat
+parked until their taps landed, and the time they stayed parked after that, so a
+parked request must report every second it waited, once, on the right side.
 """
 
 import unittest
@@ -60,6 +61,38 @@ class TestParkedSeconds(CustomTestCase):
 
         self.assertIs(picked, req)
         self.assertEqual(req.time_stats.franky_parked_s, 0.75)
+        self.assertEqual(req.time_stats.franky_parked_landed_s, 0.0)
+
+    def test_time_parked_after_the_taps_landed_counts_apart(self):
+        parked = _chunked_req("parked", prefix_len=64, rows_ready=64)
+        running = _chunked_req("running", prefix_len=64, rows_ready=1024)
+        self.parked.pick(current=parked)
+
+        self.clock.now = 100.5
+        parked.franky.ready = 128
+        self.assertIs(self.parked.pick(current=running), running)
+        self.clock.now = 101.25
+        self.assertIs(self.parked.pick(current=None), parked)
+
+        self.assertEqual(parked.time_stats.franky_parked_s, 0.5)
+        self.assertEqual(parked.time_stats.franky_parked_landed_s, 0.75)
+
+    def test_a_landed_request_counts_its_wait_behind_another_apart(self):
+        first = _chunked_req("first", prefix_len=64, rows_ready=64)
+        second = _chunked_req("second", prefix_len=64, rows_ready=64)
+        self.parked.pick(current=first)
+        self.parked.pick(current=second)
+
+        self.clock.now = 100.5
+        first.franky.ready = second.franky.ready = 128
+        self.assertIs(self.parked.pick(current=None), first)
+        self.clock.now = 101.0
+        self.assertIs(self.parked.pick(current=None), second)
+
+        self.assertEqual(first.time_stats.franky_parked_s, 0.5)
+        self.assertEqual(first.time_stats.franky_parked_landed_s, 0.0)
+        self.assertEqual(second.time_stats.franky_parked_s, 0.5)
+        self.assertEqual(second.time_stats.franky_parked_landed_s, 0.5)
 
     def test_every_parking_adds_up(self):
         req = _chunked_req("r", prefix_len=64, rows_ready=64)
@@ -82,7 +115,8 @@ class TestParkedSeconds(CustomTestCase):
         self.clock.now = 101.0
         self.assertTrue(self.parked.take(req))
         self.assertEqual(req.time_stats.franky_parked_s, 0.0)
-        self.assertEqual(self.parked.parked_since, {})
+        self.assertEqual(req.time_stats.franky_parked_landed_s, 0.0)
+        self.assertEqual(self.parked.parkings, {})
 
 
 if __name__ == "__main__":

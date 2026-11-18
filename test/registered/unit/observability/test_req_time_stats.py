@@ -423,6 +423,7 @@ class TestStageTimesOfTheLastOutput(CustomTestCase):
         self.assertNotIn("prefill_bootstrap_queue_entry", stage_times)
         self.assertNotIn("franky_taps_ready", stage_times)
         self.assertEqual(stage_times["franky_parked_s"], 0.0)
+        self.assertEqual(stage_times["franky_parked_landed_s"], 0.0)
 
     def test_franky_values_reach_the_export(self):
         stats = rts.SchedulerReqTimeStats()
@@ -430,8 +431,8 @@ class TestStageTimesOfTheLastOutput(CustomTestCase):
         stats.set_franky_pages_taken_time(tap_len=8192, taps_held=256, ts=50.0)
         stats.set_franky_taps_ready_time(ts=51.0)
         stats.set_franky_taps_ready_time(ts=52.0)
-        stats.add_franky_parked_seconds(0.25)
-        stats.add_franky_parked_seconds(0.5)
+        stats.add_franky_parked_seconds(waiting_for_taps=0.25, after_taps_landed=1.0)
+        stats.add_franky_parked_seconds(waiting_for_taps=0.5, after_taps_landed=0.0)
         stats.completion_time = 60.0
         with mock.patch.object(rts, "global_diff_realtime_monotonic", 0.0):
             stage_times = pickle.loads(pickle.dumps(stats)).convert_to_stage_times()
@@ -439,16 +440,18 @@ class TestStageTimesOfTheLastOutput(CustomTestCase):
         self.assertAlmostEqual(stage_times["franky_pages_taken"], 50.0)
         self.assertAlmostEqual(stage_times["franky_taps_ready"], 51.0)
         self.assertEqual(stage_times["franky_parked_s"], 0.75)
+        self.assertEqual(stage_times["franky_parked_landed_s"], 1.0)
         self.assertEqual(stage_times["franky_tap_len"], 8192)
         self.assertEqual(stage_times["franky_taps_held"], 256)
 
     def test_prefill_retry_forgets_the_earlier_attempts_taps_and_parking(self):
         stats = rts.SchedulerReqTimeStats()
         stats.set_franky_taps_ready_time(ts=51.0)
-        stats.add_franky_parked_seconds(0.5)
+        stats.add_franky_parked_seconds(waiting_for_taps=0.5, after_taps_landed=0.25)
         stats.reset_prefill_retry_time()
         self.assertEqual(stats.franky_taps_ready_time, 0.0)
         self.assertEqual(stats.franky_parked_s, 0.0)
+        self.assertEqual(stats.franky_parked_landed_s, 0.0)
 
 
 if __name__ == "__main__":
