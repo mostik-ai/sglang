@@ -62,6 +62,13 @@ impl MockWorker {
     /// chat-completion request arrives.
     #[allow(dead_code)] // Only used by some test files.
     pub async fn start(stream_chunks: Vec<&'static str>) -> Self {
+        Self::start_at("127.0.0.1", stream_chunks).await
+    }
+
+    /// Like [`Self::start`], on loopback address `ip` (any of 127.0.0.0/8), so
+    /// that tests can place engines on different hosts.
+    #[allow(dead_code)] // Only used by some test files.
+    pub async fn start_at(ip: &str, stream_chunks: Vec<&'static str>) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
         let abort_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let state = MockWorkerState {
@@ -82,7 +89,9 @@ impl MockWorker {
             .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind(format!("{ip}:0"))
+            .await
+            .unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");
         let (tx, rx) = oneshot::channel::<()>();

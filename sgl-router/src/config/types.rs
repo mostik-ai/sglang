@@ -45,6 +45,10 @@ pub struct ProxyConfig {
     /// chats it renders. `None` refuses a Franky chat with earlier answers
     /// unless it carries `input_ids`.
     pub franky_chat_adapter: Option<ChatTemplateAdapterKind>,
+    /// Franky: pick each request's Sandy among the Sandy engines on the host of
+    /// the Ricky engine that answers it, for engines whose taps cannot cross
+    /// hosts. With no Sandy there, the request gets `no_sandy_workers_available`.
+    pub franky_same_host_sandy: bool,
 }
 
 impl ProxyConfig {
@@ -81,6 +85,7 @@ impl Default for ProxyConfig {
             franky_block_size: None,
             franky_boundary_token_id: None,
             franky_chat_adapter: None,
+            franky_same_host_sandy: false,
         }
     }
 }

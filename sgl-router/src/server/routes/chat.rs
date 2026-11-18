@@ -432,10 +432,44 @@ impl<'a> ModelRouting<'a> {
             }
         };
         if workers.prefill.needs_taps() {
+            let off_host;
+            let excluded = if ctx.config.proxy.franky_same_host_sandy {
+                off_host = with_sandys_off_host(ctx, &request.model, &workers.prefill, excluded);
+                off_host.as_slice()
+            } else {
+                excluded
+            };
             workers.sandy = Some(pick_sandy(ctx, request, headers, excluded, &prefix).await?);
         }
         Ok(workers)
     }
+}
+
+/// `excluded` and every Sandy engine on another host than `ricky`'s, so that
+/// the Sandy picked for `ricky` sends its taps within the host.
+fn with_sandys_off_host(
+    ctx: &AppContext,
+    model: &ModelId,
+    ricky: &Worker,
+    excluded: &[WorkerId],
+) -> Vec<WorkerId> {
+    let host = url_host(&ricky.url);
+    let mut ids = excluded.to_vec();
+    ids.extend(
+        ctx.registry
+            .healthy_workers_for(model)
+            .into_iter()
+            .filter(|engine| engine.mode() == WorkerMode::Sandy && url_host(&engine.url) != host)
+            .map(|engine| engine.id.clone()),
+    );
+    ids
+}
+
+/// The host of a worker's URL; `None` when the URL does not parse.
+fn url_host(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
 }
 
 /// The Sandy that sends a Franky request's taps: the model's Sandy group picks
