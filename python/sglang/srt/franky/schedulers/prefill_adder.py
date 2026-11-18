@@ -11,10 +11,10 @@ if TYPE_CHECKING:
 
 
 class FrankyPrefillAdder(PrefillAdder):
-    """Ricky's admission: a chunk ends at the landed taps and runs on the slots
-    its request took at arrival. While a chunked request goes on, another
-    request joins only if it ends in this batch: the scheduler keeps one
-    chunked request.
+    """Ricky's admission: a chunk ends at the first row whose taps have not
+    landed, and runs on the slots its request took at arrival. While a chunked
+    request goes on, another request joins only if it ends in this batch: the
+    scheduler keeps one chunked request.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -25,7 +25,7 @@ class FrankyPrefillAdder(PrefillAdder):
 
     @override
     def add_chunked_req(self, req: Req) -> Optional[Req]:
-        taps_limit = req.franky.taps_ready - req.prefix_len
+        taps_limit = req.franky.rows_ready() - req.prefix_len
         self.chunked_req_limit = (
             taps_limit
             if self.chunked_req_limit is None
@@ -57,7 +57,7 @@ class FrankyPrefillAdder(PrefillAdder):
     ) -> tuple[bool, Optional[int]]:
         if _taps_complete(req):
             return True, chunk_limit
-        taps_limit = req.franky.taps_ready - req.prefix_len
+        taps_limit = req.franky.rows_ready() - req.prefix_len
         return True, taps_limit if chunk_limit is None else min(chunk_limit, taps_limit)
 
     def _can_start(self, req: Req, *, has_chunked_req: bool) -> bool:
@@ -79,9 +79,9 @@ class FrankyPrefillAdder(PrefillAdder):
 
 
 def taps_landed(req: Req) -> bool:
-    """Whether taps have landed for some of the request's tokens still to run."""
-    return req.franky is not None and req.franky.taps_ready > req.prefix_len
+    """Whether some of the request's rows still to run read only landed taps."""
+    return req.franky is not None and req.franky.rows_ready() > req.prefix_len
 
 
 def _taps_complete(req: Req) -> bool:
-    return req.franky.taps_ready >= len(req.full_untruncated_fill_ids)
+    return req.franky.rows_ready() >= len(req.full_untruncated_fill_ids)

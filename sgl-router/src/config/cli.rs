@@ -16,11 +16,11 @@ use crate::config::{
     default_stale_request_timeout_secs, resolve_mode, AffinityConfig, AffinityMode, BalancedBy,
     CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, ChatTemplateAdapterKind,
     CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, DpRankPolicy,
-    EligibilityConfig, FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig,
-    K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
-    StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig, DEFAULT_FUSE,
-    DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    EligibilityConfig, FilterKind, FrankySandyConfig, FusedTerm, InflightLoadConfig,
+    K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
+    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
@@ -191,6 +191,27 @@ pub struct ServerArgs {
         conflicts_with = "no_tokenizer"
     )]
     pub franky_chat_adapter: Option<ChatTemplateAdapterKind>,
+    /// Franky with a Sandy that tokenizes on its own: Sandy's model files or
+    /// HuggingFace repo id, for its tokenizer and chat template. The router then
+    /// renders each Franky chat for both models, sends Sandy its own input_ids,
+    /// and gives Ricky Sandy's input length and answer runs.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "franky_chat_adapter",
+        requires = "franky_sandy_chat_adapter",
+        conflicts_with = "franky_block_size"
+    )]
+    pub franky_sandy_tokenizer_path: Option<String>,
+    /// Franky: Sandy's chat template, as --franky-chat-adapter names the served
+    /// model's.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "TEMPLATE",
+        requires = "franky_sandy_tokenizer_path"
+    )]
+    pub franky_sandy_chat_adapter: Option<ChatTemplateAdapterKind>,
 
     /// PD: at most N requests per prefill DP rank go to decode before their
     /// first token; the rest wait and get their decode DP rank when sent.
@@ -714,6 +735,15 @@ impl Cli {
                 stream_after_prefill: self.server.pd_stream_after_prefill,
                 franky_block_size: self.server.franky_block_size,
                 franky_chat_adapter: self.server.franky_chat_adapter,
+                franky_sandy: self
+                    .server
+                    .franky_sandy_tokenizer_path
+                    .clone()
+                    .zip(self.server.franky_sandy_chat_adapter)
+                    .map(|(tokenizer_path, chat_adapter)| FrankySandyConfig {
+                        tokenizer_path,
+                        chat_adapter,
+                    }),
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -1521,6 +1551,72 @@ mod tests {
             Some(ChatTemplateAdapterKind::Qwen35)
         );
         assert_eq!(without.proxy.franky_chat_adapter, None);
+    }
+
+    #[test]
+    fn franky_sandy_tokenizer_reaches_the_proxy_config() {
+        let base = with_model(&["--worker-urls", "http://10.0.0.1:30000"]);
+        let sandy = [
+            "--franky-chat-adapter",
+            "deepseek-v4",
+            "--franky-sandy-tokenizer-path",
+            "/models/kimi-k3",
+            "--franky-sandy-chat-adapter",
+            "kimi-k3",
+        ]
+        .map(str::to_owned);
+
+        let config = into_config_owned([base, sandy.to_vec()].concat()).unwrap();
+
+        assert_eq!(
+            config.proxy.franky_chat_adapter,
+            Some(ChatTemplateAdapterKind::DeepseekV4)
+        );
+        assert_eq!(
+            config.proxy.franky_sandy,
+            Some(FrankySandyConfig {
+                tokenizer_path: "/models/kimi-k3".into(),
+                chat_adapter: ChatTemplateAdapterKind::KimiK3,
+            })
+        );
+    }
+
+    #[test]
+    fn franky_sandy_tokenizer_needs_both_chat_adapters_and_no_blocks() {
+        let base = with_model(&["--worker-urls", "http://10.0.0.1:30000"]);
+        for extra in [
+            vec![
+                "--franky-sandy-tokenizer-path",
+                "/k3",
+                "--franky-sandy-chat-adapter",
+                "kimi-k3",
+            ],
+            vec![
+                "--franky-sandy-tokenizer-path",
+                "/k3",
+                "--franky-chat-adapter",
+                "deepseek-v4",
+            ],
+            vec!["--franky-sandy-chat-adapter", "kimi-k3"],
+            vec![
+                "--franky-sandy-tokenizer-path",
+                "/k3",
+                "--franky-sandy-chat-adapter",
+                "kimi-k3",
+                "--franky-chat-adapter",
+                "deepseek-v4",
+                "--franky-block-size",
+                "64",
+            ],
+        ] {
+            let args = [
+                base.clone(),
+                extra.iter().map(|arg| arg.to_string()).collect(),
+            ]
+            .concat();
+
+            assert!(into_config_owned(args).is_err(), "{extra:?}");
+        }
     }
 
     #[test]

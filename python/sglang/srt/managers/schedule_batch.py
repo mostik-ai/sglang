@@ -1070,6 +1070,7 @@ class Req(ReqDllmMixin):
         franky_room: Optional[FrankyRoom] = None,
         franky_chain: Optional[FrankyChain] = None,
         franky_generated_spans: tuple[GeneratedSpan, ...] = (),
+        franky_sandy_input_len: Optional[int] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1420,6 +1421,8 @@ class Req(ReqDllmMixin):
         self.franky_room: Optional[FrankyRoom] = franky_room
         self.franky_chain: Optional[FrankyChain] = franky_chain
         self.franky_generated_spans = franky_generated_spans
+        # Sandy's tokens of the input when Sandy tokenizes on its own, else None.
+        self.franky_sandy_input_len = franky_sandy_input_len
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank

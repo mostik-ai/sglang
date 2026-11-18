@@ -45,7 +45,8 @@ def _spans(generation_start, block_size):
     if generation_start is None:
         return None
     return FrankyGeneratedSpans(
-        spans=(GeneratedSpan(start=generation_start),), block_size=block_size
+        spans=(GeneratedSpan(start=generation_start, sandy_start=generation_start),),
+        block_size=block_size,
     )
 
 

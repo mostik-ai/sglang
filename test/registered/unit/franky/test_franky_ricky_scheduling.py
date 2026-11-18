@@ -1,4 +1,5 @@
 import socket
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -7,10 +8,11 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans, GeneratedSpan
 from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.cache.prefill_budget import FrankyPrefillBudget
-from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+from sglang.srt.franky.cache.tap_cache import FrankyReqState, FrankyTapCache
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder
@@ -99,9 +101,20 @@ class _Tree:
 
 
 class _Req:
-    def __init__(self, rid, *, prompt_len, cached_prefix_len=0, room=True, chain=None):
+    def __init__(
+        self,
+        rid,
+        *,
+        prompt_len,
+        cached_prefix_len=0,
+        room=True,
+        chain=None,
+        sandy_input_len=None,
+    ):
         self.rid = rid
         self.franky_chain = chain
+        self.franky_generated_spans = ()
+        self.franky_sandy_input_len = sandy_input_len
         self.finished_reason = None
         self.origin_input_ids = list(range(prompt_len))
         self.output_ids = []
@@ -148,6 +161,18 @@ class _Manager:
 
     def clear_deferred_abort_state(self, room):
         self.acked_rooms.discard(room)
+
+
+def _landed(taps_ready, *, generated_spans=None, own_tap_pages=None):
+    return FrankyReqState(
+        tap_len=100,
+        taps_ready=taps_ready,
+        taken_kv_slots=torch.empty(0, dtype=torch.int64),
+        taken_from=0,
+        used_end=0,
+        generated_spans=generated_spans,
+        own_tap_pages=own_tap_pages,
+    )
 
 
 def _held(chain_id, *, node, num_tokens):
@@ -201,7 +226,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
         )
         self.queue = self._queue(mamba_room=None)
 
-    def _queue(self, *, mamba_room):
+    def _queue(self, *, mamba_room, own_pages=False):
         return FrankyReceiveQueue(
             tap_cache=FrankyTapCache(
                 encoder_ids=(0,),
@@ -209,8 +234,9 @@ class TestFrankyReceiveQueue(CustomTestCase):
                 page_size=_PAGE_SIZE,
                 kv_page_size=_PAGE_SIZE,
                 num_tokens=_NUM_TOKENS,
-                req_to_token=torch.zeros((2, 16), dtype=torch.int32),
+                req_to_token=torch.zeros((2, _NUM_TOKENS), dtype=torch.int32),
                 device="cpu",
+                own_pages=own_pages,
             ),
             kv_allocator=self.allocator,
             tree_cache=self.tree,
@@ -341,6 +367,74 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.assertEqual(req.franky.taken_from, 64)
         self.assertEqual(len(req.franky.taken_kv_slots), 8)
         self.assertEqual(req.franky.tap_len, 64)
+
+    def test_with_sandys_own_tokens_all_its_taps_land_in_pages_the_request_owns(
+        self,
+    ):
+        self.queue = self._queue(mamba_room=None, own_pages=True)
+        own_pages = self.queue.tap_cache.own_pages
+        free_pages = own_pages.num_free()
+
+        req = self._arrive(
+            _Req("r", prompt_len=70, cached_prefix_len=32, sandy_input_len=50)
+        )
+
+        [receiver] = self.receivers
+        self.assertEqual(receiver.tap_pages, req.franky.own_tap_pages.tolist())
+        self.assertEqual(len(receiver.tap_pages), 4)
+        self.assertEqual(receiver.prefix_len, 0)
+        self.assertEqual(own_pages.num_free(), free_pages - 4)
+        self.assertEqual(req.franky.tap_len, 50)
+        self.assertEqual(req.franky.taps_ready, 0)
+        self.assertEqual(len(req.franky.taken_kv_slots), 70 - 32)
+        # Prompt rows read no taps, so all but the row making the answer's
+        # first token may run before any tap lands.
+        self.assertEqual(req.franky.rows_ready(), 69)
+
+    def test_an_arrival_waits_for_tap_pages_it_can_own(self):
+        self.queue = self._queue(mamba_room=None, own_pages=True)
+        first = self._arrive(_Req("first", prompt_len=16, sandy_input_len=1000))
+        second = self._arrive(_Req("second", prompt_len=16, sandy_input_len=100))
+
+        self.assertIsNotNone(first.franky)
+        self.assertIsNone(second.franky)
+        self.assertEqual(self.failed, [])
+
+    def test_a_request_names_sandys_tokens_exactly_when_sandy_tokenizes_alone(self):
+        self._arrive(_Req("shared", prompt_len=16, sandy_input_len=20))
+        self.queue = self._queue(mamba_room=None, own_pages=True)
+        self._arrive(_Req("own", prompt_len=16))
+        self._arrive(_Req("too-long", prompt_len=16, sandy_input_len=_NUM_TOKENS + 1))
+
+        self.assertEqual(self.failed, ["shared", "own", "too-long"])
+
+    def test_a_returning_request_keeps_the_tap_pages_it_owns(self):
+        self.queue = self._queue(mamba_room=None, own_pages=True)
+        own_pages = self.queue.tap_cache.own_pages
+        req = self._arrive(_Req("r", prompt_len=64, sandy_input_len=40))
+        pages = req.franky.own_tap_pages
+        free_pages = own_pages.num_free()
+        req.franky.taps_ready = 40
+        req.output_ids = list(range(8))
+
+        self._arrive(req)
+
+        self.assertIs(req.franky.own_tap_pages, pages)
+        self.assertEqual(own_pages.num_free(), free_pages)
+        self.assertEqual(len(self.receivers), 1)
+        self.assertEqual(req.franky.rows_ready(), sys.maxsize)
+
+    def test_owned_tap_pages_come_back_when_the_request_ends(self):
+        self.queue = self._queue(mamba_room=None, own_pages=True)
+        own_pages = self.queue.tap_cache.own_pages
+        free_pages = own_pages.num_free()
+        req = self._arrive(_Req("r", prompt_len=64, sandy_input_len=40))
+
+        self._finish(req, FINISH_MATCHED_TOKEN(matched=0))
+        self.queue.poll()
+
+        self.assertEqual(own_pages.num_free(), free_pages)
+        self.assertTrue(self.queue.is_empty())
 
     def test_a_request_without_a_room_runs_at_once_and_caches_apart(self):
         req = _Req("r", prompt_len=64, room=False)
@@ -632,7 +726,7 @@ class TestFrankyPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
-        req.franky = SimpleNamespace(taps_ready=taps_ready)
+        req.franky = _landed(taps_ready)
         return req
 
     def test_a_first_chunk_ends_at_the_landed_taps_on_taken_slots(self):
@@ -667,6 +761,33 @@ class TestFrankyPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, [whole])
         self.assertIsNone(adder.new_chunked_req)
 
+    def test_with_sandys_own_tokens_a_chunk_ends_before_the_first_unlanded_read(
+        self,
+    ):
+        """Ricky's 100 prompt tokens hold an answer at 40..59 whose copy starts at
+        Sandy's token 30; Sandy's input is 80 tokens. With 30 taps landed, the
+        rows before the one making the new answer's first token may run, and a
+        first chunk ends on a page.
+        """
+        adder = self._adder()
+        req = self._req("r", prompt_len=100, taps_ready=30)
+        req.franky = _landed(
+            30,
+            generated_spans=FrankyGeneratedSpans(
+                spans=(
+                    GeneratedSpan(start=40, sandy_start=30, end=60),
+                    GeneratedSpan(start=100, sandy_start=80),
+                )
+            ),
+            own_tap_pages=torch.arange(4, 9, dtype=torch.int32),
+        )
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(req.franky.rows_ready(), 99)
+        self.assertEqual(req.extend_end, 96)
+        self.assertIs(adder.new_chunked_req, req)
+
     def test_a_continuing_chunk_ends_at_the_landed_taps(self):
         adder = self._adder()
         req = self._req("r", prompt_len=100, prefix_len=32, taps_ready=64)
@@ -679,8 +800,8 @@ class TestFrankyPrefillAdder(CustomTestCase):
         taps would let every lone ready request start its own prefill."""
         scheduler = object.__new__(RickyScheduler)
         scheduler.waiting_queue = [
-            SimpleNamespace(franky=SimpleNamespace(taps_ready=64), prefix_len=0),
-            SimpleNamespace(franky=SimpleNamespace(taps_ready=32), prefix_len=32),
+            SimpleNamespace(franky=_landed(64), prefix_len=0),
+            SimpleNamespace(franky=_landed(32), prefix_len=32),
             SimpleNamespace(franky=None, prefix_len=0),
         ]
 

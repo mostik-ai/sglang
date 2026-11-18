@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
+from sglang.srt.franky.cache.own_tap_pages import FrankyOwnTapPages
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
@@ -17,7 +18,13 @@ TAP_DTYPE = torch.bfloat16
 
 
 class FrankyReqState(msgspec.Struct, kw_only=True):
-    """One Ricky request's Franky state on this rank."""
+    """One Ricky request's Franky state on this rank. Taps count Sandy's tokens.
+
+    Attributes:
+        generated_spans: which taps each row reads; None without a room.
+        own_tap_pages: the pages the request's taps land in when Sandy tokenizes
+            on its own; None when they land at its KV slots.
+    """
 
     tap_len: int
     taps_ready: int
@@ -27,6 +34,19 @@ class FrankyReqState(msgspec.Struct, kw_only=True):
     taken_kv_slots: torch.Tensor
     taken_from: int
     used_end: int
+    generated_spans: Optional[FrankyGeneratedSpans] = None
+    own_tap_pages: Optional[torch.Tensor] = None
+
+    def rows_ready(self) -> int:
+        """
+        Returns:
+            How many of the request's first rows may run: rows whose forward reads
+            only landed taps. With taps at KV slots, also only rows whose own taps
+            landed, since the prefix tree hands their KV pages on with the taps.
+        """
+        if self.own_tap_pages is None:
+            return self.taps_ready
+        return self.generated_spans.rows_reading_at_most(self.taps_ready)
 
     def hand_to_chunk(self, *, start: int, end: int) -> torch.Tensor:
         """The taken KV slots of prompt tokens ``[start, end)``, which a chunk now
@@ -66,6 +86,10 @@ class FrankyTapCache:
     the transfer moves them and the readers attend over them. A tap page is a view
     of the slots of a KV page, so KV pages may be any multiple of it and two
     engines with different KV pages still exchange taps page to page, in place.
+
+    On a Ricky whose Sandy tokenizes on its own, taps belong to Sandy's tokens,
+    which have no KV slots here; requests then own tap pages of the same buffers,
+    from ``own_pages``, and readers find them there.
     """
 
     def __init__(
@@ -78,12 +102,14 @@ class FrankyTapCache:
         num_tokens: int,
         req_to_token: torch.Tensor,
         device: str,
+        own_pages: bool = False,
         attention_workspace: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Args:
             page_size: tokens of a tap page; it divides ``kv_page_size``.
             num_tokens: KV slots past the KV pool's first page.
+            own_pages: whether requests own tap pages apart from their KV slots.
         """
         if kv_page_size % page_size != 0:
             raise ValueError(
@@ -103,6 +129,18 @@ class FrankyTapCache:
             None
         ] * req_to_token.shape[0]
         self._plan: Optional[_RowPlan] = None
+        self._max_pages = -(-req_to_token.shape[1] // page_size)
+        self.own_pages = (
+            FrankyOwnTapPages(
+                first_page=self.pages_per_kv_page,
+                num_pages=(num_tokens + kv_page_size) // page_size,
+                max_pages_per_request=self._max_pages,
+                num_request_rows=req_to_token.shape[0],
+                device=device,
+            )
+            if own_pages
+            else None
+        )
         # One more KV page, as in the KV pool: padded tokens write to page 0, and
         # padded requests read its zeros.
         self._buffers = {
@@ -264,10 +302,7 @@ class FrankyTapCache:
 
     def _decode_plan(self, forward_batch: ForwardBatch) -> _RowPlan:
         req_pool_indices = forward_batch.req_pool_indices
-        page_table = self._page_table(
-            req_pool_indices,
-            num_pages=-(-self._req_to_token.shape[1] // self.page_size),
-        )
+        page_table = self._page_table(req_pool_indices, num_pages=self._max_pages)
         taps_to_read = self._decode_taps_to_read[req_pool_indices]
         return _RowPlan(
             source=req_pool_indices,
@@ -292,6 +327,8 @@ class FrankyTapCache:
     def _page_table(
         self, req_pool_indices: torch.Tensor, *, num_pages: int
     ) -> torch.Tensor:
+        if self.own_pages is not None:
+            return self.own_pages.page_table[req_pool_indices, :num_pages]
         first_slots = self._req_to_token[
             req_pool_indices, : num_pages * self.page_size : self.page_size
         ]

@@ -302,6 +302,10 @@ class GenerateReqInput:
     # Franky: the chain this request is a block of, as FrankyChain's fields.
     franky_chain: Optional[Dict[str, Any]] = None
     franky_generated_spans: Optional[List[List[int]]] = None
+    # Franky with a Sandy that tokenizes on its own: Sandy's tokens of the input,
+    # and the runs of franky_generated_spans' answers in Sandy's tokens.
+    franky_sandy_input_len: Optional[int] = None
+    franky_sandy_spans: Optional[List[List[int]]] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -969,6 +973,8 @@ class GenerateReqInput:
             raise ValueError("franky_chain takes a single request with n=1.")
         if self.franky_generated_spans is not None:
             raise ValueError("franky_generated_spans takes a single request with n=1.")
+        if self.franky_sandy_input_len is not None:
+            raise ValueError("franky_sandy_input_len takes a single request with n=1.")
 
     def _get_positional_embed_overrides_item(
         self, i: int
@@ -1205,6 +1211,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     franky_room: Optional[FrankyRoom] = None
     franky_chain: Optional[FrankyChain] = None
     franky_generated_spans: tuple[GeneratedSpan, ...] = ()
+    franky_sandy_input_len: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

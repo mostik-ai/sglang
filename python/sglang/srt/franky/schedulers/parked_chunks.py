@@ -51,4 +51,4 @@ class FrankyParkedChunks:
 
 
 def _next_chunk_landed(req: Req) -> bool:
-    return req.franky.taps_ready > req.prefix_len
+    return req.franky.rows_ready() > req.prefix_len

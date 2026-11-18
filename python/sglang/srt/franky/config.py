@@ -29,6 +29,10 @@ class FrankyConfig(
     # Tokens of a tap page, the unit taps are sent and read in; each side's
     # --page-size is a multiple of it.
     tap_page_size: Annotated[int, msgspec.Meta(gt=1)]
+    # Whether Sandy reads Ricky's tokens. When it tokenizes on its own, each
+    # request names its answers in both sides' tokens and Ricky keeps its taps
+    # in pages of their own.
+    shared_tokenizer: bool = True
 
     def __post_init__(self) -> None:
         num_encoders = len(self.encoder.layers)

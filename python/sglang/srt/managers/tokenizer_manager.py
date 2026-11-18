@@ -1596,14 +1596,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if obj.franky_chain is not None
                 else None
             )
-            franky_generated_spans = (
-                checked_earlier_answers(
-                    obj.franky_generated_spans,
-                    generation_start=len(input_ids_arr or ())
-                    - (franky_chain.num_generated_before if franky_chain else 0),
+            if franky_chain is not None and obj.franky_sandy_input_len is not None:
+                raise ValueError(
+                    "A Franky chain counts its blocks in Ricky's tokens, so Sandy "
+                    "must read them too; send franky_chain without "
+                    "franky_sandy_input_len."
                 )
-                if obj.franky_generated_spans is not None
-                else ()
+            franky_generated_spans = checked_earlier_answers(
+                obj.franky_generated_spans or [],
+                generation_start=len(input_ids_arr or ())
+                - (franky_chain.num_generated_before if franky_chain else 0),
+                sandy_answers=obj.franky_sandy_spans,
+                sandy_generation_start=obj.franky_sandy_input_len,
             )
 
             tokenized_obj = self.tokenized_generate_req_type(
@@ -1631,6 +1635,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ),
                 franky_chain=franky_chain,
                 franky_generated_spans=franky_generated_spans,
+                franky_sandy_input_len=obj.franky_sandy_input_len,
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,

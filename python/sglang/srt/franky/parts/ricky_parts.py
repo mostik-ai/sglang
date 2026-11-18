@@ -75,6 +75,11 @@ class RickyParts(FrankyParts):
         return attention_workspace(device=self.device)
 
     @override
+    def _owns_tap_pages(self) -> bool:
+        # Taps then count Sandy's tokens, which have no KV slots here.
+        return not self.config.shared_tokenizer
+
+    @override
     def _tap_encoder_ids(self) -> tuple[int, ...]:
         # Every stage holds all encoders' taps: PD's transfer pairs entries by id
         # and each Ricky stage reads every Sandy stage.
