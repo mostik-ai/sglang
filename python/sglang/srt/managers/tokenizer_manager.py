@@ -152,6 +152,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
+    client_request_id,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
@@ -2074,6 +2075,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
+                    out["meta_info"]["client_request_id"] = client_request_id(request)
                     asyncio.create_task(
                         self.request_metrics_exporter_manager.write_record(obj, out)
                     )
@@ -2565,6 +2567,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
                     meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
+                    if (
+                        recv_obj.finished_reasons[i] is not None
+                        and self.request_metrics_exporter_manager.exporter_enabled()
+                    ):
+                        meta_info["stage_times"] = (
+                            scheduler_time_stats.convert_to_stage_times()
+                        )
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(

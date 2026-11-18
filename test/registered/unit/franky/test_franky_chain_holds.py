@@ -206,6 +206,19 @@ class TestFrankyChainHoldsOfTapPages(CustomTestCase):
         self.assertEqual(self.tree.locked, ["c"], "the KV hold stays")
         self.assertEqual(self.own_pages.num_free(), 5)
 
+    def test_counts_the_tap_pages_its_holds_keep_until_a_next_block_takes_them(self):
+        self.holds.hold_for_next_block(
+            _block("a", node="a"), taps=self._taps(3, num_taps=40)
+        )
+        self.holds.hold_for_next_block(
+            _block("b", node="b"), taps=self._taps(2, num_taps=20)
+        )
+        self.assertEqual(self.holds.num_held_tap_pages(), 5)
+
+        self.holds.take_taps(chain_id="a")
+
+        self.assertEqual(self.holds.num_held_tap_pages(), 2)
+
     def test_every_way_a_hold_ends_gives_its_tap_pages_back(self):
         ends = {
             "release": lambda holds: holds.release(chain_id="c"),
@@ -230,6 +243,7 @@ class TestFrankyChainHoldsOfTapPages(CustomTestCase):
                 end(holds)
 
                 self.assertEqual(self.own_pages.num_free(), 8)
+                self.assertEqual(holds.num_held_tap_pages(), 0)
                 holds.release_all()
 
     def test_a_taps_only_hold_ranks_by_the_taps_it_keeps(self):

@@ -6,12 +6,16 @@ from typing_extensions import override
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
+from sglang.srt.franky.cache.own_tap_pages_metrics import FrankyOwnTapPagesMetrics
 from sglang.srt.franky.cache.own_tap_reservations import FrankyOwnTapReservations
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    STALL_METRICS_INTERVAL_S,
+)
 from sglang.srt.runtime_context import get_device, get_franky, get_parallel
 from sglang.utils import TypeBasedDispatcher
 
@@ -40,6 +44,15 @@ class RickyDecodeScheduler(Scheduler):
     def init_disaggregation(self) -> None:
         super().init_disaggregation()
         self.init_franky_relay()
+        self.init_franky_own_tap_pages_metrics()
+
+    def init_franky_own_tap_pages_metrics(self) -> None:
+        self.franky_own_tap_pages_metrics = FrankyOwnTapPagesMetrics.of_scheduler(
+            own_pages=self.tp_worker.model_runner.franky_parts.tap_cache.own_pages,
+            chain_holds=self.franky_chain_holds,
+            metrics_collector_context=self.metrics_collector_context,
+            interval_seconds=STALL_METRICS_INTERVAL_S,
+        )
 
     def init_franky_relay(self) -> None:
         """PD decode's end of the tap relay from Ricky prefill: this rank's tap
@@ -81,6 +94,8 @@ class RickyDecodeScheduler(Scheduler):
     def ingest_requests(self, stop_at_pause: bool = False) -> List:
         if self.franky_own_taps is not None:
             self.franky_own_taps.poll()
+        if self.franky_own_tap_pages_metrics is not None:
+            self.franky_own_tap_pages_metrics.maybe_publish()
         return super().ingest_requests(stop_at_pause=stop_at_pause)
 
     @override

@@ -174,6 +174,7 @@ class FrankyReceiveQueue:
             return
         state = reception.req.franky
         state.taps_ready = max(state.taps_ready, message.taps_ready)
+        self._note_first_chunk_ready(reception.req)
         if self._taps_complete(reception):
             self._forget_keys(message.request_rid, "landed", "ok")
 
@@ -318,7 +319,15 @@ class FrankyReceiveQueue:
             taps_held_at_arrival=taps_held,
             announced_taps=taps_held,
         )
+        req.time_stats.set_franky_pages_taken_time(
+            tap_len=tap_len, taps_held=taps_held if receives_taps else tap_len
+        )
+        self._note_first_chunk_ready(req)
         return True
+
+    def _note_first_chunk_ready(self, req: Req) -> None:
+        if req.franky.rows_ready() > req.prefix_len:
+            req.time_stats.set_franky_taps_ready_time()
 
     def _tokenization_problem(self, req: Req) -> Optional[str]:
         if req.franky_room is None:

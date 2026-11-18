@@ -5264,6 +5264,7 @@ class Scheduler(
         fully_idle = self.is_fully_idle()
         if not fully_idle:
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+            self.metrics_reporter.maybe_log_stall_metrics()
             now = time.monotonic()
             if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
                 self._last_stall_publish_ts = now
