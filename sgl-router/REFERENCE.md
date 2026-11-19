@@ -479,6 +479,14 @@ in the next block:
   token whose text depends on the tokens before it, such as a SentencePiece
   word start that has a leading space only after another word, could differ.
   Without the router's tokenizer, a request without `no_stop_trim` gets `400`.
+- A `/generate` request's `franky_presence_over_blocks: p`, a non-negative
+  number, carries a presence penalty across the chain's blocks: SGLang counts
+  `presence_penalty` only over a request's own output and each block is a new
+  request, so every block gets a logit bias of `-p` on each token the chain
+  generated in the blocks before it, added to the client's own `logit_bias`; a
+  token new in a block is penalized from the next block on. No engine gets the
+  field. It gets `400` beside a nonzero `presence_penalty`, which would penalize
+  a block's own tokens twice, and without blocks.
 - A stop string across two blocks is not matched; each block checks its own
   output.
 - Between two blocks a chain waits for Sandy to prefill the last block's tokens
