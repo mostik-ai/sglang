@@ -11,6 +11,7 @@ use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Json;
+use dynamo_tokenizers::Tokenizer;
 use serde_json::{json, Value};
 use sgl_router::config::{
     Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
@@ -23,10 +24,10 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::{AppContext, ChatRouting};
 use sgl_router::state::kv_events::KvEventIndex;
-use sgl_router::tokenizer::TokenizerRegistry;
+use sgl_router::tokenizer::{adapter, TokenizerRegistry};
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -82,7 +83,7 @@ fn franky_ctx(
     max_attempts: u32,
     reorg: bool,
 ) -> Arc<AppContext> {
-    franky_ctx_with_blocks(ricky, sandy, max_attempts, reorg, None)
+    franky_ctx_with_blocks(ricky, sandy, max_attempts, reorg, None, None)
 }
 
 fn franky_ctx_with_blocks(
@@ -91,13 +92,15 @@ fn franky_ctx_with_blocks(
     max_attempts: u32,
     reorg: bool,
     franky_block_size: Option<u32>,
+    franky_boundary_token_id: Option<u32>,
 ) -> Arc<AppContext> {
     let policy = if reorg {
         PolicyKind::PowerOfTwo
     } else {
         PolicyKind::RoundRobin
     };
-    let cfg = config(max_attempts, policy, franky_block_size);
+    let mut cfg = config(max_attempts, policy, franky_block_size);
+    cfg.proxy.franky_boundary_token_id = franky_boundary_token_id;
     let registry = Arc::new(WorkerRegistry::default());
     for (id, url, mode) in ricky {
         let spec = WorkerSpec {
@@ -337,15 +340,21 @@ impl BlockEngine {
             .as_u64()
             .unwrap() as usize;
         let count = max_new_tokens.min(engine.stop_at.saturating_sub(generated));
-        let ids: Vec<usize> = (input..input + count).collect();
-        let finish = if generated + count >= engine.stop_at {
+        let mut ids: Vec<usize> = (input..input + count).collect();
+        let mut finish = if generated + count >= engine.stop_at {
             json!({"type": "stop", "matched": 0})
         } else {
             json!({"type": "length", "length": count})
         };
+        let stops = request["sampling_params"]["stop_token_ids"].as_array();
+        let stopped = stops.and_then(|stops| ids.iter().position(|&id| stops.contains(&json!(id))));
+        if let Some(position) = stopped {
+            ids.truncate(position + 1);
+            finish = json!({"type": "stop", "matched": ids[position]});
+        }
         let frame = |ids: &[usize], finish: Value| {
             json!({
-                "text": ids.iter().map(|id| format!("<{id}>")).collect::<String>(),
+                "text": detokenized(&request, ids, &finish),
                 "output_ids": ids,
                 "meta_info": {
                     "id": request["rid"],
@@ -394,6 +403,25 @@ impl BlockEngine {
     }
 }
 
+/// A frame's text as SGLang's detokenizer gives it with the tiny tokenizer the
+/// routers load: a stop token the frame finished on is left out unless the
+/// request sets `no_stop_trim`.
+fn detokenized(request: &Value, ids: &[usize], finish: &Value) -> String {
+    let sampling = &request["sampling_params"];
+    let trimmed = sampling["no_stop_trim"] != json!(true)
+        && ids.last().is_some_and(|&id| finish["matched"] == json!(id));
+    let shown = &ids[..ids.len() - usize::from(trimmed)];
+    tiny_text(shown, sampling["skip_special_tokens"] != json!(false))
+}
+
+/// `ids` decoded with the tiny tokenizer, which decodes id `b` below 256 to byte `b`.
+fn tiny_text(ids: &[usize], skip_special_tokens: bool) -> String {
+    static TOKENIZER: LazyLock<Arc<Tokenizer>> =
+        LazyLock::new(|| adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap());
+    let ids: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+    adapter::decode_complete(&TOKENIZER, &ids, skip_special_tokens).unwrap()
+}
+
 fn generate(body: Value) -> Request<Body> {
     Request::post("/generate")
         .header("content-type", "application/json")
@@ -412,8 +440,36 @@ async fn blocks_router(stop_at: usize) -> (Arc<AppContext>, [BlockEngine; 2], [S
         1,
         false,
         Some(4),
+        None,
     );
     (ctx, [ricky, sandy], [ricky_stop, sandy_stop])
+}
+
+/// A router running blocks of 4 that also end at `boundary`.
+async fn boundary_router(
+    stop_at: usize,
+    boundary: u32,
+) -> (Arc<AppContext>, [BlockEngine; 2], [Shutdown; 2]) {
+    let (ricky, ricky_url, ricky_stop) = BlockEngine::start(stop_at).await;
+    let (sandy, sandy_url, sandy_stop) = BlockEngine::start(usize::MAX).await;
+    let ctx = franky_ctx_with_blocks(
+        &[("r", &ricky_url, WorkerMode::Plain)],
+        &[("s", &sandy_url)],
+        1,
+        false,
+        Some(4),
+        Some(boundary),
+    );
+    (ctx, [ricky, sandy], [ricky_stop, sandy_stop])
+}
+
+async fn answer_of(res: Response) -> Value {
+    serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -521,7 +577,7 @@ async fn a_streamed_chain_is_one_stream() {
         ]
     );
     assert_eq!(finishes[5], "stop");
-    assert_eq!(frames[5]["text"], "<3><4><5><6><7><8>");
+    assert_eq!(frames[5]["text"], tiny_text(&[3, 4, 5, 6, 7, 8], true));
 }
 
 #[tokio::test]
@@ -711,4 +767,186 @@ async fn a_sandy_view_that_cannot_align_with_rickys_prompt_is_refused() {
     }
     assert!(ricky.requests().is_empty());
     assert!(sandy.requests().is_empty());
+}
+
+/// The boundary token ends a block before its size and the next block starts a
+/// new answer: a new chain whose blocks list the answer before it, with the old
+/// chain ended on both engines; the client still gets one answer.
+#[tokio::test]
+async fn a_boundary_token_ends_an_answer_and_the_next_block_starts_another() {
+    let (ctx, [ricky, sandy], _stop) = boundary_router(10, 5).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "franky_sandy_input_ids": [7, 8, 9],
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = answer_of(res).await;
+    assert_eq!(answer["output_ids"], json!((3..13).collect::<Vec<_>>()));
+    assert_eq!(
+        answer["meta_info"]["finish_reason"],
+        json!({"type": "stop", "matched": 0})
+    );
+    let requests = ricky.requests();
+    let chains: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            (
+                request["franky_chain"]["id"].clone(),
+                request["franky_chain"]["block"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(requests.len(), 3);
+    let (first, second) = (chains[0].0.clone(), chains[1].0.clone());
+    assert_ne!(first, second);
+    assert_eq!(
+        chains,
+        [
+            (first.clone(), json!(1)),
+            (second.clone(), json!(1)),
+            (second.clone(), json!(2))
+        ]
+    );
+    assert_eq!(
+        requests[1]["rid"],
+        json!(format!("{}-1", second.as_str().unwrap()))
+    );
+    assert!(requests[0].get("franky_generated_spans").is_none());
+    for request in &requests[1..] {
+        assert_eq!(request["franky_generated_spans"], json!([[3, 6]]));
+    }
+    assert_eq!(requests[1]["input_ids"], json!([1, 2, 3, 3, 4, 5]));
+    for request in &requests {
+        assert_eq!(request["sampling_params"]["stop_token_ids"], json!([5]));
+    }
+    let sandy_requests = sandy.requests();
+    assert_eq!(sandy_requests[1]["input_ids"], json!([7, 8, 9, 3, 4, 5]));
+    assert_eq!(
+        sandy_requests[1]["franky_chain"],
+        requests[1]["franky_chain"]
+    );
+    assert_eq!(sandy_requests[1]["franky_generated_spans"], json!([[3, 6]]));
+    for engine in [&ricky, &sandy] {
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ends = engine.chain_ends();
+                if ends.len() == 2 {
+                    return ends;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both chains end on the engine");
+        assert_eq!(
+            ended,
+            [json!({"chain_id": first}), json!({"chain_id": second})]
+        );
+    }
+}
+
+/// A client that stops on the boundary token ends its answer there.
+#[tokio::test]
+async fn a_client_that_stops_on_the_boundary_token_ends_its_answer_there() {
+    let (ctx, [ricky, _sandy], _stop) = boundary_router(10, 5).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "sampling_params": {"max_new_tokens": 100, "stop_token_ids": [5]},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = answer_of(res).await;
+    assert_eq!(answer["output_ids"], json!([3, 4, 5]));
+    assert_eq!(
+        answer["meta_info"]["finish_reason"],
+        json!({"type": "stop", "matched": 5})
+    );
+    let requests = ricky.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["sampling_params"]["stop_token_ids"], json!([5]));
+}
+
+/// A boundary on the last block the client's limit allows still starts another
+/// answer while tokens are left; on the last token it allows, the answer ends
+/// at that limit, not on a stop the client never asked for.
+#[tokio::test]
+async fn a_boundary_on_the_last_block_starts_another_answer_unless_no_token_is_left() {
+    for (boundary, chains, finish) in [
+        (5, 2, json!({"type": "length", "length": 1})),
+        (6, 1, json!({"type": "length", "length": 4})),
+    ] {
+        let (ctx, [ricky, _sandy], _stop) = boundary_router(10, boundary).await;
+        let body = json!({"input_ids": [1, 2, 3], "sampling_params": {"max_new_tokens": 4}});
+
+        let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let answer = answer_of(res).await;
+        assert_eq!(
+            answer["output_ids"],
+            json!([3, 4, 5, 6]),
+            "boundary {boundary}"
+        );
+        assert_eq!(
+            answer["meta_info"]["finish_reason"], finish,
+            "boundary {boundary}"
+        );
+        assert_eq!(ricky.requests().len(), chains, "boundary {boundary}");
+    }
+}
+
+/// SGLang leaves the stop token a block stops on out of the block's text, as the
+/// engine here does, so the router gives the boundary's text back: the answer's
+/// text is what it would be without the boundary. The client's own stop is
+/// still left out, and with no_stop_trim the engine keeps every stop itself.
+#[tokio::test]
+async fn the_answer_keeps_the_boundary_tokens_text_and_trims_the_clients_stops() {
+    // A prompt of 97 tokens makes the engine generate 97, 98, ...: "abc..." decoded.
+    for (sampling, text) in [
+        (json!({}), "abcdefghij"),
+        (json!({"no_stop_trim": true}), "abcdefghij"),
+        (json!({"stop_token_ids": [103]}), "abcdef"),
+    ] {
+        let (ctx, _engines, _stop) = boundary_router(10, 100).await;
+        let body = json!({"input_ids": vec![1; 97], "sampling_params": sampling});
+
+        let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(answer_of(res).await["text"], text, "{sampling}");
+    }
+}
+
+/// A null stop_token_ids is no stop list: every block still stops on the
+/// boundary token.
+#[tokio::test]
+async fn a_null_stop_list_still_stops_every_block_on_the_boundary_token() {
+    let (ctx, [ricky, _sandy], _stop) = boundary_router(10, 5).await;
+    let body = json!({"input_ids": [1, 2, 3], "sampling_params": {"stop_token_ids": null}});
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    for request in ricky.requests() {
+        assert_eq!(request["sampling_params"]["stop_token_ids"], json!([5]));
+    }
+}
+
+/// ignore_eos turns stops off, so a request asking for it under a boundary
+/// token is refused.
+#[tokio::test]
+async fn ignore_eos_under_a_boundary_token_is_refused() {
+    let (ctx, [ricky, _sandy], _stop) = boundary_router(10, 5).await;
+    let body = json!({"input_ids": [1, 2, 3], "sampling_params": {"max_new_tokens": 8, "ignore_eos": true}});
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(ricky.requests().is_empty());
 }

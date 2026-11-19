@@ -38,6 +38,9 @@ pub struct ProxyConfig {
     /// so a block's tokens read their own taps in the next block. `None` runs
     /// it in one block.
     pub franky_block_size: Option<NonZeroU32>,
+    /// Franky: a token id that also ends a block wherever Ricky writes it; the
+    /// next block starts a new answer. `None`: blocks end only at their size.
+    pub franky_boundary_token_id: Option<u32>,
     /// Franky: the chat template whose earlier answers the router marks in the
     /// chats it renders. `None` refuses a Franky chat with earlier answers
     /// unless it carries `input_ids`.
@@ -76,6 +79,7 @@ impl Default for ProxyConfig {
             decode_dispatch_limit: None,
             stream_after_prefill: false,
             franky_block_size: None,
+            franky_boundary_token_id: None,
             franky_chat_adapter: None,
         }
     }
