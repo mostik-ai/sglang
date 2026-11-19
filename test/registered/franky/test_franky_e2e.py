@@ -30,7 +30,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=900, stage="base-b", runner_config="4-gpu-b200")
 
 _MODEL = "Qwen/Qwen3.5-0.8B"
 _LAYERS = [6, 12, 18, 24]
@@ -38,6 +38,9 @@ _TAP_SIZE = 256
 _MLP_SIZE = 256
 _PAGE_SIZE = 16
 _NEW_TOKENS = 8
+# Sandy's own tokens keep every 4th of Ricky's, as the router's
+# --franky-sandy-keep-every 4 sends them.
+_SANDY_KEEP_EVERY = 4
 _TEXT = (
     "The river ran through the old town, past the mill and the bakery, under the "
     "stone bridge where children threw pebbles into the water every evening. "
@@ -96,6 +99,9 @@ class _FrankyPair(CustomTestCase):
     reference of what Ricky's readers must read."""
 
     tp_size = 1
+    # Whether Sandy reads Ricky's tokens; when not, it reads its own, which are
+    # every _SANDY_KEEP_EVERY-th of Ricky's.
+    shared_tokenizer = True
 
     @classmethod
     def setUpClass(cls):
@@ -201,10 +207,34 @@ class _FrankyPair(CustomTestCase):
             },
             "injector": {"sandy": {"type": "residual"}, "ricky": {"type": "residual"}},
             "tap_page_size": _PAGE_SIZE,
+            "shared_tokenizer": cls.shared_tokenizer,
         }
         with open(os.path.join(cls.directory, "franky.json"), "w") as file:
             json.dump(config, file)
         return sandy, ricky
+
+    def _sandy_ids(self, ids):
+        """The tokens Sandy reads for Ricky's ``ids``."""
+        return ids if self.shared_tokenizer else ids[::_SANDY_KEEP_EVERY]
+
+    def _sandy_fields(self, ids):
+        """What Ricky's request adds when Sandy reads its own tokens."""
+        if self.shared_tokenizer:
+            return {}
+        return {"franky_sandy_input_ids": self._sandy_ids(ids)}
+
+    def _assert_reads_the_taps(self, prompts, *, first_room):
+        """Ricky's greedy logprobs follow HF with the readers, which move them."""
+        outputs = [
+            self._generate(ids, room=first_room + i) for i, ids in enumerate(prompts)
+        ]
+        for (tokens, logprobs), ref in zip(outputs, self._reference(prompts, outputs)):
+            error = (logprobs - ref["readers"]).abs().max().item()
+            same_argmax = sum(a == b for a, b in zip(ref["readers_argmax"], tokens))
+            readers_effect = (ref["plain"] - ref["readers"]).abs().max().item()
+            self.assertLess(error, 0.2)
+            self.assertGreaterEqual(same_argmax, _NEW_TOKENS - 1)
+            self.assertGreater(readers_effect, 4 * error)
 
     def _generate(self, ids, room):
         """Send the prompt to Sandy and to Ricky in one room; return Ricky's
@@ -221,11 +251,11 @@ class _FrankyPair(CustomTestCase):
         }
         answers = {}
 
-        def post(url, sampling_params, fields):
+        def post(url, input_ids, sampling_params, fields):
             answers[url] = requests.post(
                 f"{url}/generate",
                 json={
-                    "input_ids": ids,
+                    "input_ids": input_ids,
                     "sampling_params": sampling_params,
                     "return_logprob": True,
                     "franky_room": franky_room,
@@ -235,9 +265,10 @@ class _FrankyPair(CustomTestCase):
                 timeout=600,
             ).json()
 
+        ricky_fields = {**self._sandy_fields(ids), **(ricky_fields or {})}
         threads = [
-            threading.Thread(target=post, args=(self.ricky_url, ricky_sampling or {"temperature": 0, "max_new_tokens": _NEW_TOKENS}, ricky_fields or {})),
-            threading.Thread(target=post, args=(self.sandy_url, {"max_new_tokens": 1}, {})),
+            threading.Thread(target=post, args=(self.ricky_url, ids, ricky_sampling or {"temperature": 0, "max_new_tokens": _NEW_TOKENS}, ricky_fields)),
+            threading.Thread(target=post, args=(self.sandy_url, self._sandy_ids(ids), {"max_new_tokens": 1}, {})),
         ]  # fmt: skip
         for thread in threads:
             thread.start()
@@ -276,11 +307,15 @@ class _FrankyPair(CustomTestCase):
         results = []
         with torch.no_grad():
             for ids, (tokens, _) in zip(prompts, outputs):
+                sandy_ids = self._sandy_ids(ids)
                 num_taps = [
-                    _taps_to_read(
-                        row + 1,
-                        generation_start=generation_start or len(ids),
-                        block_size=block_size,
+                    min(
+                        _taps_to_read(
+                            row + 1,
+                            generation_start=generation_start or len(ids),
+                            block_size=block_size,
+                        ),
+                        len(sandy_ids),
                     )
                     for row in range(len(ids) + len(tokens) - 1)
                 ]
@@ -289,7 +324,7 @@ class _FrankyPair(CustomTestCase):
                     taps={},
                     num_taps=torch.tensor(num_taps, device="cuda"),
                 )
-                language_model(input_ids=torch.tensor([ids], device="cuda"))
+                language_model(input_ids=torch.tensor([sandy_ids], device="cuda"))
                 row = {}
                 for mode in ("readers", "plain"):
                     state["mode"] = mode
@@ -307,19 +342,10 @@ class _FrankyPair(CustomTestCase):
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")
 class TestFrankyEndToEnd(_FrankyPair):
     def test_ricky_reads_the_taps_sandy_wrote(self):
-        from transformers import AutoTokenizer
-
         tokenizer = AutoTokenizer.from_pretrained(_MODEL)
         # One prompt inside one chunk, one across many chunks and pages.
         prompts = [tokenizer.encode(_TEXT), tokenizer.encode(_TEXT * 12)]
-        outputs = [self._generate(ids, room=4100 + i) for i, ids in enumerate(prompts)]
-        for (tokens, logprobs), ref in zip(outputs, self._reference(prompts, outputs)):
-            error = (logprobs - ref["readers"]).abs().max().item()
-            same_argmax = sum(a == b for a, b in zip(ref["readers_argmax"], tokens))
-            readers_effect = (ref["plain"] - ref["readers"]).abs().max().item()
-            self.assertLess(error, 0.2)
-            self.assertGreaterEqual(same_argmax, _NEW_TOKENS - 1)
-            self.assertGreater(readers_effect, 4 * error)
+        self._assert_reads_the_taps(prompts, first_room=4100)
 
     def test_a_chains_next_block_reuses_its_held_prompt_and_reads_new_taps(self):
         prompt = AutoTokenizer.from_pretrained(_MODEL).encode(_TEXT * 6)
@@ -482,10 +508,11 @@ class TestFrankyPdEndToEnd(_FrankyPair):
             "franky_room": franky_room,
             **pd,
             **block,
+            **self._sandy_fields(ids),
             **(ricky_fields or {}),
         }
         sandy = {
-            "input_ids": ids,
+            "input_ids": self._sandy_ids(ids),
             "sampling_params": {"max_new_tokens": 1},
             "franky_room": franky_room,
             **block,
@@ -506,14 +533,7 @@ class TestFrankyPdEndToEnd(_FrankyPair):
     def test_decode_reads_the_taps_prefill_relayed(self):
         tokenizer = AutoTokenizer.from_pretrained(_MODEL)
         prompts = [tokenizer.encode(_TEXT), tokenizer.encode(_TEXT * 12)]
-        outputs = [self._generate(ids, room=5100 + i) for i, ids in enumerate(prompts)]
-        for (tokens, logprobs), ref in zip(outputs, self._reference(prompts, outputs)):
-            error = (logprobs - ref["readers"]).abs().max().item()
-            same_argmax = sum(a == b for a, b in zip(ref["readers_argmax"], tokens))
-            readers_effect = (ref["plain"] - ref["readers"]).abs().max().item()
-            self.assertLess(error, 0.2)
-            self.assertGreaterEqual(same_argmax, _NEW_TOKENS - 1)
-            self.assertGreater(readers_effect, 4 * error)
+        self._assert_reads_the_taps(prompts, first_room=5100)
 
     def test_requests_at_once_each_read_their_own_taps(self):
         tokenizer = AutoTokenizer.from_pretrained(_MODEL)
@@ -536,6 +556,30 @@ class TestFrankyPdEndToEnd(_FrankyPair):
             thread.join()
         for (tokens, logprobs), ref in zip(outputs, self._reference(prompts, outputs)):
             self.assertLess((logprobs - ref["readers"]).abs().max().item(), 0.2)
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")
+class TestFrankyOwnSandyTokensEndToEnd(_FrankyPair):
+    """Sandy reads its own tokens, so Ricky's taps count Sandy's tokens. The longer
+    prompt starts with the shorter one, so with one rank it reads the shorter
+    one's whole stripes from the tap prefix tree."""
+
+    shared_tokenizer = False
+
+    def test_ricky_reads_the_taps_of_sandys_own_tokens(self):
+        tokenizer = AutoTokenizer.from_pretrained(_MODEL)
+        prompts = [tokenizer.encode(_TEXT * 4), tokenizer.encode(_TEXT * 12)]
+        self._assert_reads_the_taps(prompts, first_room=4600)
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 4, "requires 4 GPUs")
+class TestFrankyOwnSandyTokensEndToEndTp2(TestFrankyOwnSandyTokensEndToEnd):
+    tp_size = 2
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 4, "requires 4 GPUs")
+class TestFrankyOwnSandyTokensPdEndToEnd(TestFrankyPdEndToEnd):
+    shared_tokenizer = False
 
 
 if __name__ == "__main__":
