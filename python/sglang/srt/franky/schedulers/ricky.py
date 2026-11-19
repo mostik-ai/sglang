@@ -289,6 +289,13 @@ class RickyScheduler(Scheduler):
             self.waiting_queue.remove(req)
             prepare_abort(req, reason, status_code=finished_reason.status_code)
             self._release_aborted_request(req)
+            # As SGLang's abort of a queued request: a waiting request whose prefix
+            # matched holds a copy of the matched mamba state until it starts, and
+            # under PD its bootstrap with the decode engine.
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.release_aborted_prefill_waiting_req(req)
+            elif req.kv.holds_mamba:
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
             self.send_abort_output(
                 _make_abort_req(req, finished_reason=finished_reason.to_json()), req
             )
