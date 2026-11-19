@@ -40,14 +40,14 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _PAGE_SIZE = 4
 _OUTPUT_SIZE = 8
 _RICKY_HIDDEN = 6
-_MAX_STRIPES = 4
+_MAX_STRIPES = 5
 # Request slot to the local pages of its stripes in order.
-_STRIPE_PAGES = {1: [5, 2, 7, 3], 2: [1, 6, 4, 0]}
+_STRIPE_PAGES = {1: [5, 2, 7, 3, 9], 2: [1, 6, 4, 0, 8]}
 
 
 def _tap(slot: int, position: int) -> float:
-    """Each tap's entries name its request and its token."""
-    return 100.0 * slot + position
+    """Each tap's entries name its request and its token, exactly in bfloat16."""
+    return 10.0 * slot + position
 
 
 def _rank_pages(stripes: TapStripes) -> torch.Tensor:
@@ -55,7 +55,7 @@ def _rank_pages(stripes: TapStripes) -> torch.Tensor:
         encoder_ids=(0,),
         output_size=_OUTPUT_SIZE,
         page_size=_PAGE_SIZE,
-        num_pages=8,
+        num_pages=10,
         device="cpu",
     )
     for slot, stripe_pages in _STRIPE_PAGES.items():
@@ -66,7 +66,7 @@ def _rank_pages(stripes: TapStripes) -> torch.Tensor:
             local_page = stripe_pages[page // stripes.num_ranks]
             buffers.write(
                 encoder_id=0,
-                taps=torch.full((1, _OUTPUT_SIZE), _tap(slot, position)),
+                taps=torch.full((1, _OUTPUT_SIZE), _tap(slot, position), dtype=TAP_DTYPE),
                 slots=torch.tensor([local_page * _PAGE_SIZE + position % _PAGE_SIZE]),
             )
     return buffers.pages(0)

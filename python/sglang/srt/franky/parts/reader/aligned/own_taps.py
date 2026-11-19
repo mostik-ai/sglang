@@ -84,11 +84,10 @@ class OwnTaps(msgspec.Struct, frozen=True, kw_only=True):
         reading = async_h2d(reads, dtype=torch.bool, device=device)
         request_pages = position // page_size
         kept = reading & stripes.owns(request_pages)
+        # Rows that read nothing look up their request's first stripe.
         local_pages = request_table.stripe_pages[
             async_h2d(slots, dtype=torch.int64, device=device),
-            stripes.stripe(request_pages).clamp(
-                max=request_table.max_stripes - 1
-            ),
+            torch.where(reading, stripes.stripe(request_pages), 0),
         ].to(torch.int64)
         taps = pages.view(num_pages * page_size, output_size)[
             local_pages * page_size + position % page_size
