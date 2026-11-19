@@ -766,9 +766,9 @@ class ModelRunner:
             else None
         )
 
-    def maybe_init_franky_tap_pages(self):
+    def maybe_init_franky_taps(self):
         if self.franky_parts is not None:
-            self.franky_parts.init_tap_pages(
+            self.franky_parts.init_taps(
                 num_kv_tokens=self.max_total_num_tokens,
                 kv_page_size=self.token_to_kv_pool_allocator.page_size,
                 req_to_token_pool=self.req_to_token_pool,
@@ -1027,7 +1027,7 @@ class ModelRunner:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
 
-        self.maybe_init_franky_tap_pages()
+        self.maybe_init_franky_taps()
         self._init_post_memory_pool_components()
 
     def _init_post_memory_pool_components(self):

@@ -49,7 +49,7 @@ class _Parts(FrankyParts):
     def build(cls, **kwargs):
         raise NotImplementedError
 
-    def init_tap_pages(self, **kwargs):
+    def init_taps(self, **kwargs):
         raise NotImplementedError
 
     def _tap_encoder_ids(self):
@@ -205,7 +205,7 @@ class TestRickyTapPool(CustomTestCase):
 
     def _init(self, parts, *, context_len, kv_page_size=8):
         """The pool the scheduler builds over the pages the parts own."""
-        parts.init_tap_pages(
+        parts.init_taps(
             num_kv_tokens=64,
             kv_page_size=kv_page_size,
             req_to_token_pool=SimpleNamespace(

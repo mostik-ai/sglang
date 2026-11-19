@@ -8,7 +8,7 @@ from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 
 if TYPE_CHECKING:
     from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
-    from sglang.srt.franky.cache.ricky_tap_requests import RickyTapRequests
+    from sglang.srt.franky.ricky_taps.tap_requests import RickyTapRequests
     from sglang.srt.franky.transfer.manager import FrankyTapManager
     from sglang.srt.franky.transfer.receiver import FrankyReceiver
 

@@ -9,7 +9,7 @@ rendezvous once so launches are CUDA-graph capturable.
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -486,10 +486,14 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
 class MultimemAllGatherer:
     """Guarded multimem all-gather (last dim) with NCCL fallback; the single
     entry point for every caller. Owns one symmetric buffer built lazily on the
-    first eager call, and uses the kernel only when the input fits its
-    dtype/shape/alignment contract. Guards use TP-replicated quantities so all
-    ranks pick the same path. ``skip_entry_sync=True`` drops the entry barrier;
-    only safe when a cross-rank sync sits between consecutive calls."""
+    first eager call, or by ``build`` outside graph capture, and uses the kernel
+    only when the input fits its dtype/shape/alignment contract. Guards use
+    TP-replicated quantities so all ranks pick the same path.
+    ``skip_entry_sync=True`` drops the entry barrier; only safe when a cross-rank
+    sync sits between consecutive calls. ``p2p=True`` keeps the buffer where the
+    GPUs have no NVLink multicast and stores into every rank's buffer over P2P;
+    otherwise such GPUs fall back to NCCL. ``group`` gathers over another group
+    than TP."""
 
     _UNINIT = object()
 
@@ -499,19 +503,20 @@ class MultimemAllGatherer:
         *,
         enabled: bool = True,
         skip_entry_sync: bool = False,
+        group: Any = None,
+        p2p: bool = False,
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
+        self._given_group = group
+        self._p2p = p2p
         # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
-            from sglang.srt.distributed.parallel_state import (
-                get_tp_group,
-                in_the_same_node_as,
-            )
+            from sglang.srt.distributed.parallel_state import in_the_same_node_as
 
-            tp_group = get_tp_group()
+            group = self._group()
             # Only probe node topology when the deployment can actually span
             # nodes. Check world_size first so a TP=1 gatherer short-circuits
             # before reading the parallel config (which may be unpublished on
@@ -519,15 +524,22 @@ class MultimemAllGatherer:
             # in_the_same_node_as() all-reduce, which can segfault under some
             # EP/mooncake setups, and keep multimem enabled.
             if (
-                tp_group.world_size > 1
+                group.world_size > 1
                 and get_parallel().nnodes > 1
-                and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
+                and not all(in_the_same_node_as(group.cpu_group, source_rank=0))
             ):
                 logger.warning(
                     "multimem all-gather disabled because the TP group spans "
                     "across nodes."
                 )
                 self._state = None
+
+    def build(self, hidden_size: int) -> None:
+        """Build the symmetric buffer now, for a gathered width of
+        ``hidden_size``. Collective: every rank of the group calls it at the same
+        point, outside CUDA graph capture."""
+        if self._state is self._UNINIT:
+            self._state = self._create(hidden_size=hidden_size)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         state = self._state
@@ -552,10 +564,20 @@ class MultimemAllGatherer:
                 skip_entry_sync=self._skip_entry_sync,
                 safe=False,
             )
+        if self._given_group is not None:
+            return self._given_group.all_gather(x, dim=-1)
         # Lazy import avoids a module-load dependency on the distributed facade.
         from sglang.srt.distributed import tensor_model_parallel_all_gather
 
         return tensor_model_parallel_all_gather(x, dim=-1)
+
+    def _group(self):
+        if self._given_group is not None:
+            return self._given_group
+        # Lazy import avoids a module-load dependency on the distributed facade.
+        from sglang.srt.distributed.parallel_state import get_tp_group
+
+        return get_tp_group()
 
     def _build(self, x: torch.Tensor):
         if x.dim() != 2 or x.dtype != torch.bfloat16:
@@ -565,24 +587,38 @@ class MultimemAllGatherer:
             return self._UNINIT
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
             return None
-        try:
-            from sglang.srt.distributed.parallel_state import get_tp_group
+        return self._create(local_width=x.shape[-1])
 
-            tp_group = get_tp_group()
-            if tp_group.world_size <= 1:
+    def _create(
+        self, *, hidden_size: Optional[int] = None, local_width: Optional[int] = None
+    ):
+        try:
+            group = self._group()
+            if group.world_size <= 1:
                 return None
             state = create_state(
-                group=tp_group.device_group,
-                rank_in_group=tp_group.rank_in_group,
+                group=group.device_group,
+                rank_in_group=group.rank_in_group,
                 max_tokens=self._max_tokens,
-                hidden_size=x.shape[-1] * tp_group.world_size,
+                hidden_size=(
+                    hidden_size
+                    if hidden_size is not None
+                    else local_width * group.world_size
+                ),
             )
             if state.symm_mem_hdl.multicast_ptr == 0:
+                if self._p2p:
+                    logger.info(
+                        "multimem all-gather stores over P2P (no multicast for "
+                        "world_size=%d)",
+                        group.world_size,
+                    )
+                    return state
                 # No multicast for this world size / arch; multimem.st would
                 # write nowhere. Fall back to NCCL.
                 logger.warning(
                     "multimem all-gather disabled (no multicast for world_size=%d)",
-                    tp_group.world_size,
+                    group.world_size,
                 )
                 return None
             return state

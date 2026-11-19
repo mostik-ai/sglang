@@ -11,12 +11,15 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.franky_reader_merge import PACK_COLUMNS
+from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+    MultimemAllGatherer,
+)
 from sglang.srt.franky.cache.generated_spans import (
     FrankyGeneratedSpans,
     GeneratedSpan,
 )
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE, TapBuffers
-from sglang.srt.franky.cache.tap_row_table import TapRowTable
+from sglang.srt.franky.cache.tap_request_table import TapRequestTable
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts.reader import tap_attention
 from sglang.srt.franky.parts.reader.current_tap_reading import CurrentTapReading
@@ -110,9 +113,17 @@ class _Ranks:
     def group(self, rank):
         return SimpleNamespace(
             world_size=self.world_size,
-            all_gather_into_tensor=lambda output, input: self._gather(
-                rank, output, input
-            ),
+            all_gather=lambda input, dim: self._gather_last_dim(rank, input),
+        )
+
+    def _gather_last_dim(self, rank, input):
+        # As GroupCoordinator.all_gather along the last dim.
+        output = input.new_empty((self.world_size * input.shape[0], *input.shape[1:]))
+        self._gather(rank, output, input)
+        return (
+            output.view(self.world_size, *input.shape)
+            .movedim(0, -2)
+            .reshape(*input.shape[:-1], self.world_size * input.shape[-1])
         )
 
     def _gather(self, rank, output, input):
@@ -160,11 +171,13 @@ def _rank_pages(taps, stripes):
     return buffers.pages(0)
 
 
-def _row_table(*, num_ranks):
-    row_table = TapRowTable(num_rows=_NUM_ROWS, max_stripes=_MAX_STRIPES, device="cpu")
+def _request_table(*, num_ranks):
+    request_table = TapRequestTable(
+        num_slots=_NUM_ROWS, max_stripes=_MAX_STRIPES, device="cpu"
+    )
     rows = list(_SPANS)
     pages = [_pages(row, num_ranks=num_ranks) for row in rows]
-    row_table.bind(
+    request_table.bind(
         req_pool_indices=rows,
         pages=[
             None if row_pages is None else torch.tensor(row_pages)
@@ -173,7 +186,7 @@ def _row_table(*, num_ranks):
         spans=[_SPANS[row] for row in rows],
         num_input_tokens=[_NUM_INPUT_TOKENS[row] for row in rows],
     )
-    return row_table
+    return request_table
 
 
 def _extend_batch():
@@ -220,7 +233,7 @@ class TestTapReading(CustomTestCase):
     def _reading(self, batch, *, rank=0, num_ranks=2):
         return TapReading.of(
             batch,
-            row_table=_row_table(num_ranks=num_ranks),
+            request_table=_request_table(num_ranks=num_ranks),
             stripes=TapStripes(num_ranks=num_ranks, rank=rank),
             page_size=_PAGE_SIZE,
             mask_dtype=torch.float32,
@@ -303,12 +316,17 @@ class TestTapAttention(CustomTestCase):
         return TapAttention(
             pages=_rank_pages(self.taps, stripes),
             reading=CurrentTapReading(
-                row_table=_row_table(num_ranks=num_ranks),
+                request_table=_request_table(num_ranks=num_ranks),
                 stripes=stripes,
                 page_size=_PAGE_SIZE,
             ),
             builds_reading=True,
-            gather=None if group is None else TapGather(group=group, symmetric=None),
+            gather=None
+            if group is None
+            else TapGather(
+                gatherer=MultimemAllGatherer(1, enabled=False, group=group),
+                num_ranks=group.world_size,
+            ),
             workspace=None,
         )
 

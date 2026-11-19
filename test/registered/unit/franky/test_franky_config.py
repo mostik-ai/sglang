@@ -172,6 +172,7 @@ class TestHandleFranky(_WithFiles):
             "--enable-layernorm-sp": {"enable_layernorm_sp": True},
             "--enable-two-batch-overlap": {"enable_two_batch_overlap": True},
             "--enable-pdmux": {"enable_pdmux": True},
+            "--attn-cp-size 2": {"attn_cp_size": 2},
             "--enable-unified-memory": {"enable_unified_memory": True},
             "--enable-hisparse": {"enable_hisparse": True},
             "--enable-kv-cache-sharding": {"enable_kv_cache_sharding": True},

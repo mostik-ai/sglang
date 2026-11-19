@@ -219,7 +219,7 @@ class _Files(CustomTestCase):
             dtype=torch.float32,
             device="cpu",
         )
-        parts.init_tap_pages(
+        parts.init_taps(
             num_kv_tokens=8 * len(self.req_to_token) + _CONTEXT,
             kv_page_size=_PAGE_SIZE,
             req_to_token_pool=SimpleNamespace(req_to_token=self.req_to_token),
@@ -247,7 +247,7 @@ class _Files(CustomTestCase):
         return pages
 
     def _bind(self, parts, *, row, pages, spans, first):
-        parts.row_table.bind(
+        parts.request_table.bind(
             req_pool_indices=[row],
             pages=[pages],
             spans=[spans],
@@ -338,7 +338,7 @@ class TestReaders(_Files):
         parts = self._attach(
             model=model, config_path=config_path, weights_path=weights_path
         )
-        parts.row_table.bind(
+        parts.request_table.bind(
             req_pool_indices=[4],
             pages=[None],
             spans=[_spans(5, block_size=4)],
@@ -562,9 +562,9 @@ class TestRickyParts(_Files):
         num_stripes = parts.tap_buffers.num_pages - 1
         self.assertEqual(num_stripes, (8 * 5 + _CONTEXT) // _PAGE_SIZE)
         self.assertEqual(
-            parts.row_table.stripe_pages.shape, (5, _CONTEXT // _PAGE_SIZE)
+            parts.request_table.stripe_pages.shape, (5, _CONTEXT // _PAGE_SIZE)
         )
-        self.assertEqual(parts.row_table.max_stripes * _PAGE_SIZE, _CONTEXT)
+        self.assertEqual(parts.request_table.max_stripes * _PAGE_SIZE, _CONTEXT)
 
 
 if __name__ == "__main__":

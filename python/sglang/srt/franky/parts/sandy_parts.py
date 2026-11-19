@@ -7,11 +7,11 @@ from torch import nn
 from typing_extensions import override
 
 from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
+from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts.franky_parts import FrankyParts, load_part
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.cache.tap_stripes import TapStripes
     from sglang.srt.franky.config import FrankyConfig
     from sglang.srt.franky.parts.encoder.encoder import Encoder
     from sglang.srt.franky.parts.franky_mixin import FrankyMixin
@@ -103,11 +103,11 @@ class SandyParts(FrankyParts):
             start_layer=start_layer,
             end_layer=end_layer,
             device=device,
-            stripes=cls.attention_tp_stripes(),
+            stripes=TapStripes.of_attention_tp(),
         )
 
     @override
-    def init_tap_pages(
+    def init_taps(
         self,
         *,
         num_kv_tokens: int,

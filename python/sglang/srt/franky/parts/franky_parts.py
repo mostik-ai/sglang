@@ -11,7 +11,6 @@ from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.config import FrankyConfig
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
-from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from torch import nn
@@ -118,21 +117,17 @@ class FrankyParts(ABC):
         return math.ceil(tap_bytes / self.stripes.num_ranks)
 
     @abstractmethod
-    def init_tap_pages(
+    def init_taps(
         self,
         *,
         num_kv_tokens: int,
         kv_page_size: int,
         req_to_token_pool: ReqToTokenPool,
     ) -> None:
-        """Build this rank's tap pages, once the KV budget set ``num_kv_tokens``."""
+        """Build this rank's taps once the KV budget set ``num_kv_tokens``: the
+        tap pages and, on Ricky, what the readers need to read them.
+        """
         raise NotImplementedError
-
-    @staticmethod
-    def attention_tp_stripes() -> TapStripes:
-        """How this engine's attention-TP ranks split the taps."""
-        parallel = get_parallel()
-        return TapStripes(num_ranks=parallel.attn_tp_size, rank=parallel.attn_tp_rank)
 
     def runs_after(self, *, layer_idx: int) -> bool:
         """Whether a part of this PP stage runs after layer ``layer_idx``,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -10,6 +11,7 @@ from sglang.kernels.ops.attention.franky_reader_merge import (
     franky_reader_merge,
     franky_reader_pack,
 )
+from sglang.kernels.ops.attention.franky_reader_prefill import franky_reader_prefill
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -27,8 +29,21 @@ if TYPE_CHECKING:
 # Split-KV completion tickets, one int32 a query head of a row, for 2^18 rows of
 # 8 heads: a forward's rows stay far below.
 _TRTLLM_COUNTER_BYTES = (1 << 18) * 8 * 4
-# TRT-LLM's kernels keep the log-sum-exp in base 2, as FlashInfer's MLA ones do.
-_TRTLLM_LSE_IS_BASE_E = False
+
+
+class LocalKernel(enum.Enum):
+    """A kernel a rank attends over the taps it keeps with."""
+
+    PREFILL = "franky_reader_prefill"
+    FA3 = "flash_attn_with_kvcache"
+    TRTLLM = "trtllm_batch_decode_with_kv_cache"
+
+    @property
+    def lse_is_base_e(self) -> bool:
+        """Whether its log-sum-exp is natural; TRT-LLM's kernels keep it in base 2,
+        as FlashInfer's MLA ones do.
+        """
+        return self is not LocalKernel.TRTLLM
 
 
 class TrtllmWorkspace(msgspec.Struct, frozen=True, kw_only=True):
@@ -95,6 +110,7 @@ class TapAttention:
         self.gather = gather
         self.workspace = workspace
 
+    @eager_on_graph
     def attend(
         self,
         queries: torch.Tensor,
@@ -105,31 +121,16 @@ class TapAttention:
         rows: Optional[torch.Tensor],
     ) -> None:
         """Write each row's attended taps into ``attended``, and 1 or 0 into
-        ``has_taps`` by whether it read any.
+        ``has_taps`` by whether it read any. A graph break: a prefill CUDA graph
+        replays it with the batch of the replay.
 
         Args:
             queries: [rows, queries, output_size].
             rows: the rows of ``forward_batch`` the queries belong to, as
                 indices into them; None for all of them.
         """
-        _attend_taps(
-            queries,
-            attended,
-            has_taps,
-            attention=self,
-            forward_batch=forward_batch,
-            rows=rows,
-        )
-
-    def _run(
-        self,
-        queries: torch.Tensor,
-        attended: torch.Tensor,
-        has_taps: torch.Tensor,
-        *,
-        forward_batch: ForwardBatch,
-        rows: Optional[torch.Tensor],
-    ) -> None:
+        if is_in_prefill_graph_scope():
+            forward_batch = get_forward_batch()
         reading = (
             self.reading.start(forward_batch, mask_dtype=has_taps.dtype)
             if self.builds_reading
@@ -150,17 +151,18 @@ class TapAttention:
     def _attend_rows(
         self, queries: torch.Tensor, reading: TapReading, *, out: torch.Tensor
     ) -> None:
+        kernel = self._local_kernel(queries, reading)
         if self.gather is None:
-            self._attend_locally(queries, reading, out=out, lse=None)
+            self._attend_locally(kernel, queries, reading, out=out, lse=None)
             return
         local_out = torch.empty_like(queries)
         lse = torch.empty(queries.shape[:2], dtype=torch.float32, device=queries.device)
-        lse_is_base_e = self._attend_locally(queries, reading, out=local_out, lse=lse)
+        self._attend_locally(kernel, queries, reading, out=local_out, lse=lse)
         local_taps = reading.local_taps[: queries.shape[0]]
         rows = reading.merged_rows
         if rows is None:
             self._merge(
-                local_out, lse, local_taps, out=out, lse_is_base_e=lse_is_base_e
+                local_out, lse, local_taps, out=out, lse_is_base_e=kernel.lse_is_base_e
             )
             return
         merged = local_out.new_empty((rows.shape[0], *local_out.shape[1:]))
@@ -169,7 +171,7 @@ class TapAttention:
             lse[rows],
             local_taps[rows],
             out=merged,
-            lse_is_base_e=lse_is_base_e,
+            lse_is_base_e=kernel.lse_is_base_e,
         )
         out[rows] = merged
 
@@ -189,38 +191,30 @@ class TapAttention:
             self.gather.gather(packed), out=out, lse_is_base_e=lse_is_base_e
         )
 
+    def _local_kernel(self, queries: torch.Tensor, reading: TapReading) -> LocalKernel:
+        if reading.row_blocks is not None and queries.shape[1] == 1 and queries.is_cuda:
+            return LocalKernel.PREFILL
+        if self.workspace is None:
+            return LocalKernel.FA3
+        return LocalKernel.TRTLLM
+
     def _attend_locally(
         self,
+        kernel: LocalKernel,
         queries: torch.Tensor,
         reading: TapReading,
         *,
         out: torch.Tensor,
         lse: Optional[torch.Tensor],
-    ) -> bool:
-        if reading.row_blocks is not None and queries.shape[1] == 1 and queries.is_cuda:
+    ) -> None:
+        if kernel is LocalKernel.PREFILL:
             _prefill_attend(queries, self.pages, reading, out=out, lse=lse)
-            return True
-        if self.workspace is None:
+        elif kernel is LocalKernel.FA3:
             _fa3_attend(queries, self.pages, reading, out=out, lse=lse)
-            return True
-        _trtllm_attend(queries, self.pages, reading, self.workspace, out=out, lse=lse)
-        return _TRTLLM_LSE_IS_BASE_E
-
-
-@eager_on_graph
-def _attend_taps(
-    queries: torch.Tensor,
-    attended: torch.Tensor,
-    has_taps: torch.Tensor,
-    *,
-    attention: TapAttention,
-    forward_batch: ForwardBatch,
-    rows: Optional[torch.Tensor],
-) -> None:
-    # A prefill CUDA graph replays this break with the batch of the replay.
-    if is_in_prefill_graph_scope():
-        forward_batch = get_forward_batch()
-    attention._run(queries, attended, has_taps, forward_batch=forward_batch, rows=rows)
+        else:
+            _trtllm_attend(
+                queries, self.pages, reading, self.workspace, out=out, lse=lse
+            )
 
 
 def _prefill_attend(
@@ -231,10 +225,6 @@ def _prefill_attend(
     out: torch.Tensor,
     lse: Optional[torch.Tensor],
 ) -> None:
-    from sglang.kernels.ops.attention.franky_reader_prefill import (
-        franky_reader_prefill,
-    )
-
     num_pages, page_size, _, tap_size = pages.shape
     franky_reader_prefill(
         queries.view(-1, tap_size),

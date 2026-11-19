@@ -25,14 +25,14 @@ class FrankyRequest(msgspec.Struct, frozen=True, kw_only=True):
     Attributes:
         room: where the request's taps meet; None for a request that reads none.
         chain: the chain the request is a block of, if any.
-        generated_spans: the request's earlier answers, in both sides' tokens.
+        earlier_answers: the request's earlier answers, in both sides' tokens.
         sandy_input_ids: Sandy's tokens of the input when Sandy tokenizes on its
             own; None when Sandy reads the request's own tokens.
     """
 
     room: Optional[FrankyRoom] = None
     chain: Optional[FrankyChain] = None
-    generated_spans: tuple[GeneratedSpan, ...] = ()
+    earlier_answers: tuple[GeneratedSpan, ...] = ()
     sandy_input_ids: Optional[list[int]] = None
 
     @staticmethod
@@ -79,7 +79,7 @@ class FrankyRequest(msgspec.Struct, frozen=True, kw_only=True):
                 else msgspec.convert(obj.franky_room, FrankyRoom)
             ),
             chain=chain,
-            generated_spans=checked_earlier_answers(
+            earlier_answers=checked_earlier_answers(
                 obj.franky_generated_spans or [],
                 generation_start=prompt_len
                 - (0 if chain is None else chain.num_generated_before),
@@ -96,14 +96,14 @@ class FrankyRequest(msgspec.Struct, frozen=True, kw_only=True):
     @staticmethod
     def of(req: Req) -> FrankyRequest:
         """The Franky request ``req`` carries; an empty one when it carries none."""
-        return _NO_REQUEST if req.franky_request is None else req.franky_request
+        return _NO_REQUEST if req.franky is None else req.franky
 
     def spans(self, *, num_input_tokens: int) -> FrankyGeneratedSpans:
         """Which taps each token of the request reads: its earlier answers, then
         the answer it generates now, after its chain's earlier blocks.
         """
         return FrankyGeneratedSpans.of(
-            earlier_answers=self.generated_spans,
+            earlier_answers=self.earlier_answers,
             num_input_tokens=num_input_tokens,
             chain=self.chain,
             sandy_input_len=(
@@ -111,7 +111,7 @@ class FrankyRequest(msgspec.Struct, frozen=True, kw_only=True):
             ),
         )
 
-    def sandy_ids(self, input_ids: Sequence[int]) -> Sequence[int]:
+    def sandy_tokens(self, input_ids: Sequence[int]) -> Sequence[int]:
         """The tokens Sandy reads for a request with these input ids; Ricky's
         taps count them.
         """

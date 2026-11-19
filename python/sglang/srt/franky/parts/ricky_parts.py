@@ -12,7 +12,8 @@ from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
 )
 from sglang.srt.distributed.parallel_state import get_attn_tp_group
 from sglang.srt.franky.cache.tap_buffers import TapBuffers
-from sglang.srt.franky.cache.tap_row_table import TapRowTable
+from sglang.srt.franky.cache.tap_request_table import TapRequestTable
+from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts.franky_parts import FrankyParts, load_part
 from sglang.srt.franky.parts.reader.current_tap_reading import CurrentTapReading
 from sglang.srt.franky.parts.reader.tap_attention import TapAttention, TrtllmWorkspace
@@ -21,7 +22,6 @@ from sglang.srt.runtime_context import get_franky
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.cache.tap_stripes import TapStripes
     from sglang.srt.franky.config import FrankyConfig
     from sglang.srt.franky.parts.franky_mixin import FrankyMixin
     from sglang.srt.franky.parts.injector.injector import Injector
@@ -51,7 +51,7 @@ class RickyParts(FrankyParts):
             config.reader.layers[index] - 1: index for index in readers
         }
         self.tap_buffers: Optional[TapBuffers] = None
-        self.row_table: Optional[TapRowTable] = None
+        self.request_table: Optional[TapRequestTable] = None
         self._attentions: dict[int, TapAttention] = {}
         super().__init__(
             config=config,
@@ -93,12 +93,12 @@ class RickyParts(FrankyParts):
             injector=injector,
             readers=readers,
             device=device,
-            stripes=cls.attention_tp_stripes(),
+            stripes=TapStripes.of_attention_tp(),
             tap_pool_ratio=get_franky().franky_tap_pool_ratio,
         )
 
     @override
-    def init_tap_pages(
+    def init_taps(
         self,
         *,
         num_kv_tokens: int,
@@ -107,7 +107,8 @@ class RickyParts(FrankyParts):
     ) -> None:
         """Ricky's taps get pages of their own: ``tap_pool_ratio`` taps per KV
         token over the attention-TP ranks, at least one request of the context
-        length. The scheduler's ``RickyTapCache`` hands them to requests.
+        length; the scheduler's ``RickyTapCache`` hands them to requests. Also
+        the request table and the readers' attentions over the pages.
         """
         page_size = self.config.tap_page_size
         stripe_size = self.stripes.num_ranks * page_size
@@ -126,8 +127,8 @@ class RickyParts(FrankyParts):
             num_pages=num_stripes + 1,
             device=self.device,
         )
-        self.row_table = TapRowTable(
-            num_rows=req_to_token_pool.req_to_token.shape[0],
+        self.request_table = TapRequestTable(
+            num_slots=req_to_token_pool.req_to_token.shape[0],
             max_stripes=ceil_div(context_len, stripe_size),
             device=self.device,
         )
@@ -160,7 +161,7 @@ class RickyParts(FrankyParts):
 
     def _build_attentions(self) -> dict[int, TapAttention]:
         reading = CurrentTapReading(
-            row_table=self.row_table,
+            request_table=self.request_table,
             stripes=self.stripes,
             page_size=self.config.tap_page_size,
         )

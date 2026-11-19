@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.schedulers.tap_readiness import TapReadiness
+    from sglang.srt.franky.ricky_taps.prefill_tap_limit import PrefillTapLimit
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.schedule_batch import Req
 
@@ -23,8 +23,8 @@ class FrankyParkedChunks:
     chunk's taps landed, and the seconds after that until the scheduler took it.
     """
 
-    def __init__(self, *, readiness: TapReadiness) -> None:
-        self.readiness = readiness
+    def __init__(self, *, tap_limit: PrefillTapLimit) -> None:
+        self.tap_limit = tap_limit
         self.reqs: list[Req] = []
         self.parkings: dict[str, _Parking] = {}
 
@@ -36,13 +36,13 @@ class FrankyParkedChunks:
         """
         now = time.perf_counter()
         self._note_landings(now=now)
-        if current is not None and self.readiness.can_run(current):
+        if current is not None and self.tap_limit.can_run(current):
             return current
         if current is not None:
             self.reqs.append(current)
             self.parkings[current.rid] = _Parking(since=now)
         for req in self.reqs:
-            if self.readiness.can_run(req):
+            if self.tap_limit.can_run(req):
                 self.reqs.remove(req)
                 self._unpark(req, now=now)
                 return req
@@ -72,7 +72,7 @@ class FrankyParkedChunks:
     def _note_landings(self, *, now: float) -> None:
         for req in self.reqs:
             parking = self.parkings[req.rid]
-            if parking.landed_at is None and self.readiness.can_run(req):
+            if parking.landed_at is None and self.tap_limit.can_run(req):
                 parking.landed_at = now
 
     def _unpark(self, req: Req, *, now: float) -> None:

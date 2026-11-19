@@ -124,8 +124,8 @@ class _Files(CustomTestCase):
 
     def _attach(self, *, model, config_path, weights_path, stripes=None):
         with patch.object(
-            FrankyParts,
-            "attention_tp_stripes",
+            TapStripes,
+            "of_attention_tp",
             staticmethod(lambda: stripes or TapStripes(num_ranks=1, rank=0)),
         ):
             parts = FrankyParts.attach(
@@ -136,7 +136,7 @@ class _Files(CustomTestCase):
                 dtype=TAP_DTYPE,
                 device="cpu",
             )
-        parts.init_tap_pages(
+        parts.init_taps(
             num_kv_tokens=64,
             kv_page_size=_PAGE_SIZE,
             req_to_token_pool=SimpleNamespace(

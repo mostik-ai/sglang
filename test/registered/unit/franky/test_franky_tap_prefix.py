@@ -122,18 +122,15 @@ class TestFrankyTapsPastTheCachedPrefix(CustomTestCase):
         self.assertEqual(receiver.landed(), 70)
 
 
-def _tap_manager(*, attn_tp_size, pp_size, attn_cp_size=1):
+def _tap_manager(*, attn_tp_size, pp_size):
     manager = FrankyTapManager.__new__(FrankyTapManager)
     manager.attn_tp_size = attn_tp_size
     manager.pp_size = pp_size
-    manager.attn_cp_size = attn_cp_size
     return manager
 
 
-def _sending_engine(*, attn_tp_size, pp_size, attn_cp_size=1):
-    return SimpleNamespace(
-        attn_tp_size=attn_tp_size, pp_size=pp_size, attn_cp_size=attn_cp_size
-    )
+def _sending_engine(*, attn_tp_size, pp_size):
+    return SimpleNamespace(attn_tp_size=attn_tp_size, pp_size=pp_size)
 
 
 class TestFrankyTapManager(CustomTestCase):
@@ -184,26 +181,6 @@ class TestFrankyTapManager(CustomTestCase):
 
         self.assertEqual(sending_engine.required_dst_info_num, 8)
         self.assertEqual(sending_engine.required_prefill_response_num, 8)
-
-    def test_attention_context_parallelism_is_refused(self):
-        for manager, sending_engine in (
-            (
-                _tap_manager(attn_tp_size=2, pp_size=1),
-                _sending_engine(attn_tp_size=2, pp_size=1, attn_cp_size=2),
-            ),
-            (
-                _tap_manager(attn_tp_size=2, pp_size=1, attn_cp_size=2),
-                _sending_engine(attn_tp_size=2, pp_size=1),
-            ),
-        ):
-            with (
-                self.subTest(
-                    sending=sending_engine.attn_cp_size,
-                    receiving=manager.attn_cp_size,
-                ),
-                self.assertRaisesRegex(ValueError, "context parallelism"),
-            ):
-                manager._resolve_rank_mapping(sending_engine)
 
 
 if __name__ == "__main__":

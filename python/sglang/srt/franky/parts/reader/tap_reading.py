@@ -12,7 +12,7 @@ from sglang.kernels.ops.attention.franky_reader_blocks import (
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.cache.tap_row_table import TapRowTable
+    from sglang.srt.franky.cache.tap_request_table import TapRequestTable
     from sglang.srt.franky.cache.tap_stripes import TapStripes
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -49,7 +49,7 @@ class TapReading(msgspec.Struct, frozen=True, kw_only=True):
     def of(
         forward_batch: ForwardBatch,
         *,
-        row_table: TapRowTable,
+        request_table: TapRequestTable,
         stripes: TapStripes,
         page_size: int,
         mask_dtype: torch.dtype,
@@ -65,7 +65,7 @@ class TapReading(msgspec.Struct, frozen=True, kw_only=True):
         )
         return reading(
             forward_batch,
-            row_table=row_table,
+            request_table=request_table,
             stripes=stripes,
             page_size=page_size,
             mask_dtype=mask_dtype,
@@ -103,7 +103,7 @@ class TapReading(msgspec.Struct, frozen=True, kw_only=True):
 def _extend_reading(
     forward_batch: ForwardBatch,
     *,
-    row_table: TapRowTable,
+    request_table: TapRequestTable,
     stripes: TapStripes,
     page_size: int,
     mask_dtype: torch.dtype,
@@ -111,21 +111,23 @@ def _extend_reading(
     req_pool_indices = _on_host(
         forward_batch.req_pool_indices_cpu, forward_batch.req_pool_indices
     )
-    first_rows = _on_host(
+    first_tokens = _on_host(
         forward_batch.extend_prefix_lens_cpu, forward_batch.extend_prefix_lens
     )
     num_rows = list(forward_batch.extend_seq_lens_cpu)
     taps = torch.cat(
         [
-            _taps_of_rows(row_table, row, first_row=first_row, num_rows=count)
-            for row, first_row, count in zip(req_pool_indices, first_rows, num_rows)
+            _taps_of_tokens(request_table, slot, first_token=first, num_tokens=count)
+            for slot, first, count in zip(req_pool_indices, first_tokens, num_rows)
         ]
         + [torch.zeros(1, dtype=torch.int64)]
     )
-    device = row_table.stripe_pages.device
+    device = request_table.stripe_pages.device
     total_rows = sum(num_rows)
     num_stripes = max(1, ceil_div(int(taps.max()), stripes.num_ranks * page_size))
-    request_pages = row_table.stripe_pages[forward_batch.req_pool_indices, :num_stripes]
+    request_pages = request_table.stripe_pages[
+        forward_batch.req_pool_indices, :num_stripes
+    ]
     reads = taps > 0
     reads_on_device = _to_device(reads, device=device)
     return TapReading(
@@ -154,15 +156,18 @@ def _extend_reading(
 def _decode_reading(
     forward_batch: ForwardBatch,
     *,
-    row_table: TapRowTable,
+    request_table: TapRequestTable,
     stripes: TapStripes,
     page_size: int,
     mask_dtype: torch.dtype,
 ) -> TapReading:
     req_pool_indices = forward_batch.req_pool_indices
-    request_pages = row_table.stripe_pages[req_pool_indices]
+    request_pages = request_table.stripe_pages[req_pool_indices]
     taps = torch.cat(
-        [row_table.decode_taps[req_pool_indices], row_table.decode_taps[:1] * 0]
+        [
+            request_table.decode_taps[req_pool_indices],
+            request_table.decode_taps[:1] * 0,
+        ]
     )
     reads = taps > 0
     return TapReading(
@@ -175,11 +180,11 @@ def _decode_reading(
     )
 
 
-def _taps_of_rows(
-    row_table: TapRowTable, row: int, *, first_row: int, num_rows: int
+def _taps_of_tokens(
+    request_table: TapRequestTable, slot: int, *, first_token: int, num_tokens: int
 ) -> torch.Tensor:
-    spans = row_table.spans_of(row)
-    made_tokens = torch.arange(first_row + 1, first_row + num_rows + 1)
+    spans = request_table.spans_of(slot)
+    made_tokens = torch.arange(first_token + 1, first_token + num_tokens + 1)
     if spans is None:
         return torch.zeros_like(made_tokens)
     return spans.taps_to_read(made_tokens)

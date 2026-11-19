@@ -102,7 +102,7 @@ def _sandy_cache(*, page_size=_PAGE_SIZE, num_ranks=1, rank=0) -> SandyTapCache:
 def _req(rid="r", prompt_len=10, chain=None):
     return SimpleNamespace(
         rid=rid,
-        franky_request=None if chain is None else FrankyRequest(chain=chain),
+        franky=None if chain is None else FrankyRequest(chain=chain),
         last_node=f"node-{rid}",
         origin_input_ids=list(range(prompt_len)),
         extend_end=0,

@@ -95,7 +95,6 @@ class FrankyRelayReceiver(NixlKVReceiver):
             self.kv_mgr.forget_tap_receiver(self.bootstrap_room)
 
     def _rid(self) -> Optional[str]:
-        """The request of this room when it reads taps, else None."""
         return self.kv_mgr.tap_requests.rid_of_room(self.bootstrap_room)
 
     def _relay_room(self) -> FrankyRoom:

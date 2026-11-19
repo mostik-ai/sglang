@@ -13,13 +13,13 @@ import numpy as np
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.nixl.conn import NixlKVReceiver, NixlKVSender
 from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
-from sglang.srt.franky.cache.ricky_tap_requests import RickyTapRequests
 from sglang.srt.franky.cache.tap_buffers import TapBuffers
-from sglang.srt.franky.cache.tap_row_table import TapRowTable
+from sglang.srt.franky.cache.tap_request_table import TapRequestTable
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.request import FrankyRequest
+from sglang.srt.franky.ricky_taps.tap_requests import RickyTapRequests
 from sglang.srt.franky.transfer import receiver as receiver_module
 from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.franky.transfer.relay import sender as relay_sender_module
@@ -56,8 +56,8 @@ def _tap_cache(*, rank: int = 0) -> RickyTapCache:
 def _tap_requests(tap_cache, *, shared_tokenizer=True):
     return RickyTapRequests(
         tap_cache=tap_cache,
-        row_table=TapRowTable(
-            num_rows=_NUM_ROWS, max_stripes=_MAX_STRIPES, device="cpu"
+        request_table=TapRequestTable(
+            num_slots=_NUM_ROWS, max_stripes=_MAX_STRIPES, device="cpu"
         ),
         chain_holds=FrankyChainHolds(
             tree_cache=None, tap_cache=tap_cache, hold_seconds=60.0
@@ -81,8 +81,8 @@ def _request(
     """
     request = SimpleNamespace(
         rid=rid,
-        franky=None,
-        franky_request=(
+        franky_taps=None,
+        franky=(
             None
             if room is None and chain is None and sandy_input_ids is None
             else FrankyRequest(room=room, chain=chain, sandy_input_ids=sandy_input_ids)
@@ -221,7 +221,7 @@ class TestRickyTapRequests(_Requests):
         self.assertEqual(self.requests.refusal("a"), problem)
         self.assertFalse(self.requests.waits("a"))
         self.assertIsNone(self.requests.reservation("a"))
-        self.assertIsNone(too_many.franky)
+        self.assertIsNone(too_many.franky_taps)
         too_many.done = True
         self.requests.poll()
         self.assertIsNone(self.requests.refusal("a"))
@@ -238,7 +238,7 @@ class TestRickyTapRequests(_Requests):
         ):
             with self.subTest(request.rid):
                 self.assertIn(problem, requests.arrive(request))
-                self.assertIsNone(request.franky)
+                self.assertIsNone(request.franky_taps)
                 self.assertEqual(requests.poll(), [])
 
     def test_with_sandys_own_tokens_the_stripes_count_sandys_tokens(self):
@@ -261,7 +261,7 @@ class TestRickyTapRequests(_Requests):
         self.assertEqual(plain.extra_key, "user|franky=no-taps")
         self.assertEqual(bare.extra_key, "franky=no-taps")
         self.assertEqual(
-            (plain.franky.tap_len, plain.franky.generated_spans), (0, None)
+            (plain.franky_taps.tap_len, plain.franky_taps.spans), (0, None)
         )
         self.assertEqual(self.requests.poll(), [])
         self.assertTrue(self.requests.is_empty())
@@ -269,11 +269,11 @@ class TestRickyTapRequests(_Requests):
     def test_a_returning_request_keeps_what_it_had(self):
         request = _request("r", range(20))
         reservation = self._reserve(request)
-        state = request.franky
+        state = request.franky_taps
 
         self._arrive(request)
 
-        self.assertIs(request.franky, state)
+        self.assertIs(request.franky_taps, state)
         self.assertEqual(self.requests.poll(), [])
         self.assertIs(self.requests.reservation("r"), reservation)
 
@@ -333,18 +333,18 @@ class TestRickyTapRequests(_Requests):
         reading = _request("reading", range(20), row=2)
         reservation = self._reserve(reading)
         plain = self._arrive(_request("plain", range(8), room=None, row=1))
-        row_table = self.requests._row_table
+        request_table = self.requests._request_table
 
         self.requests.join_batch([reading, plain])
 
         self.assertEqual(
-            row_table.stripe_pages[2, :3].tolist(), reservation.pages.tolist()
+            request_table.stripe_pages[2, :3].tolist(), reservation.pages.tolist()
         )
-        self.assertEqual(row_table.stripe_pages[1].tolist(), [0] * _MAX_STRIPES)
-        self.assertEqual(row_table.decode_taps.tolist(), [0, 0, 20, 0])
-        self.assertIs(row_table.spans_of(2), reading.franky.generated_spans)
-        self.assertIsNone(row_table.spans_of(1))
-        self.assertEqual(reservation.num_taps, reading.franky.tap_len)
+        self.assertEqual(request_table.stripe_pages[1].tolist(), [0] * _MAX_STRIPES)
+        self.assertEqual(request_table.decode_taps.tolist(), [0, 0, 20, 0])
+        self.assertIs(request_table.spans_of(2), reading.franky_taps.spans)
+        self.assertIsNone(request_table.spans_of(1))
+        self.assertEqual(reservation.num_taps, reading.franky_taps.tap_len)
 
 
 class TestHeldChains(_Requests):
@@ -446,6 +446,31 @@ class TestHeldChains(_Requests):
         self.assertEqual(self.requests.poll(), [])
         self.assertTrue(self.requests.waits("c-2"))
         self.assertTrue(self.holds.holds_chain_of(_block("c", range(8), block=2)))
+
+    def test_an_aborted_waiting_block_releases_its_chains_hold(self):
+        for name, first_id, abort in (
+            ("forgotten", 0, self.requests.forget),
+            ("finished", 1000, self._finish_and_poll),
+        ):
+            with self.subTest(name):
+                self._hold(_block(name, range(first_id, first_id + 16), block=1))
+                big = _request(f"{name}-big", range(first_id + 100, first_id + 148))
+                self._reserve(big)
+                block = self._arrive(
+                    _block(name, range(first_id, first_id + 32), block=2)
+                )
+                self.assertEqual(self.requests.poll(), [])
+
+                abort(block)
+
+                self.assertFalse(self.requests.waits(block.rid))
+                self.assertFalse(self.holds.holds_chain_of(block))
+                self.requests.end(big, landed=False)
+                self.assertEqual(self.tap_cache.num_takeable_stripes(), _NUM_STRIPES)
+
+    def _finish_and_poll(self, request):
+        _finish(request)
+        self.requests.poll()
 
 
 class TestTapRelay(_Requests):

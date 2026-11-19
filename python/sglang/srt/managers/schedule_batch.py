@@ -154,7 +154,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.franky.request import FrankyRequest
-    from sglang.srt.franky.transfer.req_state import FrankyReqState
+    from sglang.srt.franky.ricky_taps.tap_progress import TapProgress
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
@@ -1065,7 +1065,7 @@ class Req(ReqDllmMixin):
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
-        franky_request: Optional[FrankyRequest] = None,
+        franky: Optional[FrankyRequest] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1413,8 +1413,8 @@ class Req(ReqDllmMixin):
         self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
         # Franky: what the request asks of it, and on Ricky its taps' progress.
-        self.franky_request: Optional[FrankyRequest] = franky_request
-        self.franky: Optional[FrankyReqState] = None
+        self.franky: Optional[FrankyRequest] = franky
+        self.franky_taps: Optional[TapProgress] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank

@@ -7,7 +7,7 @@ import torch
 from sglang.srt.franky.parts.reader.tap_reading import TapReading
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.cache.tap_row_table import TapRowTable
+    from sglang.srt.franky.cache.tap_request_table import TapRequestTable
     from sglang.srt.franky.cache.tap_stripes import TapStripes
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -19,9 +19,9 @@ class CurrentTapReading:
     """
 
     def __init__(
-        self, *, row_table: TapRowTable, stripes: TapStripes, page_size: int
+        self, *, request_table: TapRequestTable, stripes: TapStripes, page_size: int
     ) -> None:
-        self.row_table = row_table
+        self.request_table = request_table
         self.stripes = stripes
         self.page_size = page_size
         self._reading: Optional[TapReading] = None
@@ -31,7 +31,7 @@ class CurrentTapReading:
     ) -> TapReading:
         self._reading = TapReading.of(
             forward_batch,
-            row_table=self.row_table,
+            request_table=self.request_table,
             stripes=self.stripes,
             page_size=self.page_size,
             mask_dtype=mask_dtype,

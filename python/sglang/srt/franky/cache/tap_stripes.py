@@ -6,6 +6,8 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.runtime_context import get_parallel
+
 Pages = TypeVar("Pages", np.ndarray, torch.Tensor)
 
 
@@ -20,6 +22,12 @@ class TapStripes(msgspec.Struct, frozen=True, kw_only=True):
 
     num_ranks: int
     rank: int
+
+    @staticmethod
+    def of_attention_tp() -> TapStripes:
+        """How this engine's attention-TP ranks split the taps."""
+        parallel = get_parallel()
+        return TapStripes(num_ranks=parallel.attn_tp_size, rank=parallel.attn_tp_rank)
 
     def owns(self, pages: Pages) -> Pages:
         """Whether this rank keeps each page."""

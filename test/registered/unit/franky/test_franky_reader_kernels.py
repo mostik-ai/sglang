@@ -11,12 +11,15 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+    MultimemAllGatherer,
+)
 from sglang.srt.franky.cache.generated_spans import (
     FrankyGeneratedSpans,
     GeneratedSpan,
 )
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE, TapBuffers
-from sglang.srt.franky.cache.tap_row_table import TapRowTable
+from sglang.srt.franky.cache.tap_request_table import TapRequestTable
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts.reader.current_tap_reading import CurrentTapReading
 from sglang.srt.franky.parts.reader.tap_attention import (
@@ -64,9 +67,17 @@ class _Ranks:
     def group(self, rank):
         return SimpleNamespace(
             world_size=self.world_size,
-            all_gather_into_tensor=lambda output, input: self._gather(
-                rank, output, input
-            ),
+            all_gather=lambda input, dim: self._gather_last_dim(rank, input),
+        )
+
+    def _gather_last_dim(self, rank, input):
+        # As GroupCoordinator.all_gather along the last dim.
+        output = input.new_empty((self.world_size * input.shape[0], *input.shape[1:]))
+        self._gather(rank, output, input)
+        return (
+            output.view(self.world_size, *input.shape)
+            .movedim(0, -2)
+            .reshape(*input.shape[:-1], self.world_size * input.shape[-1])
         )
 
     def _gather(self, rank, output, input):
@@ -88,7 +99,7 @@ class TestReaderKernels(CustomTestCase):
             torch.randperm(_NUM_ROWS * _MAX_STRIPES).view(_NUM_ROWS, _MAX_STRIPES) + 1
         )
 
-    def _attention(self, *, stripes, group, row_table):
+    def _attention(self, *, stripes, group, request_table):
         stripe_size = stripes.num_ranks * _PAGE_SIZE
         buffers = TapBuffers(
             encoder_ids=(0,),
@@ -107,31 +118,36 @@ class TestReaderKernels(CustomTestCase):
                     row, page * _PAGE_SIZE : (page + 1) * _PAGE_SIZE
                 ]
         num_stripes = _CONTEXT // stripe_size
-        row_table.stripe_pages[:, :num_stripes] = self.stripe_pages[:, :num_stripes].to(
-            device="cuda", dtype=torch.int32
-        )
+        request_table.stripe_pages[:, :num_stripes] = self.stripe_pages[
+            :, :num_stripes
+        ].to(device="cuda", dtype=torch.int32)
         return TapAttention(
             pages=buffers.pages(0),
             reading=CurrentTapReading(
-                row_table=row_table, stripes=stripes, page_size=_PAGE_SIZE
+                request_table=request_table, stripes=stripes, page_size=_PAGE_SIZE
             ),
             builds_reading=True,
-            gather=None if group is None else TapGather(group=group, symmetric=None),
+            gather=None
+            if group is None
+            else TapGather(
+                gatherer=MultimemAllGatherer(1, enabled=False, group=group),
+                num_ranks=group.world_size,
+            ),
             workspace=TrtllmWorkspace.for_device("cuda"),
         )
 
-    def _row_table(self, spans, num_input_tokens):
-        row_table = TapRowTable(
-            num_rows=_NUM_ROWS, max_stripes=_MAX_STRIPES, device="cuda"
+    def _request_table(self, spans, num_input_tokens):
+        request_table = TapRequestTable(
+            num_slots=_NUM_ROWS, max_stripes=_MAX_STRIPES, device="cuda"
         )
         rows = list(spans)
-        row_table.bind(
+        request_table.bind(
             req_pool_indices=rows,
             pages=[None] * len(rows),
             spans=[spans[row] for row in rows],
             num_input_tokens=[num_input_tokens[row] for row in rows],
         )
-        return row_table
+        return request_table
 
     def _reference(self, queries, *, rows, num_taps):
         out = torch.zeros(queries.shape, dtype=torch.float32, device="cuda")
@@ -205,7 +221,7 @@ class TestReaderKernels(CustomTestCase):
                 attention = self._attention(
                     stripes=TapStripes(num_ranks=1, rank=0),
                     group=None,
-                    row_table=self._row_table(spans, num_input_tokens),
+                    request_table=self._request_table(spans, num_input_tokens),
                 )
                 queries = torch.randn(
                     len(rows), num_queries, _TAP_SIZE, dtype=TAP_DTYPE, device="cuda"
@@ -238,7 +254,7 @@ class TestReaderKernels(CustomTestCase):
                 attention = self._attention(
                     stripes=TapStripes(num_ranks=1, rank=0),
                     group=None,
-                    row_table=self._row_table(spans, num_input_tokens),
+                    request_table=self._request_table(spans, num_input_tokens),
                 )
                 queries = torch.randn(
                     len(query_rows), 1, _TAP_SIZE, dtype=TAP_DTYPE, device="cuda"
@@ -249,9 +265,9 @@ class TestReaderKernels(CustomTestCase):
                 out = torch.empty_like(queries)
                 lse = torch.empty(queries.shape[:2], dtype=torch.float32, device="cuda")
 
-                lse_is_base_e = attention._attend_locally(
-                    queries, reading, out=out, lse=lse
-                )
+                kernel = attention._local_kernel(queries, reading)
+                attention._attend_locally(kernel, queries, reading, out=out, lse=lse)
+                lse_is_base_e = kernel.lse_is_base_e
 
                 expected_out, expected_lse = self._reference(
                     queries, rows=query_rows, num_taps=query_taps
@@ -285,7 +301,7 @@ class TestReaderKernels(CustomTestCase):
                         self._attention(
                             stripes=TapStripes(num_ranks=num_ranks, rank=rank),
                             group=ranks.group(rank),
-                            row_table=self._row_table(spans, num_input_tokens),
+                            request_table=self._request_table(spans, num_input_tokens),
                         )
                         for rank in range(num_ranks)
                     ]
@@ -321,7 +337,7 @@ class TestReaderKernels(CustomTestCase):
         attention = self._attention(
             stripes=TapStripes(num_ranks=1, rank=0),
             group=None,
-            row_table=self._row_table(spans, num_input_tokens),
+            request_table=self._request_table(spans, num_input_tokens),
         )
         req_pool_indices = torch.tensor([1, 2, 3], device="cuda")
         batch = SimpleNamespace(
@@ -354,7 +370,7 @@ class TestReaderKernels(CustomTestCase):
         batch, spans, num_input_tokens, rows, num_taps = self._extend()
         reading = TapReading.of(
             batch,
-            row_table=self._row_table(spans, num_input_tokens),
+            request_table=self._request_table(spans, num_input_tokens),
             stripes=TapStripes(num_ranks=2, rank=1),
             page_size=_PAGE_SIZE,
             mask_dtype=torch.float32,

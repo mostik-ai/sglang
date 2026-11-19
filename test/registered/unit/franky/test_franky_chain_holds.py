@@ -27,7 +27,7 @@ class _Tree:
 
 def _block(chain_id, *, node, num_tokens=1, block=1, last_block=False):
     return SimpleNamespace(
-        franky_request=FrankyRequest(
+        franky=FrankyRequest(
             chain=FrankyChain(
                 id=chain_id, block=block, block_size=8, last_block=last_block
             )
@@ -70,9 +70,7 @@ class TestFrankyChainHolds(CustomTestCase):
 
     def test_a_request_outside_chains_holds_nothing(self):
         holds = self._holds()
-        plain = SimpleNamespace(
-            franky_request=None, last_node="n", origin_input_ids=[0]
-        )
+        plain = SimpleNamespace(franky=None, last_node="n", origin_input_ids=[0])
 
         holds.hold_for_next_block(plain)
         holds.release_chain_of(plain)
@@ -120,7 +118,7 @@ class TestFrankyChainHolds(CustomTestCase):
         requests = [
             _block("new", node="n"),
             _block("held-2", node="h2", block=2),
-            SimpleNamespace(franky_request=None),
+            SimpleNamespace(franky=None),
             _block("held-1", node="h1", block=2),
         ]
 
@@ -238,9 +236,7 @@ class TestFrankyChainHoldsOfTaps(CustomTestCase):
                 holds.release_all()
 
     def test_a_last_block_or_one_outside_chains_releases_its_tap_lock_at_once(self):
-        plain = SimpleNamespace(
-            franky_request=None, last_node="n", origin_input_ids=[0]
-        )
+        plain = SimpleNamespace(franky=None, last_node="n", origin_input_ids=[0])
         last = _block("c", node="c-2", last_block=True)
         self.holds.hold_for_next_block(_block("c", node="c-1"), tap_lock="taps-1")
 
@@ -289,7 +285,7 @@ class TestFrankyChain(CustomTestCase):
             )
             return SimpleNamespace(
                 name=name,
-                franky_request=None if chain is None else FrankyRequest(chain=chain),
+                franky=None if chain is None else FrankyRequest(chain=chain),
             )
 
         requests = [

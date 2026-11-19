@@ -12,10 +12,8 @@ from sglang.srt.franky.transfer.messages import FrankyRoomClosed, FrankyTapsRead
 from sglang.srt.franky.transfer.receiver import FrankyReceiver
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
     from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
-    from sglang.srt.franky.cache.ricky_tap_requests import RickyTapRequests
-    from sglang.srt.franky.chains.holds import FrankyChainHolds
+    from sglang.srt.franky.ricky_taps.tap_requests import RickyTapRequests
     from sglang.srt.franky.transfer.manager import FrankyTapManager
     from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
     from sglang.srt.managers.schedule_batch import Req
@@ -49,8 +47,6 @@ class FrankyReceiveQueue:
         tap_requests: RickyTapRequests,
         tap_manager: FrankyTapManager,
         rank_reports: FrankyRankReports,
-        chain_holds: FrankyChainHolds,
-        mamba_room: Optional[FrankyMambaRoom],
         release_timeout_seconds: float,
         fail_request: Callable[[Req, str], None],
     ) -> None:
@@ -58,8 +54,6 @@ class FrankyReceiveQueue:
         self.tap_requests = tap_requests
         self.tap_manager = tap_manager
         self.rank_reports = rank_reports
-        self.chain_holds = chain_holds
-        self.mamba_room = mamba_room
         self.release_timeout_seconds = release_timeout_seconds
         self.fail_request = fail_request
         self.receptions: dict[str, _Reception] = {}
@@ -78,14 +72,13 @@ class FrankyReceiveQueue:
     def forget(self, *, req: Req) -> None:
         """The scheduler aborted ``req``; its stripes wait for its room to close."""
         self.tap_requests.forget(req)
-        self.chain_holds.release_chain_of(req)
         if req.rid in self.receptions:
             self._end(self.receptions[req.rid])
 
     def poll(self) -> None:
         """Every rank, at each step: fail what never fits, end the receptions of
-        ended requests, take stripes for arrivals in order, and agree on landings
-        with ``FrankyRankReports``.
+        ended requests, open receptions for the requests that took their stripes,
+        and agree on landings with ``FrankyRankReports``.
         """
         failing, self._failing = self._failing, []
         for req, problem in failing:
@@ -93,7 +86,6 @@ class FrankyReceiveQueue:
         for reception in self._live_receptions():
             if reception.req.finished():
                 self._end(reception)
-        self._release_holds_past_the_mamba_room()
         for req in self.tap_requests.poll():
             self._open(req)
         for reception in self._live_receptions():
@@ -123,7 +115,7 @@ class FrankyReceiveQueue:
                 f"Franky taps of request {message.request_rid} did not arrive.",
             )
             return
-        state = reception.req.franky
+        state = reception.req.franky_taps
         state.taps_ready = max(state.taps_ready, message.taps_ready)
         self._note_first_chunk_ready(reception.req)
         if state.taps_complete():
@@ -133,18 +125,6 @@ class FrankyReceiveQueue:
         reception = self.receptions.get(message.request_rid)
         if reception is not None and reception.ended:
             self._release(reception)
-
-    def num_startable_requests(self) -> Optional[int]:
-        """
-        Returns:
-            How many requests may start beside the running ones as far as the
-            mamba state pool goes, or None without such a pool.
-        """
-        if self.mamba_room is None:
-            return None
-        return self.mamba_room.num_startable_requests(
-            num_pinned_states=len(self.chain_holds.locked_nodes())
-        )
 
     def is_empty(self) -> bool:
         return (
@@ -165,14 +145,14 @@ class FrankyReceiveQueue:
             landed=num_cached,
             announced_taps=num_cached,
         )
-        req.franky.taps_ready = max(req.franky.taps_ready, num_cached)
+        req.franky_taps.taps_ready = max(req.franky_taps.taps_ready, num_cached)
         req.time_stats.set_franky_pages_taken_time(
             tap_len=reservation.num_taps, taps_held=num_cached
         )
         self._note_first_chunk_ready(req)
 
     def _note_first_chunk_ready(self, req: Req) -> None:
-        if req.franky.rows_ready() > req.prefix_len:
+        if req.franky_taps.rows_ready() > req.prefix_len:
             req.time_stats.set_franky_taps_ready_time()
 
     def _live_receptions(self) -> list[_Reception]:
@@ -181,27 +161,15 @@ class FrankyReceiveQueue:
         ]
 
     def _keep_kv_past_the_prompt_out_of_the_cache(self, req: Req) -> None:
-        if req.franky.tap_len > 0 and req.prefix_len >= len(req.origin_input_ids):
+        if req.franky_taps.tap_len > 0 and req.prefix_len >= len(req.origin_input_ids):
             req.skip_radix_cache_insert = True
-
-    def _release_holds_past_the_mamba_room(self) -> None:
-        while not self._fits_mamba_room():
-            if not self.chain_holds.release_least_progress(sparing_chain_id=None):
-                return
-
-    def _fits_mamba_room(self) -> bool:
-        if self.mamba_room is None:
-            return True
-        return self.mamba_room.fits_pinned_states(
-            num_pinned_states=len(self.chain_holds.locked_nodes())
-        )
 
     def _rank_numbers(self) -> dict[str, int]:
         numbers = {}
         for rid, reception in self.receptions.items():
             if reception.ended:
                 numbers[f"closed:{rid}"] = int(self._room_is_closed(reception))
-            elif not reception.req.franky.taps_complete():
+            elif not reception.req.franky_taps.taps_complete():
                 ok = self._poll_receiver(reception)
                 numbers[f"landed:{rid}"] = reception.landed
                 numbers[f"ok:{rid}"] = int(ok)
@@ -216,13 +184,13 @@ class FrankyReceiveQueue:
         if state == KVPoll.Success:
             receiver.close()
             reception.receiver = None
-            reception.landed = reception.req.franky.tap_len
+            reception.landed = reception.req.franky_taps.tap_len
         return state != KVPoll.Failed
 
     def _taps_ready_message(
         self, rid: str, reception: _Reception
     ) -> Optional[FrankyTapsReady]:
-        if reception.req.franky.taps_complete() or reception.announced_failure:
+        if reception.req.franky_taps.taps_complete() or reception.announced_failure:
             return None
         ok = self._lowest(f"ok:{rid}")
         if ok == 0:
@@ -249,7 +217,7 @@ class FrankyReceiveQueue:
 
     def _end(self, reception: _Reception) -> None:
         reception.ended = True
-        if reception.req.franky.taps_complete():
+        if reception.req.franky_taps.taps_complete():
             self._release(reception)
             return
         reception.release_deadline = time.monotonic() + self.release_timeout_seconds
@@ -272,7 +240,7 @@ class FrankyReceiveQueue:
 
     def _release(self, reception: _Reception) -> None:
         req = reception.req
-        self.tap_requests.end(req, landed=req.franky.taps_complete())
+        self.tap_requests.end(req, landed=req.franky_taps.taps_complete())
         if reception.receiver is not None:
             self.tap_manager.clear_deferred_abort_state(
                 reception.receiver.bootstrap_room

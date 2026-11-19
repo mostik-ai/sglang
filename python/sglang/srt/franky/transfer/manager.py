@@ -145,11 +145,7 @@ class FrankyTapManager(NixlKVManager):
 
     @override
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
-        if info.attn_cp_size != 1 or self.attn_cp_size != 1:
-            raise ValueError(
-                "Franky moves taps between engines without attention context "
-                f"parallelism, got {info.attn_cp_size} and {self.attn_cp_size}."
-            )
+        # handle_franky refuses attention context parallelism at start.
         info.target_tp_rank = None
         info.target_tp_ranks = list(range(info.attn_tp_size))
         info.target_cp_ranks = [0]

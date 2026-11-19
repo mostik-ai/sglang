@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -11,15 +12,12 @@ from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
-from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
-from sglang.srt.franky.cache.ricky_tap_requests import RickyTapRequests
-from sglang.srt.franky.cache.tap_pool_metrics import FrankyTapPoolMetrics
 from sglang.srt.franky.chains.chain import put_continuations_first
-from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
+from sglang.srt.franky.ricky_taps.prefill_tap_limit import PrefillTapLimit
+from sglang.srt.franky.ricky_taps.taps import RickyTaps
 from sglang.srt.franky.schedulers.parked_chunks import FrankyParkedChunks
 from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder
-from sglang.srt.franky.schedulers.tap_readiness import TapReadiness
 from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.franky.transfer.messages import FrankyRoomClosed, FrankyTapsReady
 from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
@@ -47,9 +45,9 @@ if TYPE_CHECKING:
 
 class RickyScheduler(Scheduler):
     """A Ricky engine that runs prefills: without PD, or as PD prefill. A request
-    that reads taps takes their stripes in ``RickyTapRequests``, and joins a
-    batch only for rows whose taps have landed. PD prefill relays the taps to
-    Ricky decode with the KV, once they all landed.
+    that reads taps takes their stripes in ``RickyTaps``, and joins a batch only
+    for tokens whose taps have landed. PD prefill relays the taps to Ricky decode
+    with the KV, once they all landed.
     """
 
     @override
@@ -67,44 +65,30 @@ class RickyScheduler(Scheduler):
     @override
     def init_disaggregation(self) -> None:
         super().init_disaggregation()
-        self.init_franky_tap_cache()
-        self.init_franky_chain_holds()
-        self.init_franky_mamba_room()
+        self.init_franky_taps()
         self.init_franky_receiving()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.init_franky_relay()
-        self.init_franky_tap_pool_metrics()
 
-    def init_franky_tap_cache(self) -> None:
-        """This rank's tap pool, over the tap pages of the model's parts."""
-        parts = self._franky_parts
-        self.franky_tap_cache = RickyTapCache(
-            buffers=parts.tap_buffers, stripes=parts.stripes
-        )
-
-    def init_franky_tap_pool_metrics(self) -> None:
-        self.franky_tap_pool_metrics = FrankyTapPoolMetrics.of_scheduler(
-            tap_cache=self.franky_tap_cache,
+    def init_franky_taps(self) -> None:
+        """This rank's taps, whose chain holds stay within the mamba state pool's
+        room.
+        """
+        self.franky_taps = RickyTaps.build(
+            parts=self._franky_parts,
+            tree_cache=self.tree_cache,
+            mamba_room=FrankyMambaRoom.from_engine(
+                req_to_token_pool=self.req_to_token_pool,
+                kv_cache_configurator=self.tp_worker.model_runner.kv_cache_configurator,
+            ),
             metrics_collector_context=self.metrics_collector_context,
-            interval_seconds=STALL_METRICS_INTERVAL_S,
-        )
-
-    def init_franky_chain_holds(self) -> None:
-        self.franky_chain_holds = FrankyChainHolds.from_config(
-            tree_cache=self.tree_cache, tap_cache=self.franky_tap_cache
-        )
-
-    def init_franky_mamba_room(self) -> None:
-        self.franky_mamba_room = FrankyMambaRoom.from_engine(
-            req_to_token_pool=self.req_to_token_pool,
-            kv_cache_configurator=self.tp_worker.model_runner.kv_cache_configurator,
+            metrics_interval_seconds=STALL_METRICS_INTERVAL_S,
         )
         self.franky_num_startable_reqs: Optional[int] = None
 
     def init_franky_receiving(self) -> None:
-        """Ricky's end of tap transfers: this rank's tap manager, the requests
-        with their stripes, the queue of their transfers, and the chunked
-        requests waiting for taps.
+        """Ricky's end of tap transfers: this rank's tap manager, the queue of the
+        requests' transfers, and the chunked requests waiting for taps.
         """
         parallel = get_parallel()
         parts = self._franky_parts
@@ -117,15 +101,9 @@ class RickyScheduler(Scheduler):
             pp_rank=parallel.pp_rank,
             gpu_id=get_device().gpu_id,
         )
-        self.franky_tap_requests = RickyTapRequests(
-            tap_cache=self.franky_tap_cache,
-            row_table=parts.row_table,
-            chain_holds=self.franky_chain_holds,
-            shared_tokenizer=parts.config.shared_tokenizer,
-        )
         self.franky_receive_queue = FrankyReceiveQueue(
-            tap_cache=self.franky_tap_cache,
-            tap_requests=self.franky_tap_requests,
+            tap_cache=self.franky_taps.cache,
+            tap_requests=self.franky_taps.requests,
             tap_manager=self.franky_tap_manager,
             rank_reports=FrankyRankReports(
                 attn_tp_cpu_group=self.attn_tp_cpu_group,
@@ -136,19 +114,15 @@ class RickyScheduler(Scheduler):
                     else None
                 ),
             ),
-            chain_holds=self.franky_chain_holds,
-            mamba_room=self.franky_mamba_room,
             release_timeout_seconds=(
                 envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
             ),
             fail_request=self._fail_franky_request,
         )
-        self.franky_tap_readiness = TapReadiness.of(
+        self.franky_tap_limit = PrefillTapLimit.of(
             self.tree_cache, page_size=self.page_size
         )
-        self.franky_parked_chunks = FrankyParkedChunks(
-            readiness=self.franky_tap_readiness
-        )
+        self.franky_parked_chunks = FrankyParkedChunks(tap_limit=self.franky_tap_limit)
 
     def init_franky_relay(self) -> None:
         """PD prefill's end of the tap relay to Ricky decode: a bootstrap server on
@@ -173,7 +147,7 @@ class RickyScheduler(Scheduler):
         )
         self.disagg_prefill_bootstrap_queue.kv_manager.attach_tap_relay(
             tap_relay=self.franky_relay_manager,
-            tap_cache=self.franky_tap_cache,
+            tap_cache=self.franky_taps.cache,
             relay_bootstrap_port=port,
         )
 
@@ -191,14 +165,13 @@ class RickyScheduler(Scheduler):
     @override
     def prefillable_queue_len(self) -> int:
         return sum(
-            1 for req in self.waiting_queue if self.franky_tap_readiness.can_run(req)
+            1 for req in self.waiting_queue if self.franky_tap_limit.can_run(req)
         )
 
     @override
     def ingest_requests(self, stop_at_pause: bool = False) -> List:
         self.franky_receive_queue.poll()
-        if self.franky_tap_pool_metrics is not None:
-            self.franky_tap_pool_metrics.maybe_publish()
+        self.franky_taps.publish_metrics()
         return super().ingest_requests(stop_at_pause=stop_at_pause)
 
     @override
@@ -206,7 +179,7 @@ class RickyScheduler(Scheduler):
         return (
             super()._poll_timeout_aborts()
             + self.franky_receive_queue.ready_messages()
-            + self.franky_chain_holds.expired_messages()
+            + self.franky_taps.chain_holds.expired_messages()
         )
 
     @override
@@ -226,13 +199,13 @@ class RickyScheduler(Scheduler):
         self.chunked_req = self.franky_parked_chunks.pick(current=self.chunked_req)
         put_continuations_first(self.waiting_queue)
         self.franky_num_startable_reqs = (
-            self.franky_receive_queue.num_startable_requests()
+            self.franky_taps.requests.num_startable_requests()
         )
         new_batch, running_batch = super()._get_new_batch_prefill_raw(
             prefill_delayer_single_pass, running_batch
         )
         if new_batch is not None:
-            self.franky_tap_requests.join_batch(new_batch.reqs)
+            self.franky_taps.requests.join_batch(new_batch.reqs)
         return new_batch, running_batch
 
     @override
@@ -265,11 +238,9 @@ class RickyScheduler(Scheduler):
 
     @override
     def flush_cache(self, empty_cache: bool = True) -> bool:
-        self.franky_chain_holds.release_all()
-        flushed = super().flush_cache(empty_cache=empty_cache)
-        if flushed:
-            self.franky_tap_cache.reset()
-        return flushed
+        return self.franky_taps.flush(
+            functools.partial(super().flush_cache, empty_cache=empty_cache)
+        )
 
     @override
     def on_idle(self) -> None:
@@ -288,14 +259,14 @@ class RickyScheduler(Scheduler):
         )
 
     def _relay_landed_taps(self, req: Req) -> None:
-        state = req.franky
+        progress = req.franky_taps
         sender = req.disagg_kv_sender
-        if state is None or state.tap_len == 0 or not state.taps_complete():
+        if progress is None or progress.tap_len == 0 or not progress.taps_complete():
             return
         if sender is None or sender.relays_taps:
             return
-        reservation = self.franky_tap_requests.reservation(req.rid)
-        sender.relay_taps(tap_pages=self.franky_tap_cache.pages_to_relay(reservation))
+        reservation = self.franky_taps.requests.reservation(req.rid)
+        sender.relay_taps(tap_pages=self.franky_taps.cache.pages_to_relay(reservation))
 
     @property
     def _franky_parts(self) -> RickyParts:
@@ -308,11 +279,11 @@ class RickyScheduler(Scheduler):
         self.franky_receive_queue.on_room_closed(message=message)
 
     def _handle_hold_expired(self, message: FrankyHoldExpired) -> None:
-        self.franky_chain_holds.on_hold_expired(message=message)
+        self.franky_taps.chain_holds.on_hold_expired(message=message)
 
     def _handle_end_chain(self, recv_req: FrankyEndChainReq) -> None:
         self.abort_request(AbortReq(rid=recv_req.chain_id))
-        self.franky_chain_holds.release(chain_id=recv_req.chain_id)
+        self.franky_taps.chain_holds.release(chain_id=recv_req.chain_id)
 
     def _fail_franky_request(self, req: Req, reason: str) -> None:
         finished_reason = FINISH_ABORT(

@@ -77,6 +77,8 @@ def _shared_checks(*, cfg: Any, model_config: ModelConfig) -> dict[str, bool]:
         "--enable-two-batch-overlap": cfg.enable_two_batch_overlap,
         # Split prefill runs the layers outside the model's layer loop.
         "--enable-pdmux": cfg.enable_pdmux,
+        # Taps are striped over attention TP ranks and move between them.
+        f"--attn-cp-size {cfg.attn_cp_size}": cfg.attn_cp_size > 1,
         # KV loaded from outside the forward would have no taps.
         "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
         "--enable-lmcache": cfg.enable_lmcache,
