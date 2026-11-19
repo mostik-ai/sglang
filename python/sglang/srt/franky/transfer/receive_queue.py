@@ -38,11 +38,27 @@ class _Reception(msgspec.Struct, kw_only=True):
     receiver: Optional[FrankyReceiver]
     prefix_lock: Any
     landed: int
+    # The request's own node in the tree, locked again where each insert of its
+    # prompt leaves it, so a retraction, which drops the request's own lock,
+    # keeps the tokens before ``tapped_len`` and their taps.
+    tapped_lock: Any = None
+    tapped_len: int = 0
     ended: bool = False
     release_deadline: float = 0.0
     announced_taps: int = 0
     announced_failure: bool = False
     announced_close: bool = False
+
+
+class _Retracted(msgspec.Struct, kw_only=True):
+    """A request back from a retraction. Its taps cannot land again, so it resumes
+    from the prompt that ``lock`` keeps in the tree, up to ``kept_from``, and the
+    taps of its prompt past it, kept on the host by encoder."""
+
+    tap_len: int
+    lock: Any
+    kept_from: int
+    kept_taps: dict[int, torch.Tensor]
 
 
 class FrankyReceiveQueue:
@@ -79,18 +95,20 @@ class FrankyReceiveQueue:
         self.release_timeout_seconds = release_timeout_seconds
         self.fail_request = fail_request
         self.arrivals: list[Req] = []
-        self.returning_tap_lens: dict[str, int] = {}
+        self.retracted: dict[str, _Retracted] = {}
         self.receptions: dict[str, _Reception] = {}
         self.agreed: dict[str, int] = {}
 
     def add(self, *, req: Req) -> None:
         """A request entered the waiting queue: new, or back after its KV was
-        released by a retraction. A request without a room reads no taps, so its
-        KV is cached apart from KV that read taps.
+        released by a retraction, which keeps its prompt and taps for it. A request
+        without a room reads no taps, so its KV is cached apart from KV that read
+        taps.
         """
         if req.rid in self.receptions:
-            self.returning_tap_lens[req.rid] = req.franky.tap_len
-            self._release(self.receptions[req.rid])
+            reception = self.receptions[req.rid]
+            self.retracted[req.rid] = self._keep_prompt_of(reception)
+            self._release(reception)
             req.franky = None
         elif req.franky_room is None:
             req.extra_key = (
@@ -104,7 +122,9 @@ class FrankyReceiveQueue:
         """The scheduler aborted ``req``; its pages wait for its room to close."""
         if req in self.arrivals:
             self.arrivals.remove(req)
-        self.returning_tap_lens.pop(req.rid, None)
+        retracted = self.retracted.pop(req.rid, None)
+        if retracted is not None:
+            self.tree_cache.unlock(retracted.lock)
         self.chain_holds.release_chain_of(req)
         if req.rid in self.receptions:
             self._end(self.receptions[req.rid])
@@ -122,6 +142,8 @@ class FrankyReceiveQueue:
         self._take_pages_for_arrivals()
         for reception in self._live_receptions():
             self._keep_kv_past_the_prompt_out_of_the_cache(reception.req)
+            if reception.tapped_lock is not None:
+                self._lock_the_tapped_prompt(reception)
         self.agreed = self.rank_reports.report(numbers=self._rank_numbers())
 
     def ready_messages(self) -> list[FrankyTapsReady | FrankyRoomClosed]:
@@ -158,12 +180,14 @@ class FrankyReceiveQueue:
             self._release(reception)
 
     def on_started(self, *, reqs: list[Req]) -> None:
-        """The scheduler started ``reqs``; each now locks its cached prefix itself."""
+        """The scheduler started ``reqs``; each now locks its cached prefix itself,
+        and one that reads taps also keeps a lock for a retraction."""
         for req in reqs:
             reception = self.receptions.get(req.rid)
             if reception is not None:
                 self.tree_cache.unlock(reception.prefix_lock)
                 reception.prefix_lock = None
+                self._lock_the_tapped_prompt(reception)
 
     def num_startable_requests(self) -> Optional[int]:
         """
@@ -188,7 +212,7 @@ class FrankyReceiveQueue:
                 return
 
     def _take_pages(self, req: Req) -> bool:
-        returning = req.rid in self.returning_tap_lens
+        retracted = self.retracted.get(req.rid)
         tap_len = self._tap_len_of(req)
         req.init_next_round_input(self.tree_cache, cow_mamba=False)
         num_tokens = len(req.full_untruncated_fill_ids)
@@ -199,7 +223,7 @@ class FrankyReceiveQueue:
                 req, f"Request {req.rid} does not fit in Ricky's KV memory."
             )
             return True
-        if returning and req.prefix_len < tap_len:
+        if retracted is not None and req.prefix_len < retracted.kept_from:
             self.fail_request(
                 req, f"The taps of request {req.rid} left the prefix cache."
             )
@@ -213,9 +237,12 @@ class FrankyReceiveQueue:
             self.tree_cache.unlock(prefix_lock)
             return False
         self.chain_holds.release_chain_of(req)
-        self.returning_tap_lens.pop(req.rid, None)
         taken = self._take_slots(num_page_slots)[:num_taken]
-        receives_taps = not returning and tap_len > 0
+        if retracted is not None:
+            del self.retracted[req.rid]
+            self._restore_taps(retracted, prefix_len=req.prefix_len, taken=taken)
+            self.tree_cache.unlock(retracted.lock)
+        receives_taps = retracted is None and tap_len > 0
         req.franky = FrankyReqState(
             tap_len=tap_len,
             taps_ready=req.prefix_len if receives_taps else num_tokens,
@@ -248,9 +275,54 @@ class FrankyReceiveQueue:
         if req.franky.tap_len > 0 and req.prefix_len >= req.franky.tap_len:
             req.skip_radix_cache_insert = True
 
+    def _lock_the_tapped_prompt(self, reception: _Reception) -> None:
+        """Locks the request's node in the tree, which moves as its prefill inserts
+        its prompt, so a retraction, which drops the request's own lock, keeps the
+        prompt and its taps."""
+        req = reception.req
+        held = reception.tapped_lock
+        if req.franky.tap_len == 0 or (held is not None and held.node == req.last_node):
+            return
+        reception.tapped_lock = self.tree_cache.lock(req.last_node)
+        reception.tapped_len = req.kv.cache_protected_len
+        self.tree_cache.unlock(held)
+
+    def _keep_prompt_of(self, reception: _Reception) -> _Retracted:
+        """What the retracted request of ``reception`` resumes from: its tapped
+        prompt in the tree, whose lock passes to it, and the taps that landed past
+        that prompt, read from the slots the retraction freed before anything can
+        take them again."""
+        state = reception.req.franky
+        kept_from = max(reception.tapped_len, state.taken_from)
+        start = kept_from - state.taken_from
+        slots = state.taken_kv_slots[start : start + max(state.tap_len - kept_from, 0)]
+        retracted = _Retracted(
+            tap_len=state.tap_len,
+            lock=reception.tapped_lock,
+            kept_from=kept_from,
+            kept_taps=self.tap_cache.read(kv_slots=slots),
+        )
+        reception.tapped_lock = None
+        return retracted
+
+    def _restore_taps(
+        self, retracted: _Retracted, *, prefix_len: int, taken: torch.Tensor
+    ) -> None:
+        """Writes the kept taps of the prompt past ``prefix_len`` to the slots the
+        request took for it."""
+        start = prefix_len - retracted.kept_from
+        num_tokens = max(retracted.tap_len - prefix_len, 0)
+        self.tap_cache.restore(
+            taps={
+                encoder_id: taps[start : start + num_tokens]
+                for encoder_id, taps in retracted.kept_taps.items()
+            },
+            kv_slots=taken[:num_tokens],
+        )
+
     def _tap_len_of(self, req: Req) -> int:
-        if req.rid in self.returning_tap_lens:
-            return self.returning_tap_lens[req.rid]
+        if req.rid in self.retracted:
+            return self.retracted[req.rid].tap_len
         return len(req.origin_input_ids) if req.franky_room is not None else 0
 
     def _fits_after_releasing_holds(
@@ -285,6 +357,7 @@ class FrankyReceiveQueue:
         self, *, arriving_prefix_lock: Optional[TreeLock] = None
     ) -> set[Any]:
         locks = [reception.prefix_lock for reception in self.receptions.values()]
+        locks += [retracted.lock for retracted in self.retracted.values()]
         locks.append(arriving_prefix_lock)
         nodes = {lock.node for lock in locks if lock is not None}
         return nodes | self.chain_holds.locked_nodes()
@@ -398,6 +471,7 @@ class FrankyReceiveQueue:
         unused_from = ceil_div(state.used_end - state.taken_from, self.page_size)
         self.kv_allocator.free(state.taken_kv_slots[unused_from * self.page_size :])
         self.tree_cache.unlock(reception.prefix_lock)
+        self.tree_cache.unlock(reception.tapped_lock)
         if reception.receiver is not None:
             self.tap_manager.clear_deferred_abort_state(
                 reception.receiver.bootstrap_room

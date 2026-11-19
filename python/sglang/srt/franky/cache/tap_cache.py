@@ -118,6 +118,20 @@ class FrankyTapCache:
     ) -> None:
         self._buffers[encoder_id][self.slots_of(kv_slots=kv_slots)] = taps
 
+    def read(self, *, kv_slots: torch.Tensor) -> dict[int, torch.Tensor]:
+        """Every encoder's taps at ``kv_slots``, copied to the host."""
+        slots = self.slots_of(kv_slots=kv_slots)
+        return {
+            encoder_id: buffer[slots].cpu()
+            for encoder_id, buffer in self._buffers.items()
+        }
+
+    def restore(self, *, taps: dict[int, torch.Tensor], kv_slots: torch.Tensor) -> None:
+        """Writes taps that ``read`` copied to the host, by encoder, at ``kv_slots``."""
+        for encoder_id, encoder_taps in taps.items():
+            buffer = self._buffers[encoder_id]
+            buffer[self.slots_of(kv_slots=kv_slots)] = encoder_taps.to(buffer.device)
+
     def set_generated_spans(
         self,
         *,

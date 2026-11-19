@@ -113,6 +113,7 @@ class _Req:
         )
         self.last_node = f"node-{rid}"
         self.prefix_len = 0
+        self.kv = SimpleNamespace(cache_protected_len=0)
         self.extra_key = None
         self.skip_radix_cache_insert = False
         self.done = False
@@ -121,6 +122,7 @@ class _Req:
     def init_next_round_input(self, tree_cache, cow_mamba=None):
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
         self.prefix_len = self.cached_prefix_len
+        self.kv.cache_protected_len = self.cached_prefix_len
         self.copies_mamba_state.append(cow_mamba is not False)
 
     def finished(self):
@@ -317,14 +319,57 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
         self.assertEqual(self.failed, ["r"])
 
-    def test_a_returning_request_whose_taps_left_the_cache_fails(self):
+    def _start_and_insert(self, req, *, inserted_len):
+        """Starts ``req``, whose prefill then inserts its first tokens in the tree."""
+        req.franky.taps_ready = req.franky.tap_len
+        self.queue.on_started(reqs=[req])
+        req.last_node = f"node-{req.rid}-{inserted_len}"
+        req.kv.cache_protected_len = inserted_len
+        self.queue.poll()
+
+    def test_a_returning_request_whose_kept_prompt_left_the_cache_fails(self):
         req = self._arrive(_Req("r", prompt_len=64))
-        req.franky.taps_ready = 64
+        self._start_and_insert(req, inserted_len=48)
         req.cached_prefix_len = 32
 
         self._arrive(req)
 
         self.assertEqual(self.failed, ["r"])
+
+    def test_a_retracted_request_resumes_on_its_kept_prompt_with_its_taps(self):
+        req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=16))
+        old_slots = req.franky.taken_kv_slots
+        taps = torch.arange(48 * 2, dtype=torch.bfloat16).view(48, 2)
+        self.queue.tap_cache.write(encoder_id=0, taps=taps, kv_slots=old_slots)
+        self._start_and_insert(req, inserted_len=32)
+        self.assertEqual(self.tree.locked, ["node-r-32"])
+
+        self.queue.add(req=req)
+        self.queue.tap_cache.write(
+            encoder_id=0, taps=torch.zeros_like(taps), kv_slots=old_slots
+        )
+        self.assertEqual(self.tree.locked, ["node-r-32"], "the retraction keeps it")
+        req.cached_prefix_len = 32
+        req.output_ids = [7] * 8
+        self.queue.poll()
+
+        self.assertEqual(self.failed, [])
+        self.assertEqual(self.tree.locked, ["node-r-32"], "now its arrival's lock")
+        self.assertEqual((req.franky.taken_from, req.franky.taps_ready), (32, 72))
+        [restored] = self.queue.tap_cache.read(
+            kv_slots=req.franky.taken_kv_slots[:32]
+        ).values()
+        self.assertTrue(torch.equal(restored, taps[16:]))
+
+    def test_a_retracted_request_that_is_aborted_releases_its_prompt(self):
+        req = self._arrive(_Req("r", prompt_len=64))
+        self._start_and_insert(req, inserted_len=48)
+        self.queue.add(req=req)
+
+        self.queue.forget(req=req)
+
+        self.assertEqual(self.tree.locked, [])
+        self.assertTrue(self.queue.is_empty())
 
     def test_a_returning_request_never_runs_on_the_pages_it_gave_back(self):
         req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=16))
@@ -489,15 +534,16 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.assertEqual(self.tree.locked, ["node-c-1"])
         self.assertEqual(self.holds.locked_nodes(), set())
 
-    def test_a_started_request_no_longer_pins_its_prefix(self):
+    def test_a_started_request_keeps_its_prompt_locked_until_it_ends(self):
         req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=32))
 
         self.queue.on_started(reqs=[req])
 
-        self.assertEqual(self.tree.locked, [])
+        self.assertEqual(self.tree.locked, ["node-r"], "for a retraction")
         req.franky.taps_ready = 64
         self.queue.forget(req=req)
         self.assertTrue(self.queue.is_empty())
+        self.assertEqual(self.tree.locked, [])
 
     def test_an_arrival_past_the_mamba_room_releases_the_oldest_holds_first(self):
         self._with_mamba_room(num_states=7)

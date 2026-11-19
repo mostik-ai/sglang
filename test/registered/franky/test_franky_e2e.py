@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=450, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu-large")
 
 _MODEL = "Qwen/Qwen3.5-0.8B"
 _LAYERS = [6, 12, 18, 24]
@@ -464,6 +464,68 @@ class TestFrankyTapFailure(_FrankyPair):
         self.assertEqual(health.status_code, 200)
         tokens, _ = self._generate(prompt, room=4302)
         self.assertEqual(len(tokens), _NEW_TOKENS)
+
+
+class TestFrankyRetraction(_FrankyPair):
+    """A retracted request resumes on the prompt and taps its retraction kept, and
+    reads the taps it read before. SGLang's test mode retracts a decoding request
+    at every third forward, and each retraction evicts every unlocked prefix, as
+    one does when a full KV pool needs the room at once."""
+
+    ricky_env = {
+        "SGLANG_TEST_RETRACT": "1",
+        "SGLANG_RETRACT_DECODE_STEPS": "1000000",
+    }
+
+    def test_retracted_requests_resume_and_read_the_taps_sandy_wrote(self):
+        tokenizer = AutoTokenizer.from_pretrained(_MODEL)
+        # Past their last whole linear-attention chunk, these prompts' taps are in
+        # their own KV only: 63, 22 and 63 tokens.
+        prompts = [tokenizer.encode(_TEXT * 8)[:length] for length in (127, 150, 191)]
+        sampling = {
+            "temperature": 0,
+            "max_new_tokens": 2 * _NEW_TOKENS,
+            "ignore_eos": True,
+        }
+
+        def tokens_of(answer):
+            return [pair[1] for pair in answer["meta_info"]["output_token_logprobs"]]
+
+        # Alone, a request is never retracted: a retraction keeps one request.
+        alone = []
+        for index, prompt in enumerate(prompts):
+            answer = self._send(prompt, 4500 + index, ricky_sampling=sampling)
+            alone.append(tokens_of(answer[self.ricky_url]))
+        answers = [None] * len(prompts)
+
+        def send(index):
+            sent = self._send(prompts[index], 4400 + index, ricky_sampling=sampling)
+            answers[index] = sent[self.ricky_url]
+
+        threads = [threading.Thread(target=send, args=(i,)) for i in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        for answer in answers:
+            self.assertIn("meta_info", answer, answer)
+        retractions = [answer["meta_info"]["num_retractions"] for answer in answers]
+        self.assertGreater(sum(retractions), 0, retractions)
+        outputs = []
+        for answer in answers:
+            pairs = answer["meta_info"]["output_token_logprobs"]
+            logprobs = torch.tensor([pair[0] for pair in pairs])
+            outputs.append((tokens_of(answer), logprobs))
+        references = self._reference(prompts, outputs)
+        for (tokens, logprobs), ref, tokens_alone in zip(outputs, references, alone):
+            self.assertEqual(tokens, tokens_alone)
+            self.assertLess((logprobs - ref["readers"]).abs().max().item(), 0.2)
+
+        # Idle, Ricky's scheduler checks that every mamba state is free or cached.
+        time.sleep(10)
+        health = requests.get(f"{self.ricky_url}/health", timeout=30)
+        self.assertEqual(health.status_code, 200)
 
 
 if __name__ == "__main__":
