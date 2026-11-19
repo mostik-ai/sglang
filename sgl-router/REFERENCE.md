@@ -487,6 +487,24 @@ recomputes those tokens with the taps their decode read.
   and for assistant messages without `--franky-chat-adapter` or in a chat the
   router leaves to the engine to render (see [Chat rendering](#chat-rendering)).
 
+### Sandy's own view
+
+A Franky `/generate` request may give Sandy her own view of the prompt as
+`franky_sandy_input_ids`: token ids, as many as its `input_ids`. Sandy's leg
+reads them in place of Ricky's prompt, and in a chain every block gives her
+that view and the tokens Ricky generated so far, as it gives Ricky his. The
+views must be one length so that every tap keeps its position: a part only
+Sandy may read is replaced one for one by filler in Ricky's view.
+
+- The router answers `400` for a view of another length, a prompt sent as
+  `text`, or a view that is not one prompt's token ids.
+- No engine gets the field; Sandy gets her view as her `input_ids`.
+- Ricky's legs get a digest of her view of the prompt in `extra_key`, after
+  any key the client sent, because his cached KV holds what his readers added
+  from her taps: requests with one Ricky prompt under different views share no
+  cache, while requests under one view, and a chain's blocks, still share it.
+  Sandy's leg keeps the client's own key: her `input_ids` are her view.
+
 ## Chat rendering
 
 The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's

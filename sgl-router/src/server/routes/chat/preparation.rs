@@ -22,6 +22,7 @@ use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
     lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -114,6 +115,12 @@ pub(super) struct PreparedRequest {
     sampling_defaults: Vec<(SamplingField, Number)>,
     /// Turns the engine's `/generate` response back into the OpenAI one.
     pub(super) responder: Option<Responder>,
+    /// Sandy's own view of the prompt, from a `/generate` body's
+    /// `franky_sandy_input_ids`: her leg's `input_ids`, as long as Ricky's.
+    pub(super) sandy_input_ids: Option<Vec<u32>>,
+    /// The client's own `extra_key`, which Sandy's leg keeps while Ricky's
+    /// carries the digest of her view: her `input_ids` are that view.
+    pub(super) sandy_extra_key: Option<Value>,
 }
 
 impl PreparedRequest {
@@ -250,6 +257,8 @@ impl PreparedRequest {
                 || (path == COMPLETIONS_PATH && fields.prompt_batch),
             input_ids_forwarding: forwarding,
             forwarding_booked: false,
+            sandy_input_ids: None,
+            sandy_extra_key: None,
             parsed_body,
             sampling_defaults,
             responder: None,
@@ -310,6 +319,8 @@ impl PreparedRequest {
             fans_out: batch.is_some() || requests_multiple_samples(&fields, &sampling_defaults),
             input_ids_forwarding: None,
             forwarding_booked: false,
+            sandy_input_ids: None,
+            sandy_extra_key: None,
             responder: None,
             cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
@@ -343,6 +354,13 @@ impl PreparedRequest {
             Some(_) => apply_sampling_overrides(ctx, &mut value)?,
             None => true,
         };
+        let sandy_input_ids = take_sandy_input_ids(&mut value)?;
+        let mut sandy_extra_key = None;
+        if let Some(view) = &sandy_input_ids {
+            sandy_extra_key = value.get("extra_key").cloned();
+            key_cache_by_view(&mut value, view);
+        }
+        rewrite |= sandy_input_ids.is_some();
         let text_ids = tokenize_text(ctx, &model, &value);
         // Routing sees `text` as the engine's ids, whether or not they are forwarded.
         let routed = text_ids.as_ref().map(|ids| json!({ "input_ids": ids }));
@@ -404,6 +422,8 @@ impl PreparedRequest {
             fans_out,
             input_ids_forwarding: None,
             forwarding_booked: false,
+            sandy_input_ids,
+            sandy_extra_key,
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
             responder: None,
@@ -524,6 +544,8 @@ impl PreparedRequest {
             fans_out,
             input_ids_forwarding: None,
             forwarding_booked: false,
+            sandy_input_ids: None,
+            sandy_extra_key: None,
             responder: None,
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
@@ -558,6 +580,8 @@ impl PreparedRequest {
             fans_out: false,
             input_ids_forwarding: None,
             forwarding_booked: false,
+            sandy_input_ids: None,
+            sandy_extra_key: None,
             parsed_body: None,
             sampling_defaults: Vec::new(),
             responder: None,
@@ -605,6 +629,38 @@ impl PreparedRequest {
             .into();
         self.parsed_body = Some(body);
         Ok(())
+    }
+
+    /// Sandy's engine body for one dispatch attempt: the body Ricky's leg gets
+    /// or, when the client sent her own view of the prompt, that view as her
+    /// `input_ids` with the client's own `extra_key`.
+    pub(super) fn sandy_outgoing_body(
+        &mut self,
+        ctx: &AppContext,
+        franky_room: &FrankyRoom,
+        engine_rid: Option<&str>,
+    ) -> Result<Bytes, ApiError> {
+        let Some(sandy_input_ids) = self.sandy_input_ids.as_deref() else {
+            return self.outgoing_body(ctx, None, Some(franky_room), engine_rid);
+        };
+        let mut body = match self.parsed_body.take() {
+            Some(body) => body,
+            None => serde_json::from_slice(&self.body).map_err(|_| invalid_request())?,
+        };
+        let fields = body.as_object_mut().ok_or_else(invalid_request)?;
+        match &self.sandy_extra_key {
+            Some(key) => fields.insert("extra_key".into(), key.clone()),
+            None => fields.remove("extra_key"),
+        };
+        build_outgoing_body(
+            &self.body,
+            Some(body),
+            Some(sandy_input_ids),
+            None,
+            Some(franky_room),
+            &self.sampling_defaults,
+            engine_rid,
+        )
     }
 
     /// The engine body for one dispatch attempt; each attempt brings its own
@@ -1611,6 +1667,61 @@ pub(super) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiErr
     // Keep deserialization details out of the client-visible error.
     tracing::debug!(error = %err, "chat-completions routing-fields deserialize failed");
     Err(invalid_request())
+}
+
+/// Takes the client's `franky_sandy_input_ids`, Sandy's own view of the
+/// prompt, out of a `/generate` body, so no engine sees the field. Ricky's view
+/// replaces the part only Sandy may read one for one by filler, so every tap
+/// keeps its position: the two views must be token ids of one length.
+///
+/// Errors: `ApiError::BadRequest` for a view that is not token ids, a prompt
+/// sent as text or a batch, or views of different lengths.
+fn take_sandy_input_ids(value: &mut Value) -> Result<Option<Vec<u32>>, ApiError> {
+    let Some(fields) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(view) = fields.remove("franky_sandy_input_ids") else {
+        return Ok(None);
+    };
+    let view: Vec<u32> = serde_json::from_value(view).map_err(|_| {
+        ApiError::BadRequest("franky_sandy_input_ids must be one prompt's token ids".into())
+    })?;
+    let prompt = match fields.get("input_ids") {
+        Some(Value::Array(ids)) if ids.iter().all(Value::is_u64) => ids.len(),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "franky_sandy_input_ids needs Ricky's prompt as one prompt's input_ids".into(),
+            ))
+        }
+    };
+    if view.len() != prompt {
+        return Err(ApiError::BadRequest(format!(
+            "franky_sandy_input_ids holds {} tokens for a prompt of {prompt}: \
+             Sandy's view must be as long as Ricky's",
+            view.len()
+        )));
+    }
+    Ok(Some(view))
+}
+
+/// Ricky's cached KV holds what his readers added, which depends on Sandy's
+/// taps and so on her view as well as on his own tokens: requests that share
+/// his tokens but not her view must not share his cache. Appends a digest of
+/// her view of the prompt to the request's `extra_key`, which SGLang's radix
+/// cache keys on, after any key of the client's own. A chain's blocks keep
+/// their prompt's key, so that they share the cache with each other.
+fn key_cache_by_view(value: &mut Value, view: &[u32]) {
+    let mut hasher = Sha256::new();
+    for id in view {
+        hasher.update(id.to_le_bytes());
+    }
+    let digest = format!("sandy-view:{:x}", hasher.finalize());
+    let fields = value.as_object_mut().expect("parsed as an object");
+    let key = match fields.get("extra_key").and_then(Value::as_str) {
+        Some(client) if !client.is_empty() => format!("{client}|{digest}"),
+        _ => digest,
+    };
+    fields.insert("extra_key".into(), Value::String(key));
 }
 
 pub(super) fn invalid_request() -> ApiError {
