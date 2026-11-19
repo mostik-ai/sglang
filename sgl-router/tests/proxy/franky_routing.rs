@@ -950,3 +950,105 @@ async fn ignore_eos_under_a_boundary_token_is_refused() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     assert!(ricky.requests().is_empty());
 }
+
+/// A presence penalty over the whole answer reaches each block as a logit bias on the tokens of
+/// the blocks before it, added to the client's own bias, and the field reaches no engine.
+#[tokio::test]
+async fn a_presence_penalty_over_blocks_biases_each_block_against_the_tokens_before_it() {
+    let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "franky_presence_over_blocks": 1.5,
+        "sampling_params": {"max_new_tokens": 100, "logit_bias": {"4": 2.0, "99": -1.0}},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let requests = ricky.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0]["sampling_params"]["logit_bias"],
+        json!({"4": 2.0, "99": -1.0})
+    );
+    for (block, request) in requests.iter().enumerate().skip(1) {
+        let mut expected = serde_json::Map::new();
+        expected.insert("99".into(), json!(-1.0));
+        for token in 3..3 + 4 * block as u64 {
+            let client = if token == 4 { 2.0 } else { 0.0 };
+            expected.insert(token.to_string(), json!(client - 1.5));
+        }
+        assert_eq!(
+            request["sampling_params"]["logit_bias"],
+            Value::Object(expected),
+            "block {}",
+            block + 1
+        );
+    }
+    for request in ricky.requests().iter().chain(&sandy.requests()) {
+        assert!(
+            request.get("franky_presence_over_blocks").is_none(),
+            "{request}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_presence_penalty_over_blocks_beside_sglangs_own_or_below_zero_is_refused() {
+    let (ctx, [ricky, _sandy], _stop) = blocks_router(10).await;
+    for body in [
+        json!({"input_ids": [1, 2], "franky_presence_over_blocks": 1.5,
+               "sampling_params": {"max_new_tokens": 8, "presence_penalty": 1.5}}),
+        json!({"input_ids": [1, 2], "franky_presence_over_blocks": -1.0,
+               "sampling_params": {"max_new_tokens": 8}}),
+        json!({"input_ids": [1, 2], "franky_presence_over_blocks": "high",
+               "sampling_params": {"max_new_tokens": 8}}),
+    ] {
+        let res = build_router(Arc::clone(&ctx))
+            .oneshot(generate(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    assert!(ricky.requests().is_empty());
+}
+
+/// A null logit_bias is no bias: the blocks after the first still get the
+/// presence penalty.
+#[tokio::test]
+async fn a_presence_penalty_over_blocks_replaces_a_null_logit_bias() {
+    let (ctx, [ricky, _sandy], _stop) = blocks_router(10).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "franky_presence_over_blocks": 1.5,
+        "sampling_params": {"logit_bias": null},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        ricky.requests()[1]["sampling_params"]["logit_bias"],
+        json!({"3": -1.5, "4": -1.5, "5": -1.5, "6": -1.5})
+    );
+}
+
+/// Without blocks there is no chain to carry a presence penalty across, and the
+/// engine would ignore the field: the router refuses it.
+#[tokio::test]
+async fn a_presence_penalty_over_blocks_without_blocks_is_refused() {
+    let ricky = MockWorker::start(vec![]).await;
+    let sandy = MockWorker::start(vec![]).await;
+    let ctx = franky_ctx(
+        &[("r", &ricky.url, WorkerMode::Plain)],
+        &[("s", &sandy.url)],
+        1,
+        false,
+    );
+    let body = json!({"input_ids": [1, 2, 3], "franky_presence_over_blocks": 1.5});
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(ricky.captured.lock().unwrap().last_body.is_none());
+}

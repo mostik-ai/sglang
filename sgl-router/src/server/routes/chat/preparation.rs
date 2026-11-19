@@ -5,6 +5,8 @@
 //! chat completions, completions, the native `/generate` endpoint, embeddings,
 //! classify and rerank.
 
+use super::blocks::PRESENCE_FIELD;
+use super::serves_franky;
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
@@ -354,6 +356,13 @@ impl PreparedRequest {
             Some(_) => apply_sampling_overrides(ctx, &mut value)?,
             None => true,
         };
+        if value.get(PRESENCE_FIELD).is_some()
+            && (ctx.config.proxy.franky_block_size.is_none() || !serves_franky(ctx, &model))
+        {
+            return Err(ApiError::BadRequest(format!(
+                "{PRESENCE_FIELD} needs Franky blocks (--franky-block-size)"
+            )));
+        }
         let sandy_input_ids = take_sandy_input_ids(&mut value)?;
         let mut sandy_extra_key = None;
         if let Some(view) = &sandy_input_ids {
