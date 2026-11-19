@@ -18,7 +18,8 @@ from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.franky.schedulers.parked_chunks import FrankyParkedChunks
-from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder, taps_landed
+from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder
+from sglang.srt.franky.schedulers.tap_readiness import TapReadiness
 from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.franky.transfer.messages import FrankyRoomClosed, FrankyTapsReady
 from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
@@ -142,7 +143,12 @@ class RickyScheduler(Scheduler):
             ),
             fail_request=self._fail_franky_request,
         )
-        self.franky_parked_chunks = FrankyParkedChunks()
+        self.franky_tap_readiness = TapReadiness.of(
+            self.tree_cache, page_size=self.page_size
+        )
+        self.franky_parked_chunks = FrankyParkedChunks(
+            readiness=self.franky_tap_readiness
+        )
 
     def init_franky_relay(self) -> None:
         """PD prefill's end of the tap relay to Ricky decode: a bootstrap server on
@@ -184,7 +190,9 @@ class RickyScheduler(Scheduler):
 
     @override
     def prefillable_queue_len(self) -> int:
-        return sum(1 for req in self.waiting_queue if taps_landed(req))
+        return sum(
+            1 for req in self.waiting_queue if self.franky_tap_readiness.can_run(req)
+        )
 
     @override
     def ingest_requests(self, stop_at_pause: bool = False) -> List:

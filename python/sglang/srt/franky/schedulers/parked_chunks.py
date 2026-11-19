@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 
 if TYPE_CHECKING:
+    from sglang.srt.franky.schedulers.tap_readiness import TapReadiness
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.schedule_batch import Req
 
@@ -22,7 +23,8 @@ class FrankyParkedChunks:
     chunk's taps landed, and the seconds after that until the scheduler took it.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, readiness: TapReadiness) -> None:
+        self.readiness = readiness
         self.reqs: list[Req] = []
         self.parkings: dict[str, _Parking] = {}
 
@@ -34,13 +36,13 @@ class FrankyParkedChunks:
         """
         now = time.perf_counter()
         self._note_landings(now=now)
-        if current is not None and _next_chunk_landed(current):
+        if current is not None and self.readiness.can_run(current):
             return current
         if current is not None:
             self.reqs.append(current)
             self.parkings[current.rid] = _Parking(since=now)
         for req in self.reqs:
-            if _next_chunk_landed(req):
+            if self.readiness.can_run(req):
                 self.reqs.remove(req)
                 self._unpark(req, now=now)
                 return req
@@ -70,7 +72,7 @@ class FrankyParkedChunks:
     def _note_landings(self, *, now: float) -> None:
         for req in self.reqs:
             parking = self.parkings[req.rid]
-            if parking.landed_at is None and _next_chunk_landed(req):
+            if parking.landed_at is None and self.readiness.can_run(req):
                 parking.landed_at = now
 
     def _unpark(self, req: Req, *, now: float) -> None:
@@ -79,7 +81,3 @@ class FrankyParkedChunks:
             waiting_for_taps=parking.landed_at - parking.since,
             after_taps_landed=now - parking.landed_at,
         )
-
-
-def _next_chunk_landed(req: Req) -> bool:
-    return req.franky.rows_ready() > req.prefix_len

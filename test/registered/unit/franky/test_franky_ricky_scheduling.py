@@ -21,6 +21,7 @@ from sglang.srt.franky.schedulers.parked_chunks import FrankyParkedChunks
 from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder
 from sglang.srt.franky.schedulers.ricky import RickyScheduler
 from sglang.srt.franky.schedulers.sandy import SandyScheduler
+from sglang.srt.franky.schedulers.tap_readiness import TapReadiness
 from sglang.srt.franky.transfer import receiver as receiver_module
 from sglang.srt.franky.transfer.messages import (
     FrankyRoom,
@@ -778,7 +779,9 @@ class TestRickySchedulerTaps(CustomTestCase):
         reading = self._reserved("reading", row=2, num_taps=100)
         plain = _Req("plain", prompt_len=8, room=False, row=1)
         self.tap_requests.arrive(plain)
-        self.scheduler.franky_parked_chunks = FrankyParkedChunks()
+        self.scheduler.franky_parked_chunks = FrankyParkedChunks(
+            readiness=TapReadiness(chunk_grid=1)
+        )
         self.scheduler.chunked_req = None
         self.scheduler.waiting_queue = []
         self.scheduler.franky_receive_queue = SimpleNamespace(
@@ -937,6 +940,7 @@ class TestFrankyPrefillAdder(CustomTestCase):
         req.prefix_len = prefix_len
         req.extend_end = None
         req.full_untruncated_fill_ids = list(range(prompt_len))
+        req.origin_input_ids = list(range(prompt_len))
         req.output_ids = []
         req.sampling_params = SimpleNamespace(max_new_tokens=8, ignore_eos=False)
         req.retracted_stain = False
@@ -1057,22 +1061,43 @@ class TestFrankyPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_end, 39)
 
+    def test_with_mamba_rows_short_of_a_page_wait_for_the_last_rows_taps(self):
+        # A chunk that ends inside a page would leave no mamba checkpoint and
+        # take one more forward; the rows wait and run with the last one.
+        self.tree_cache.supports_mamba.return_value = True
+        self.tree_cache.supports_prefix_sharing.return_value = True
+        adder = self._adder()
+        req = self._req("r", prompt_len=100, prefix_len=96, taps_ready=0)
+
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(adder.can_run_list, [])
+
+        req.franky.taps_ready = 100
+        adder = self._adder()
+        adder.add_chunked_req(req)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(req.extend_end, 100)
+
     def test_the_prefill_delayer_counts_only_requests_with_rows_to_run(self):
         scheduler = object.__new__(RickyScheduler)
+        scheduler.franky_tap_readiness = TapReadiness(chunk_grid=1)
+        rows = dict(origin_input_ids=[0] * 64, output_ids=[])
         scheduler.waiting_queue = [
             SimpleNamespace(
                 franky=FrankyReqState(
                     tap_len=64, taps_ready=0, generated_spans=_single_turn(64)
                 ),
                 prefix_len=0,
+                **rows,
             ),
             SimpleNamespace(
                 franky=FrankyReqState(
                     tap_len=64, taps_ready=32, generated_spans=_single_turn(64)
                 ),
                 prefix_len=63,
+                **rows,
             ),
-            SimpleNamespace(franky=None, prefix_len=0),
+            SimpleNamespace(franky=None, prefix_len=0, **rows),
         ]
 
         self.assertEqual(scheduler.prefillable_queue_len(), 1)

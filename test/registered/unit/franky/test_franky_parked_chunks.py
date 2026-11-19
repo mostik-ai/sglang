@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from sglang.srt.franky.schedulers import parked_chunks as parked_chunks_module
 from sglang.srt.franky.schedulers.parked_chunks import FrankyParkedChunks
+from sglang.srt.franky.schedulers.tap_readiness import TapReadiness
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -25,11 +26,13 @@ class _Taps:
         return self.ready
 
 
-def _chunked_req(rid: str, *, prefix_len: int, rows_ready: int):
+def _chunked_req(rid: str, *, prefix_len: int, rows_ready: int, num_rows: int = 1024):
     return SimpleNamespace(
         rid=rid,
         prefix_len=prefix_len,
         franky=_Taps(rows_ready),
+        origin_input_ids=[0] * num_rows,
+        output_ids=[],
         time_stats=SchedulerReqTimeStats(),
     )
 
@@ -49,7 +52,7 @@ class TestParkedSeconds(CustomTestCase):
         clock_patch = patch.object(parked_chunks_module, "time", self.clock)
         clock_patch.start()
         self.addCleanup(clock_patch.stop)
-        self.parked = FrankyParkedChunks()
+        self.parked = FrankyParkedChunks(readiness=TapReadiness(chunk_grid=1))
 
     def test_a_request_adds_the_time_it_sat_parked(self):
         req = _chunked_req("r", prefix_len=64, rows_ready=64)
@@ -117,6 +120,52 @@ class TestParkedSeconds(CustomTestCase):
         self.assertEqual(req.time_stats.franky_parked_s, 0.0)
         self.assertEqual(req.time_stats.franky_parked_landed_s, 0.0)
         self.assertEqual(self.parked.parkings, {})
+
+
+class TestTapReadiness(CustomTestCase):
+    def test_without_mamba_checkpoints_a_prefill_stops_on_any_row(self):
+        readiness = TapReadiness(chunk_grid=1)
+        req = _chunked_req("r", prefix_len=960, rows_ready=1023)
+
+        self.assertEqual(readiness.end(req), 1023)
+        self.assertTrue(readiness.can_run(req))
+        self.assertFalse(readiness.complete(req))
+
+    def test_with_mamba_checkpoints_an_early_stop_is_a_page_end(self):
+        readiness = TapReadiness(chunk_grid=64)
+        req = _chunked_req("r", prefix_len=960, rows_ready=1023)
+
+        self.assertEqual(readiness.end(req), 960)
+        self.assertFalse(readiness.can_run(req))
+        req.franky.ready = 1024
+        self.assertEqual(readiness.end(req), 1024)
+        self.assertTrue(readiness.can_run(req))
+        self.assertTrue(readiness.complete(req))
+
+    def test_the_grid_is_the_page_only_for_a_mamba_prefix_cache(self):
+        mamba = SimpleNamespace(
+            supports_mamba=lambda: True, supports_prefix_sharing=lambda: True
+        )
+        plain = SimpleNamespace(
+            supports_mamba=lambda: False, supports_prefix_sharing=lambda: True
+        )
+
+        self.assertEqual(TapReadiness.of(mamba, page_size=64).chunk_grid, 64)
+        self.assertEqual(TapReadiness.of(plain, page_size=64).chunk_grid, 1)
+
+    def test_a_request_without_tap_state_cannot_run(self):
+        req = _chunked_req("r", prefix_len=0, rows_ready=0)
+        req.franky = None
+
+        self.assertFalse(TapReadiness(chunk_grid=1).can_run(req))
+
+    def test_a_parked_mamba_request_waits_for_its_last_rows_taps(self):
+        parked = FrankyParkedChunks(readiness=TapReadiness(chunk_grid=64))
+        req = _chunked_req("r", prefix_len=960, rows_ready=1023)
+
+        self.assertIsNone(parked.pick(current=req))
+        req.franky.ready = 1024
+        self.assertIs(parked.pick(current=None), req)
 
 
 if __name__ == "__main__":
