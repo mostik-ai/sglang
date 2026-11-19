@@ -51,6 +51,12 @@ pub(super) struct BlockChain {
     total_limit: Option<u64>,
     body_without_prompt: Map<String, Value>,
     prompt_ids: Vec<Value>,
+    /// The client's own `extra_key` for Sandy's leg; `body_without_prompt`
+    /// carries Ricky's, keyed by her view of the prompt.
+    sandy_extra_key: Option<Value>,
+    /// Sandy's own view of the prompt, when the client sent one; each block
+    /// gives her that view and every token generated so far.
+    sandy_prompt_ids: Option<Vec<u32>>,
     streaming: bool,
     responder: Option<Responder>,
     output: ChainOutput,
@@ -99,6 +105,7 @@ impl BlockChain {
             }
         };
         body.remove("text");
+        let sandy_prompt_ids = request.sandy_input_ids.take();
         let client_rid = body.remove("rid");
         let total_limit = body
             .get("sampling_params")
@@ -120,6 +127,8 @@ impl BlockChain {
             total_limit,
             body_without_prompt: body,
             prompt_ids,
+            sandy_extra_key: request.sandy_extra_key.take(),
+            sandy_prompt_ids,
             streaming: request.streaming,
             responder: request.responder.take(),
             workers: None,
@@ -174,6 +183,12 @@ impl BlockChain {
         self.blocks_sent += 1;
         let body = self.block_body(max_new_tokens, last_block);
         let mut request = PreparedRequest::generate_value(ctx, self.model.clone(), body, None)?;
+        if let Some(view) = &self.sandy_prompt_ids {
+            let generated = self.output.generated_ids().iter().filter_map(Value::as_u64);
+            let view = view.iter().copied().chain(generated.map(|id| id as u32));
+            request.sandy_input_ids = Some(view.collect());
+            request.sandy_extra_key = self.sandy_extra_key.clone();
+        }
         self.output.start_block(last_block);
         let (response, answered) = routing
             .forward_with_retries(

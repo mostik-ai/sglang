@@ -254,10 +254,10 @@ async fn dispatch<T: Transport>(
         franky_room.as_ref(),
         engine_rid.as_deref(),
     )?;
-    // Sandy computes the same prompt, outside PD.
+    // Sandy computes the same prompt, or her own view of it, outside PD.
     let sandy_leg = match (sandy, &franky_room) {
         (Some(sandy), Some(room)) => {
-            let body = request.outgoing_body(ctx, None, Some(room), engine_rid.as_deref())?;
+            let body = request.sandy_outgoing_body(ctx, room, engine_rid.as_deref())?;
             let rank = dp_aware
                 .then(|| prompt_dp_rank(ctx, request, &headers, &sandy))
                 .flatten();
