@@ -9,6 +9,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 
 import requests
@@ -89,7 +90,12 @@ def _reader(weights, index, layer_output, taps, num_taps):
 
 
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")
-class TestFrankyEndToEnd(CustomTestCase):
+class _FrankyPair(CustomTestCase):
+    """A Sandy server and a Ricky server on two GPUs, with seeded encoders and
+    readers; ``ricky_env`` adds to the Ricky server's environment."""
+
+    ricky_env: dict[str, str] = {}
+
     @classmethod
     def setUpClass(cls):
         cls.directory = tempfile.mkdtemp(prefix="franky_e2e_")
@@ -127,7 +133,11 @@ class TestFrankyEndToEnd(CustomTestCase):
         if side == "sandy":
             args += ["--franky-bootstrap-port", str(cls.bootstrap_port)]
         return popen_launch_server(
-            _MODEL, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, other_args=args
+            _MODEL,
+            url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=args,
+            env={**os.environ, **cls.ricky_env} if side == "ricky" else None,
         )
 
     @classmethod
@@ -290,6 +300,8 @@ class TestFrankyEndToEnd(CustomTestCase):
                 results.append(row)
         return results
 
+
+class TestFrankyEndToEnd(_FrankyPair):
     def test_ricky_reads_the_taps_sandy_wrote(self):
         from transformers import AutoTokenizer
 
@@ -394,6 +406,64 @@ class TestFrankyEndToEnd(CustomTestCase):
         # average, some past 0.3.
         self.assertLess(gap.mean().item(), 0.03, gap.tolist())
         self.assertLess(gap.max().item(), 0.2, gap.tolist())
+
+
+class TestFrankyTapFailure(_FrankyPair):
+    """A block whose taps never arrive fails and leaves no mamba state behind: four
+    tap transfers that timed out under load once left four states out of Ricky's
+    pool, and his idle check stopped the engine."""
+
+    ricky_env = {
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "10",
+        "SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT": "2",
+    }
+
+    def test_a_block_whose_taps_never_arrive_fails_and_ricky_serves_on(self):
+        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(_TEXT * 6)
+        chain = "chain4300"
+        first = self._send(
+            prompt,
+            4300,
+            rid=f"{chain}-1",
+            franky_chain={"id": chain, "block_size": _NEW_TOKENS, "last_block": False},
+        )
+        pairs = first[self.ricky_url]["meta_info"]["output_token_logprobs"]
+        context = prompt + [pair[1] for pair in pairs]
+
+        # Sandy never gets the next block. Ricky matches it on the held prompt, which
+        # copies the prompt's mamba state into a state of its own, and waits for its
+        # taps until the transfer times out.
+        failed = requests.post(
+            f"{self.ricky_url}/generate",
+            json={
+                "input_ids": context,
+                "sampling_params": {"temperature": 0, "max_new_tokens": _NEW_TOKENS},
+                "franky_room": {
+                    "bootstrap_host": "127.0.0.1",
+                    "bootstrap_port": self.bootstrap_port,
+                    "room": 4301,
+                },
+                "rid": f"{chain}-2",
+                "franky_chain": {
+                    "id": chain,
+                    "block": 2,
+                    "block_size": _NEW_TOKENS,
+                    "last_block": True,
+                },
+            },
+            timeout=600,
+        )
+        self.assertNotEqual(failed.status_code, 200, failed.text)
+
+        # Idle, Ricky's scheduler checks that every mamba state is free or cached.
+        time.sleep(10)
+        try:
+            health = requests.get(f"{self.ricky_url}/health", timeout=30)
+        except requests.ConnectionError as error:
+            self.fail(f"Ricky's server is gone after the failed block: {error}")
+        self.assertEqual(health.status_code, 200)
+        tokens, _ = self._generate(prompt, room=4302)
+        self.assertEqual(len(tokens), _NEW_TOKENS)
 
 
 if __name__ == "__main__":
