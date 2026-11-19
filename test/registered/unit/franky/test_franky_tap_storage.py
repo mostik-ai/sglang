@@ -197,14 +197,17 @@ class TestRickyTapCache(CustomTestCase):
         super().setUp()
         self.cache = _ricky_cache()
 
-    def _reserve(self, cache: RickyTapCache, sandy_ids: list[int]) -> TapReservation:
-        cached = cache.match(sandy_ids)
+    def _reserve(
+        self, cache: RickyTapCache, sandy_ids: list[int], extra_key=None
+    ) -> TapReservation:
+        cached = cache.match(sandy_ids, extra_key=extra_key)
         num_stripes = -(-len(sandy_ids) // cache.stripe_size)
         new_pages = cache.take(num_stripes - len(cached.pages))
         return TapReservation(
             sandy_ids=sandy_ids,
             pages=torch.cat([cached.pages, new_pages]),
             cached=cached,
+            extra_key=extra_key,
         )
 
     def _hold_and_cache(self, cache: RickyTapCache, sandy_ids: list[int]):
@@ -255,6 +258,21 @@ class TestRickyTapCache(CustomTestCase):
         self.assertEqual(cached.num_taps, 16)
         self.assertEqual(cached.pages.tolist(), pages[:2].tolist())
         self.cache.release(cached.lock)
+
+    def test_a_cached_request_is_found_only_under_its_own_extra_key(self):
+        # Sandy reads one view of the tokens per extra key, so its taps differ.
+        reservation = self._reserve(self.cache, list(range(20)), extra_key="view-a")
+        self.cache.release(self.cache.cache(reservation))
+
+        same = self.cache.match(list(range(20)), extra_key="view-a")
+        other = self.cache.match(list(range(20)), extra_key="view-b")
+        none = self.cache.match(list(range(20)))
+
+        self.assertEqual(same.num_taps, 16)
+        self.assertEqual(other.num_taps, 0)
+        self.assertEqual(none.num_taps, 0)
+        for cached in (same, other, none):
+            self.cache.release(cached.lock)
 
     def test_a_match_counts_whole_stripes_only(self):
         self._cache(list(range(20)))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Sequence
+from typing import Optional
 
 import msgspec
 import numpy as np
@@ -42,11 +43,14 @@ class TapReservation(msgspec.Struct, frozen=True, kw_only=True):
         pages: int64 host, the local pages of its stripes in order, those of
             ``cached`` first.
         cached: the prefix it took from the prefix tree.
+        extra_key: the request's cache namespace, which keys its taps beside
+            ``sandy_ids``: Sandy may read a view of the request's tokens.
     """
 
     sandy_ids: Sequence[int]
     pages: torch.Tensor
     cached: CachedTaps
+    extra_key: Optional[str] = None
 
     @property
     def num_taps(self) -> int:
@@ -98,12 +102,18 @@ class RickyTapCache:
         )
         self._stripe_offsets = torch.arange(self.stripe_size, dtype=torch.int64)
 
-    def match(self, sandy_ids: Sequence[int]) -> CachedTaps:
+    def match(
+        self, sandy_ids: Sequence[int], *, extra_key: Optional[str] = None
+    ) -> CachedTaps:
         """
+        Args:
+            extra_key: the request's cache namespace.
         Returns:
             The longest cached prefix of the taps of ``sandy_ids``, locked.
         """
-        result = self._tree.match_prefix(MatchPrefixParams(key=_key(sandy_ids)))
+        result = self._tree.match_prefix(
+            MatchPrefixParams(key=_key(sandy_ids, extra_key=extra_key))
+        )
         node = result.last_device_node
         return CachedTaps(
             lock=self._tree.lock(node),
@@ -144,7 +154,10 @@ class RickyTapCache:
         ).reshape(-1)
         result = self._tree.insert(
             InsertParams(
-                key=_key(reservation.sandy_ids[: num_whole * self.stripe_size]),
+                key=_key(
+                    reservation.sandy_ids[: num_whole * self.stripe_size],
+                    extra_key=reservation.extra_key,
+                ),
                 value=values,
             )
         )
@@ -228,5 +241,5 @@ class RickyTapCache:
         return indices[:: self.stripe_size] // self.stripe_size
 
 
-def _key(sandy_ids: Sequence[int]) -> RadixKey:
-    return RadixKey(token_ids=array("q", sandy_ids))
+def _key(sandy_ids: Sequence[int], *, extra_key: Optional[str]) -> RadixKey:
+    return RadixKey(token_ids=array("q", sandy_ids), extra_key=extra_key)

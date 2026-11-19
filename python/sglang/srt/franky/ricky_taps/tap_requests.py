@@ -25,6 +25,7 @@ _NO_TAPS_NAMESPACE = "franky=no-taps"
 class _Waiting(msgspec.Struct, frozen=True, kw_only=True):
     req: Any
     sandy_tokens: Sequence[int]
+    extra_key: Optional[str]
 
 
 class _Refused(msgspec.Struct, frozen=True, kw_only=True):
@@ -114,7 +115,9 @@ class RickyTapRequests:
             taps_ready=0,
             spans=request.spans(num_input_tokens=len(req.origin_input_ids)),
         )
-        self._waiting[req.rid] = _Waiting(req=req, sandy_tokens=sandy_tokens)
+        self._waiting[req.rid] = _Waiting(
+            req=req, sandy_tokens=sandy_tokens, extra_key=req.extra_key
+        )
         return None
 
     def poll(self) -> list[Req]:
@@ -227,7 +230,9 @@ class RickyTapRequests:
         page_size = self._tap_cache.buffers.page_size
         num_taps = len(waiting.sandy_tokens)
         max_cached_taps = (ceil_div(num_taps, page_size) - 1) * page_size
-        cached = self._tap_cache.match(waiting.sandy_tokens[:max_cached_taps])
+        cached = self._tap_cache.match(
+            waiting.sandy_tokens[:max_cached_taps], extra_key=waiting.extra_key
+        )
         num_new = ceil_div(num_taps, self._tap_cache.stripe_size) - len(cached.pages)
         if not self._fits_or_releases_holds(waiting.req, num_new):
             self._tap_cache.release(cached.lock)
@@ -236,6 +241,7 @@ class RickyTapRequests:
             sandy_ids=waiting.sandy_tokens,
             pages=torch.cat([cached.pages, self._tap_cache.take(num_new)]),
             cached=cached,
+            extra_key=waiting.extra_key,
         )
 
     def _fits_or_releases_holds(self, req: Req, num_new: int) -> bool:
