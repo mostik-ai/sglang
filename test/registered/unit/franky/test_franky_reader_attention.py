@@ -78,11 +78,21 @@ def _flash_attention_on_cpu(
     return (out, lse) if return_softmax_lse else out
 
 
-def _combine_on_cpu(recv_output, recv_lse, is_lse_base_on_e=True, return_lse=False):
-    lse = recv_lse if is_lse_base_on_e else recv_lse * torch.log(torch.tensor(2.0))
+def _pack_on_cpu(out, lse, local_taps):
+    rows, queries, size = out.shape
+    reads = (local_taps > 0)[:, None]
+    packed = out.new_zeros((rows, queries, size + 2))
+    packed[..., :size] = torch.where(reads[..., None], out, 0)
+    packed.view(torch.float32)[..., size // 2] = torch.where(reads, lse, float("-inf"))
+    return packed
+
+
+def _merge_on_cpu(gathered, *, out, lse_is_base_e):
+    size = gathered.shape[-1] - 2
+    lse = gathered.view(torch.float32)[..., size // 2]
+    lse = lse if lse_is_base_e else lse * torch.log(torch.tensor(2.0))
     weights = torch.softmax(lse, dim=0).nan_to_num(0.0)
-    combined = (weights[..., None] * recv_output.float()).sum(dim=0)
-    return combined.to(recv_output.dtype), None
+    out.copy_((weights[..., None] * gathered[..., :size].float()).sum(dim=0))
 
 
 class _Ranks:
@@ -273,7 +283,8 @@ class TestTapAttention(CustomTestCase):
         super().setUp()
         for name, stand_in in (
             ("flash_attn_with_kvcache", _flash_attention_on_cpu),
-            ("dcp_lse_combine_triton", _combine_on_cpu),
+            ("franky_reader_pack", _pack_on_cpu),
+            ("franky_reader_merge", _merge_on_cpu),
         ):
             stand_in_patch = patch.object(tap_attention, name, stand_in)
             stand_in_patch.start()
@@ -372,25 +383,31 @@ class TestTapAttention(CustomTestCase):
                         )
 
     def test_ranks_merge_rows_by_their_log_sum_exp(self):
-        queries = torch.randn(2, 1, _TAP_SIZE, dtype=TAP_DTYPE)
         out = torch.randn(2, 1, _TAP_SIZE, dtype=TAP_DTYPE)
         lse = torch.tensor([[0.5], [float("-inf")]])
-        ranks = _Ranks(2)
         other_out = torch.randn(2, 1, _TAP_SIZE, dtype=TAP_DTYPE)
         other_lse = torch.tensor([[1.5], [float("-inf")]])
-        tap_attention._merge_ranks(
-            other_out, other_lse, group=ranks.group(1), lse_is_base_e=True
+        local_taps = torch.tensor([3, 0], dtype=torch.int32)
+        ranks = _Ranks(2)
+        attentions = [
+            self._attention(num_ranks=2, rank=rank, group=ranks.group(rank))
+            for rank in range(2)
+        ]
+        merged = torch.full_like(out, float("nan"))
+        attentions[1]._merge(
+            other_out,
+            other_lse,
+            local_taps,
+            out=torch.empty_like(out),
+            lse_is_base_e=True,
         )
 
-        merged = tap_attention._merge_ranks(
-            out, lse, group=ranks.group(0), lse_is_base_e=True
-        )
+        attentions[0]._merge(out, lse, local_taps, out=merged, lse_is_base_e=True)
 
         weights = torch.softmax(torch.tensor([0.5, 1.5]), dim=0)
         expected = weights[0] * out[0].float() + weights[1] * other_out[0].float()
         torch.testing.assert_close(merged[0].float(), expected, atol=1e-2, rtol=1e-2)
         self.assertTrue(torch.all(merged[1] == 0))
-        self.assertEqual(queries.shape, merged.shape)
 
 
 if __name__ == "__main__":

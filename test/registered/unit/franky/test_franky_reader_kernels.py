@@ -243,9 +243,7 @@ class TestReaderKernels(CustomTestCase):
                     len(query_rows), 1, _TAP_SIZE, dtype=TAP_DTYPE, device="cuda"
                 )
                 reading = attention.readings.start(
-                    forward_batch,
-                    padded_rows=len(query_rows),
-                    mask_dtype=torch.float32,
+                    forward_batch, mask_dtype=torch.float32
                 )
                 out = torch.empty_like(queries)
                 lse = torch.empty(queries.shape[:2], dtype=torch.float32, device="cuda")
@@ -358,7 +356,6 @@ class TestReaderKernels(CustomTestCase):
             read_rows=self._read_rows(spans, num_input_tokens),
             stripes=TapStripes(num_ranks=2, rank=1),
             page_size=_PAGE_SIZE,
-            padded_rows=len(rows),
             mask_dtype=torch.float32,
         )
 

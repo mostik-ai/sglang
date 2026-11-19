@@ -5,8 +5,11 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
+from sglang.kernels.ops.attention.franky_reader_merge import (
+    franky_reader_merge,
+    franky_reader_pack,
+)
 from sglang.srt.franky.parts.reader.tap_reading import TapReading
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
@@ -170,33 +173,55 @@ class TapAttention:
         if num_rows == 0:
             return
         real = attended[:num_rows]
-        real.copy_(self._attend_rows(queries[:num_rows], reading))
-        real.masked_fill_(~reading.reads[:num_rows, None, None], 0)
+        self._attend_rows(queries[:num_rows], reading, out=real)
+        real.masked_fill_(reading.no_taps[:num_rows, None, None], 0)
 
-    def _attend_rows(self, queries: torch.Tensor, reading: TapReading) -> torch.Tensor:
-        merges = self.group is not None
-        out = torch.empty_like(queries)
-        lse = (
-            torch.empty(queries.shape[:2], dtype=torch.float32, device=queries.device)
-            if merges
-            else None
-        )
-        lse_is_base_e = self._attend_locally(queries, reading, out=out, lse=lse)
-        if not merges:
-            return out
-        kept_none = (reading.local_taps[: queries.shape[0]] <= 0)[:, None]
-        out.masked_fill_(kept_none[:, :, None], 0)
-        lse.masked_fill_(kept_none, float("-inf"))
-        if reading.merged_rows is None:
-            return _merge_ranks(out, lse, group=self.group, lse_is_base_e=lse_is_base_e)
-        merged_rows = reading.merged_rows
-        out[merged_rows] = _merge_ranks(
-            out[merged_rows],
-            lse[merged_rows],
-            group=self.group,
+    def _attend_rows(
+        self, queries: torch.Tensor, reading: TapReading, *, out: torch.Tensor
+    ) -> None:
+        if self.group is None:
+            self._attend_locally(queries, reading, out=out, lse=None)
+            return
+        local_out = torch.empty_like(queries)
+        lse = torch.empty(queries.shape[:2], dtype=torch.float32, device=queries.device)
+        lse_is_base_e = self._attend_locally(queries, reading, out=local_out, lse=lse)
+        local_taps = reading.local_taps[: queries.shape[0]]
+        rows = reading.merged_rows
+        if rows is None:
+            self._merge(
+                local_out, lse, local_taps, out=out, lse_is_base_e=lse_is_base_e
+            )
+            return
+        merged = local_out.new_empty((rows.shape[0], *local_out.shape[1:]))
+        self._merge(
+            local_out[rows],
+            lse[rows],
+            local_taps[rows],
+            out=merged,
             lse_is_base_e=lse_is_base_e,
         )
-        return out
+        out[rows] = merged
+
+    def _merge(
+        self,
+        local_out: torch.Tensor,
+        lse: torch.Tensor,
+        local_taps: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        lse_is_base_e: bool,
+    ) -> None:
+        if local_out.shape[0] == 0:
+            return
+        packed = franky_reader_pack(local_out, lse, local_taps)
+        num_ranks = self.group.world_size
+        gathered = packed.new_empty((num_ranks * packed.shape[0], *packed.shape[1:]))
+        self.group.all_gather_into_tensor(gathered, packed)
+        franky_reader_merge(
+            gathered.view(num_ranks, *packed.shape),
+            out=out,
+            lse_is_base_e=lse_is_base_e,
+        )
 
     def _attend_locally(
         self,
@@ -230,33 +255,6 @@ def _attend_taps(
     if is_in_prefill_graph_scope():
         forward_batch = get_forward_batch()
     attention.run(queries, attended, has_taps, forward_batch=forward_batch, rows=rows)
-
-
-def _merge_ranks(
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    *,
-    group: GroupCoordinator,
-    lse_is_base_e: bool,
-) -> torch.Tensor:
-    if out.shape[0] == 0:
-        return out
-    num_rows, num_heads, size = out.shape
-    lse_columns = torch.float32.itemsize // out.dtype.itemsize
-    packed = out.new_empty((num_rows, num_heads, size + lse_columns))
-    packed[..., :size] = out
-    packed.view(torch.float32)[..., size // lse_columns] = lse
-    gathered = packed.new_empty(
-        (group.world_size * num_rows, num_heads, size + lse_columns)
-    )
-    group.all_gather_into_tensor(gathered, packed)
-    gathered = gathered.view(group.world_size, num_rows, num_heads, size + lse_columns)
-    merged, _ = dcp_lse_combine_triton(
-        gathered[..., :size],
-        gathered.view(torch.float32)[..., size // lse_columns],
-        is_lse_base_on_e=lse_is_base_e,
-    )
-    return merged
 
 
 def _prefill_attend(

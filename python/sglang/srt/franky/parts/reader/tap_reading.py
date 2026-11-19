@@ -29,6 +29,7 @@ class TapReading(msgspec.Struct, frozen=True, kw_only=True):
         local_taps: [rows + 1] int32, how many of the taps each row reads this
             rank keeps; the last entry is a row that reads nothing.
         reads: [rows + 1] bool, whether each row reads any tap.
+        no_taps: [rows + 1] bool, the opposite of ``reads``.
         has_taps: [rows + 1, 1], 1 for rows that read taps and 0 for the rest.
         num_rows: the real rows; a CUDA graph pads after them.
         merged_rows: the rows whose results the ranks merge; None for all real
@@ -40,6 +41,7 @@ class TapReading(msgspec.Struct, frozen=True, kw_only=True):
     row_requests: Optional[torch.Tensor]
     local_taps: torch.Tensor
     reads: torch.Tensor
+    no_taps: torch.Tensor
     has_taps: torch.Tensor
     num_rows: int
     merged_rows: Optional[torch.Tensor] = None
@@ -87,6 +89,7 @@ class TapReading(msgspec.Struct, frozen=True, kw_only=True):
             ),
             local_taps=self.local_taps[selected],
             reads=self.reads[selected],
+            no_taps=self.no_taps[selected],
             has_taps=self.has_taps[selected],
             num_rows=rows.shape[0],
         )
@@ -143,6 +146,7 @@ def _extend_reading(
             device=device,
         ),
         reads=reads_on_device,
+        no_taps=~reads_on_device,
         has_taps=reads_on_device.to(mask_dtype)[:, None],
         num_rows=total_rows,
         merged_rows=_to_device(torch.nonzero(reads).flatten(), device=device),
@@ -169,6 +173,7 @@ def _decode_reading(
         row_requests=None,
         local_taps=stripes.local_taps(taps, page_size=page_size),
         reads=reads,
+        no_taps=~reads,
         has_taps=reads.to(mask_dtype)[:, None],
         num_rows=req_pool_indices.shape[0],
     )
