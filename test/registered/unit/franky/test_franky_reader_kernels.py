@@ -23,6 +23,7 @@ from sglang.srt.franky.parts.reader.tap_attention import (
     TapReadings,
     TrtllmWorkspace,
 )
+from sglang.srt.franky.parts.reader.tap_gather import TapGather
 from sglang.srt.franky.parts.reader.tap_reading import TapReading
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -115,7 +116,7 @@ class TestReaderKernels(CustomTestCase):
                 read_rows=read_rows, stripes=stripes, page_size=_PAGE_SIZE
             ),
             starts_forward=True,
-            group=group,
+            gather=None if group is None else TapGather(group=group, multicast=None),
             workspace=TrtllmWorkspace.for_device("cuda"),
         )
 

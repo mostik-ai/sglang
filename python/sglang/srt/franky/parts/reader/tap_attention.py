@@ -20,9 +20,9 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.franky.cache.tap_read_rows import TapReadRows
     from sglang.srt.franky.cache.tap_stripes import TapStripes
+    from sglang.srt.franky.parts.reader.tap_gather import TapGather
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 # Split-KV completion tickets, one int32 a query head of a row, for 2^18 rows of
@@ -106,7 +106,7 @@ class TapAttention:
         pages: torch.Tensor,
         readings: TapReadings,
         starts_forward: bool,
-        group: Optional[GroupCoordinator],
+        gather: Optional[TapGather],
         workspace: Optional[TrtllmWorkspace],
     ) -> None:
         """
@@ -115,13 +115,13 @@ class TapAttention:
                 the encoder.
             starts_forward: whether this reader runs first in each forward and
                 makes the forward's reading.
-            group: the attention-TP group whose ranks split the taps; None
-                when this rank keeps them all.
+            gather: how the attention-TP ranks that split the taps gather their
+                results; None when this rank keeps them all.
         """
         self.pages = pages
         self.readings = readings
         self.starts_forward = starts_forward
-        self.group = group
+        self.gather = gather
         self.workspace = workspace
 
     def attend(
@@ -179,7 +179,7 @@ class TapAttention:
     def _attend_rows(
         self, queries: torch.Tensor, reading: TapReading, *, out: torch.Tensor
     ) -> None:
-        if self.group is None:
+        if self.gather is None:
             self._attend_locally(queries, reading, out=out, lse=None)
             return
         local_out = torch.empty_like(queries)
@@ -214,13 +214,8 @@ class TapAttention:
         if local_out.shape[0] == 0:
             return
         packed = franky_reader_pack(local_out, lse, local_taps)
-        num_ranks = self.group.world_size
-        gathered = packed.new_empty((num_ranks * packed.shape[0], *packed.shape[1:]))
-        self.group.all_gather_into_tensor(gathered, packed)
         franky_reader_merge(
-            gathered.view(num_ranks, *packed.shape),
-            out=out,
-            lse_is_base_e=lse_is_base_e,
+            self.gather.gather(packed), out=out, lse_is_base_e=lse_is_base_e
         )
 
     def _attend_locally(

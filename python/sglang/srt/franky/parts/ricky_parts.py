@@ -6,6 +6,10 @@ import torch
 from torch import nn
 from typing_extensions import override
 
+from sglang.kernels.ops.attention.franky_reader_merge import PACK_COLUMNS
+from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+    recommended_max_tokens,
+)
 from sglang.srt.distributed.parallel_state import get_attn_tp_group
 from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
 from sglang.srt.franky.cache.tap_read_rows import TapReadRows
@@ -15,6 +19,7 @@ from sglang.srt.franky.parts.reader.tap_attention import (
     TapReadings,
     TrtllmWorkspace,
 )
+from sglang.srt.franky.parts.reader.tap_gather import TapGather
 from sglang.srt.runtime_context import get_franky
 from sglang.srt.utils.common import ceil_div
 
@@ -155,6 +160,14 @@ class RickyParts(FrankyParts):
         )
         return self.injector.inject(output=output, addition=reader_output)
 
+    def _gather(self) -> TapGather:
+        return TapGather.build(
+            group=get_attn_tp_group(),
+            max_rows=recommended_max_tokens(include_prefill=True, floor=256),
+            row_size=self.config.reader.num_queries
+            * (self.config.encoder.output_size + PACK_COLUMNS),
+        )
+
     def _build_attentions(self) -> dict[int, TapAttention]:
         readings = TapReadings(
             read_rows=self.read_rows,
@@ -162,14 +175,16 @@ class RickyParts(FrankyParts):
             page_size=self.config.tap_page_size,
         )
         workspace = TrtllmWorkspace.for_device(self.device)
-        group = get_attn_tp_group() if self.stripes.num_ranks > 1 else None
+        gather = (
+            self._gather() if self.stripes.num_ranks > 1 and self._readers else None
+        )
         first_index = min(self._readers, default=None)
         return {
             index: TapAttention(
                 pages=self.tap_cache.buffers.pages(index),
                 readings=readings,
                 starts_forward=index == first_index,
-                group=group,
+                gather=gather,
                 workspace=workspace,
             )
             for index in self._readers

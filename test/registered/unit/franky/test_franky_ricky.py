@@ -546,7 +546,7 @@ class TestRickyParts(_Files):
             [True, False],
         )
         self.assertIs(parts._attentions[0].readings, parts._attentions[1].readings)
-        self.assertIsNone(parts._attentions[0].group)
+        self.assertIsNone(parts._attentions[0].gather)
 
     def test_the_pool_holds_the_taps_of_the_kv_tokens_and_rows_fit_the_context(
         self,

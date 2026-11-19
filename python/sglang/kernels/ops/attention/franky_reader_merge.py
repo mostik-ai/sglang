@@ -4,7 +4,9 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.dcp_kernels import _dcp_lse_combine_kernel
 
-LSE_COLUMNS = 2
+# Each packed row is the attended taps, then the log-sum-exp in two columns and
+# padding, so rows stay whole 16-byte vectors for NVLink multicast stores.
+PACK_COLUMNS = 8
 
 
 @triton.jit
@@ -39,22 +41,22 @@ def franky_reader_pack(
     out: torch.Tensor, lse: torch.Tensor, local_taps: torch.Tensor
 ) -> torch.Tensor:
     """One rank's reader results, packed for the ranks to gather: each query's
-    attended taps, then its log-sum-exp in the next two columns; a row that
-    reads no taps on this rank gets zeros and -inf.
+    attended taps, then its log-sum-exp in the next two columns, then padding to
+    ``PACK_COLUMNS``; a row that reads no taps on this rank gets zeros and -inf.
 
     Args:
         out: [rows, queries, tap_size] bfloat16.
         lse: [rows, queries] float32.
         local_taps: [rows] int32, the taps each row reads on this rank.
     Returns:
-        [rows, queries, tap_size + 2] bfloat16.
+        [rows, queries, tap_size + PACK_COLUMNS] bfloat16.
     """
     rows, queries, tap_size = out.shape
-    packed = out.new_empty((rows, queries, tap_size + LSE_COLUMNS))
+    packed = out.new_empty((rows, queries, tap_size + PACK_COLUMNS))
     if rows == 0:
         return packed
     flat_out = out.view(rows * queries, tap_size)
-    flat_packed = packed.view(rows * queries, tap_size + LSE_COLUMNS)
+    flat_packed = packed.view(rows * queries, tap_size + PACK_COLUMNS)
     flat_packed_lse = flat_packed.view(torch.float32)
     _franky_reader_pack_kernel[(rows * queries,)](
         flat_out,
@@ -77,17 +79,17 @@ def franky_reader_merge(
     """Merge the ranks' packed results by their log-sum-exp into ``out``.
 
     Args:
-        gathered: [ranks, rows, queries, tap_size + 2], every rank's
-            ``franky_reader_pack`` result.
+        gathered: [ranks, rows, queries, tap_size + PACK_COLUMNS], every
+            rank's ``franky_reader_pack`` result.
         out: [rows, queries, tap_size], written.
         lse_is_base_e: whether the log-sum-exp is natural, else base 2.
     """
     ranks, rows, queries, packed_size = gathered.shape
     if rows == 0:
         return
-    tap_size = packed_size - LSE_COLUMNS
+    tap_size = packed_size - PACK_COLUMNS
     results = gathered[..., :tap_size]
-    lse = gathered.view(torch.float32)[..., tap_size // LSE_COLUMNS]
+    lse = gathered.view(torch.float32)[..., tap_size // 2]
     _dcp_lse_combine_kernel[(rows, queries)](
         results,
         lse,

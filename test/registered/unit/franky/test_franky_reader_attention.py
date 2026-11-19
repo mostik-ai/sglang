@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention.franky_reader_merge import PACK_COLUMNS
 from sglang.srt.franky.cache.generated_spans import (
     FrankyGeneratedSpans,
     GeneratedSpan,
@@ -19,6 +20,7 @@ from sglang.srt.franky.cache.tap_read_rows import TapReadRows
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts.reader import tap_attention
 from sglang.srt.franky.parts.reader.tap_attention import TapAttention, TapReadings
+from sglang.srt.franky.parts.reader.tap_gather import TapGather
 from sglang.srt.franky.parts.reader.tap_reading import TapReading
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -81,14 +83,14 @@ def _flash_attention_on_cpu(
 def _pack_on_cpu(out, lse, local_taps):
     rows, queries, size = out.shape
     reads = (local_taps > 0)[:, None]
-    packed = out.new_zeros((rows, queries, size + 2))
+    packed = out.new_zeros((rows, queries, size + PACK_COLUMNS))
     packed[..., :size] = torch.where(reads[..., None], out, 0)
     packed.view(torch.float32)[..., size // 2] = torch.where(reads, lse, float("-inf"))
     return packed
 
 
 def _merge_on_cpu(gathered, *, out, lse_is_base_e):
-    size = gathered.shape[-1] - 2
+    size = gathered.shape[-1] - PACK_COLUMNS
     lse = gathered.view(torch.float32)[..., size // 2]
     lse = lse if lse_is_base_e else lse * torch.log(torch.tensor(2.0))
     weights = torch.softmax(lse, dim=0).nan_to_num(0.0)
@@ -301,7 +303,7 @@ class TestTapAttention(CustomTestCase):
                 page_size=_PAGE_SIZE,
             ),
             starts_forward=True,
-            group=group,
+            gather=None if group is None else TapGather(group=group, multicast=None),
             workspace=None,
         )
 
