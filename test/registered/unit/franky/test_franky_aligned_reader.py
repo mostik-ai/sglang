@@ -186,13 +186,16 @@ class _FixedTaps:
 
 
 class TestAlignedReader(CustomTestCase):
-    def _reader(self, *, replace: bool = False) -> AlignedReader:
+    def _reader(
+        self, *, replace: bool = False, replace_weight: float = 1.0
+    ) -> AlignedReader:
         torch.manual_seed(0)
         reader = AlignedReader(
             input_size=_OUTPUT_SIZE,
             ricky_hidden_size=_RICKY_HIDDEN,
             output_scale=2.0,
             replace=replace,
+            replace_weight=replace_weight,
         )
         torch.nn.init.normal_(reader.projection.weight)
         torch.nn.init.ones_(reader.projection.bias)
@@ -219,30 +222,32 @@ class TestAlignedReader(CustomTestCase):
         self.assertTrue(torch.allclose(added[reads], expected[reads], atol=1e-6))
         self.assertTrue(torch.all(added[~reads] == 0))
 
-    def test_a_replacing_row_ends_at_the_scaled_map_and_others_add_exact_zeros(self):
-        reader = self._reader(replace=True)
-        taps = torch.randn(4, _OUTPUT_SIZE)
-        reads = torch.tensor([True, False, True, False])
-        residual = 10 * torch.randn(4, _RICKY_HIDDEN)
-        # a CUDA graph's padding row may hold anything, and must still gain zero
-        residual[3] = float("nan")
+    def test_a_replacing_row_moves_its_weight_toward_the_map_and_others_add_zeros(self):
+        for weight in (1.0, 0.5):
+            reader = self._reader(replace=True, replace_weight=weight)
+            taps = torch.randn(4, _OUTPUT_SIZE)
+            reads = torch.tensor([True, False, True, False])
+            residual = 10 * torch.randn(4, _RICKY_HIDDEN)
+            # a CUDA graph's padding row may hold anything, and must still gain zero
+            residual[3] = float("nan")
 
-        added = reader(
-            tap_cache=_FixedTaps(
-                AlignedTaps(
-                    taps=taps, reads=reads, positions=[0, 1, 2, 3], requests=[0] * 4
-                )
-            ),
-            encoder_id=0,
-            residual=residual,
-            forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
-        )
+            added = reader(
+                tap_cache=_FixedTaps(
+                    AlignedTaps(
+                        taps=taps, reads=reads, positions=[0, 1, 2, 3], requests=[0] * 4
+                    )
+                ),
+                encoder_id=0,
+                residual=residual,
+                forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+            )
 
-        expected = 2.0 * reader.projection(taps.to(TAP_DTYPE).float())
-        self.assertTrue(
-            torch.allclose((residual + added)[reads], expected[reads], atol=1e-5)
-        )
-        self.assertTrue(torch.all(added[~reads] == 0))
+            mapped = 2.0 * reader.projection(taps.to(TAP_DTYPE).float())
+            expected = residual + weight * (mapped - residual)
+            self.assertTrue(
+                torch.allclose((residual + added)[reads], expected[reads], atol=1e-5)
+            )
+            self.assertTrue(torch.all(added[~reads] == 0))
 
     def test_a_decode_forward_adds_zeros(self):
         for replace in (False, True):
@@ -323,6 +328,23 @@ class TestAlignedConfig(CustomTestCase):
                 input_size=_OUTPUT_SIZE, ricky_hidden_size=_RICKY_HIDDEN
             )
             self.assertIs(reader.replace, replace)
+
+    def test_a_replace_weight_needs_replace_and_a_share_in_zero_to_one(self):
+        reader = msgspec.json.decode(
+            b'{"type": "aligned", "layers": [12], "output_scale": 1, "replace": true,'
+            b' "replace_weight": 0.5}',
+            type=ReaderConfig,
+        ).build(input_size=_OUTPUT_SIZE, ricky_hidden_size=_RICKY_HIDDEN)
+        self.assertEqual(reader.replace_weight, 0.5)
+        for body in (
+            b'{"type": "aligned", "layers": [12], "output_scale": 1, "replace_weight": 0.5}',
+            b'{"type": "aligned", "layers": [12], "output_scale": 1, "replace": true,'
+            b' "replace_weight": 0}',
+            b'{"type": "aligned", "layers": [12], "output_scale": 1, "replace": true,'
+            b' "replace_weight": 1.5}',
+        ):
+            with self.assertRaises(msgspec.ValidationError):
+                msgspec.json.decode(body, type=ReaderConfig)
 
     def test_an_aligned_reader_without_a_positive_scale_is_refused(self):
         with self.assertRaises(msgspec.ValidationError):
