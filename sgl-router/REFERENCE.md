@@ -455,10 +455,20 @@ in the next block:
   ended with its last block, the router posts `/franky/end_chain` to its engines
   when it ends: after a stop, an error, or a client that left.
 - Blocks need token ids (`input_ids`, or text or chat the router renders) and
-  one sequence. Batches, `n` above 1, constrained decoding, hidden states,
-  routed experts and sessions are refused with `400`, as is chat the router
-  does not lower to `/generate`: it lowers chat only for the templates it
-  renders as SGLang does (see [Chat rendering](#chat-rendering)).
+  one sequence. Batches, `n` above 1, constrained decoding, hidden states and
+  sessions are refused with `400`, as is chat the router does not lower to
+  `/generate`: it lowers chat only for the templates it renders as SGLang does
+  (see [Chat rendering](#chat-rendering)).
+- With `return_routed_experts`, each block after the first asks Ricky for the
+  experts of its own tokens only (`routed_experts_start_len` at the forward of
+  the block's last input token), those its decode routed, and the chain's
+  response carries every block's rows joined: as one request's
+  `routed_experts`, from the client's `routed_experts_start_len`. A later
+  block's prefill that recomputes earlier tokens and routes them anew is left
+  out. Unary responses also carry Sandy's experts as
+  `franky_sandy_routed_experts`, the rows of every token of hers that a block
+  prefilled, joined in her ids' order: her prompt and the tokens before the
+  last block (see [Routed experts](#routed-experts)).
 - With `--franky-boundary-token-id ID` (such as the close of Ricky's thinking),
   a block also ends where Ricky writes `ID`, unless the client stops on it, and
   the next block starts a new answer: the router ends the chain on its engines
@@ -542,11 +552,47 @@ router gets `--franky-sandy-tokenizer-path` (Sandy's model files) and
   rendering, counted from its start, so a chat's earlier turns keep the same
   tokens in Sandy's cache. Ricky's `franky_sandy_input_ids` and
   `franky_sandy_spans` hold the kept tokens.
-- A chat gets `400` when it sends `input_ids`, when the router leaves it to the
+- Clients that keep both sides' ids, as a trainer does over the turns of a
+  session, send them: `/generate`, and chats that send `input_ids`, send
+  Sandy's ids of the prompt as `franky_sandy_input_ids`, any length, and for
+  the earlier answers `franky_generated_spans`, `franky_sandy_spans` and
+  `franky_sandy_block_starts`, one list per answer: Sandy's tokens before each
+  of the answer's blocks after the first, counted from the start of her ids,
+  as a response reported them. Ricky recomputes each earlier answer with the
+  taps its decode read; an answer without block starts reads before its whole
+  run. Such a request without `franky_sandy_input_ids` gets `400`, as does
+  `/v1/completions`.
+- With blocks, each block's Sandy ids extend the last block's: the router
+  decodes Ricky's ids of the finished blocks with Ricky's tokenizer (without
+  special tokens, as the engine returns text), encodes the text they added with
+  Sandy's, and appends those tokens; a character Ricky's ids end inside of
+  waits for the next block. Ricky's block gets Sandy's ids and, in
+  `franky_chain.sandy_block_starts`, her tokens before each earlier block of
+  the answer. An answer ended at a boundary token joins the earlier answers in
+  Sandy's tokens too.
+- A unary `/generate` response, with or without blocks, carries in its
+  `meta_info` `franky_sandy_output_ids`, Sandy's tokens of the whole answer,
+  the last block's text too, made as the blocks made them, so that her ids of
+  the prompt and these extend every block's Sandy ids and a later turn's ids
+  can extend them; and `franky_sandy_block_starts`, her tokens before each
+  block after the first, counted from the start of her ids. An answer ended at
+  a boundary token continues in both: the next answer's tokens follow, and
+  its first block is one of the blocks after the first.
+- A chat without `input_ids` gets `400` when the router leaves it to the
   engine or Sandy's template does not render it, and when the two renderings
-  hold different numbers of answers. `/v1/completions` and `/generate` get
-  `400`: the router renders only chats for Sandy. `--franky-block-size` is
-  refused with these flags, since blocks count Ricky's tokens.
+  hold different numbers of answers.
+
+### Routed experts
+
+A Franky request with `return_routed_experts` gets Ricky's experts as SGLang
+returns them, `routed_experts`: per token from `routed_experts_start_len`, per
+MoE layer, its top-k experts, as base64 of int32 rows. Sandy's engine returns
+the experts of every token it prefills, its last one too, since each token's
+forward makes its taps; a unary response carries them as
+`franky_sandy_routed_experts` in the same encoding, from her first token, or
+from the client's `routed_experts_start_len` when she reads Ricky's tokens.
+A Sandy whose engine captures no experts (no `--enable-return-routed-experts`)
+adds none.
 
 ## Chat rendering
 

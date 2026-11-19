@@ -78,11 +78,13 @@ pub(super) fn prepare_franky_chat(
 
 /// A chat for Franky workers whose Sandy tokenizes on its own. The router
 /// renders it for both models: Sandy gets its own ids, and Ricky gets Sandy's
-/// input length and, for each earlier answer, its runs in both renderings.
+/// input length and, for each earlier answer, its runs in both renderings. A
+/// chat that sends `input_ids` sends Sandy's too, as `franky_sandy_input_ids`,
+/// with its earlier answers in both sides' ids, and the router renders nothing.
 ///
-/// Errors: `ApiError::BadRequest` for a chat with `input_ids`, one the router
-/// leaves to the engine or Sandy's template does not render, and one whose two
-/// renderings hold different numbers of answers.
+/// Errors: `ApiError::BadRequest` for a chat with `input_ids` but not Sandy's,
+/// one the router leaves to the engine or Sandy's template does not render,
+/// and one whose two renderings hold different numbers of answers.
 #[allow(clippy::too_many_arguments)]
 fn prepare_chat_for_both_tokenizers(
     ctx: &AppContext,
@@ -95,10 +97,18 @@ fn prepare_chat_for_both_tokenizers(
     policy_needs_request_tokens: bool,
 ) -> Result<PreparedRequest, ApiError> {
     if has_caller_input_ids(chat) {
-        return Err(ApiError::BadRequest(format!(
-            "model {model} is served by Franky workers whose Sandy tokenizes on its own, \
-             so the router renders each chat for both models; send messages without input_ids"
-        )));
+        let sandy_ids = caller_sandy_ids(chat, &model)?;
+        let mut request = PreparedRequest::openai(
+            ctx,
+            CHAT_PATH,
+            model,
+            fields,
+            headers,
+            body,
+            policy_needs_request_tokens,
+        )?;
+        request.set_franky_sandy_ids(sandy_ids);
+        return Ok(request);
     }
     let Some(adapter) = ctx.franky_chat_adapter.as_deref() else {
         return Err(cannot_mark_answers(&model, "with --franky-chat-adapter"));
@@ -137,6 +147,24 @@ fn prepare_chat_for_both_tokenizers(
     }
     request.add_franky_sandy_chat(&generated_spans, sandy_chat)?;
     Ok(request)
+}
+
+/// The `franky_sandy_input_ids` of a chat that sends its own `input_ids`.
+///
+/// Errors: `ApiError::BadRequest` when they are missing or not token ids.
+fn caller_sandy_ids(chat: &Value, model: &ModelId) -> Result<Vec<u32>, ApiError> {
+    let ids = chat
+        .get("franky_sandy_input_ids")
+        .filter(|ids| !ids.is_null())
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "model {model} is served by Franky workers whose Sandy tokenizes on its own, \
+                 so a chat that sends input_ids sends Sandy's as franky_sandy_input_ids"
+            ))
+        })?;
+    serde_json::from_value(ids.clone()).map_err(|_| {
+        ApiError::BadRequest("franky_sandy_input_ids must be one prompt's token ids".into())
+    })
 }
 
 fn router_marks_earlier_answers(chat: &Value) -> Result<bool, ApiError> {

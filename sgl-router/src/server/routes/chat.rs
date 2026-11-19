@@ -27,7 +27,7 @@ use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
-use blocks::BlockChain;
+use blocks::{sandy::SandyChain, BlockChain};
 use bytes::Bytes;
 use earlier_answers::prepare_franky_chat;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
@@ -120,9 +120,31 @@ async fn serve_http(
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let (mut request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
-    match BlockChain::plan(&ctx, &mut request, &headers)? {
-        Some(chain) => chain.serve(&ctx, &routing, headers, start).await,
-        None => routing.dispatch(&ctx, request, headers, start).await,
+    if let Some(chain) = BlockChain::plan(&ctx, &mut request, &headers)? {
+        return chain.serve(&ctx, &routing, headers, start).await;
+    }
+    let sandy = sandy_of_unary_generate(&ctx, &request)?;
+    let response = routing.dispatch(&ctx, request, headers, start).await?;
+    match sandy {
+        Some(sandy) => sandy.add_answer_to(response).await,
+        None => Ok(response),
+    }
+}
+
+/// Sandy's ids of a unary `/generate` request served in one block, for its
+/// response, when Franky workers whose Sandy tokenizes on its own serve it.
+fn sandy_of_unary_generate(
+    ctx: &AppContext,
+    request: &PreparedRequest,
+) -> Result<Option<SandyChain>, ApiError> {
+    if request.path != GENERATE_PATH || request.streaming || request.responder.is_some() {
+        return Ok(None);
+    }
+    match request.franky_sandy_ids() {
+        Some(prompt_ids) if serves_franky(ctx, &request.model) => {
+            SandyChain::of_prompt(ctx, &request.model.0, prompt_ids.to_vec())
+        }
+        _ => Ok(None),
     }
 }
 
@@ -244,8 +266,9 @@ async fn prepare<'a>(
         Endpoint::Generate => {
             let model = served_model();
             let routing = ModelRouting::lookup(ctx, &model)?;
-            refuse_franky_prompts_rendered_by_the_engine(ctx, &model, GENERATE_PATH)?;
-            (routing, PreparedRequest::generate(ctx, model, body)?)
+            let request = PreparedRequest::generate(ctx, model, body)?;
+            require_franky_sandy_ids(ctx, &request)?;
+            (routing, request)
         }
         Endpoint::Embeddings | Endpoint::Classify => {
             let path = endpoint.path();
@@ -281,8 +304,25 @@ fn require_plain_workers(ctx: &AppContext, model: &ModelId, path: &str) -> Resul
     Ok(())
 }
 
+/// A Franky `/generate` request for a Sandy that tokenizes on its own sends her
+/// ids, as the router renders only chats.
+fn require_franky_sandy_ids(ctx: &AppContext, request: &PreparedRequest) -> Result<(), ApiError> {
+    if ctx.franky_sandy.is_some()
+        && serves_franky(ctx, &request.model)
+        && !request.has_franky_sandy_ids()
+    {
+        return Err(ApiError::BadRequest(format!(
+            "model {} is served by Franky workers whose Sandy tokenizes on its own, so a \
+             /generate request sends Sandy's token ids of its prompt as \
+             franky_sandy_input_ids beside input_ids",
+            request.model
+        )));
+    }
+    Ok(())
+}
+
 /// A Franky Sandy that tokenizes on its own reads ids the router rendered for
-/// it, and the router renders chats only.
+/// it or the client sent, and the router renders chats only.
 fn refuse_franky_prompts_rendered_by_the_engine(
     ctx: &AppContext,
     model: &ModelId,

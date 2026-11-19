@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::server::error::ApiError;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde_json::{Map, Value};
 
 const PER_TOKEN_FIELDS: [&str; 5] = [
@@ -19,6 +22,9 @@ const PROMPT_FIELDS: [&str; 6] = [
     "input_token_ids_logprobs",
 ];
 const SUMMED_COUNTS: [&str; 2] = ["completion_tokens", "reasoning_tokens"];
+/// Per-token rows, base64 of fixed-size records, that each block returns for
+/// its own tokens only and the chain joins in order.
+const JOINED_ROWS: [&str; 2] = ["routed_experts", "franky_sandy_routed_experts"];
 const BLOCK_REPORT_FIELDS: [&str; 7] = [
     "prompt_tokens",
     "cached_tokens",
@@ -35,6 +41,8 @@ struct Generated {
     output_ids: Vec<Value>,
     token_fields: Map<String, Value>,
     counts: [u64; SUMMED_COUNTS.len()],
+    /// Per field of `JOINED_ROWS`, each block's rows, base64.
+    rows: [Vec<String>; JOINED_ROWS.len()],
 }
 
 impl Generated {
@@ -58,6 +66,11 @@ impl Generated {
                 append(&mut self.token_fields, field, values);
             }
         }
+        for (field, rows) in JOINED_ROWS.iter().zip(self.rows.iter_mut()) {
+            if let Some(block_rows) = frame["meta_info"][field].as_str() {
+                rows.push(block_rows.to_owned());
+            }
+        }
     }
 
     fn extend(&mut self, other: Generated) {
@@ -70,6 +83,9 @@ impl Generated {
         }
         for (count, other) in self.counts.iter_mut().zip(other.counts) {
             *count += other;
+        }
+        for (rows, other) in self.rows.iter_mut().zip(other.rows) {
+            rows.extend(other);
         }
     }
 
@@ -88,6 +104,27 @@ impl Generated {
             }
         }
     }
+}
+
+fn token_ids(ids: &[Value]) -> Vec<u32> {
+    ids.iter()
+        .filter_map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+        .collect()
+}
+
+/// The rows of every block, in order, as one base64 string, as one request
+/// would have returned them.
+///
+/// Errors: `ApiError::Internal` for a block's rows that are not base64.
+fn joined_rows<'a>(blocks: impl Iterator<Item = &'a String>) -> Result<String, ApiError> {
+    let mut bytes = Vec::new();
+    for block in blocks {
+        let rows = STANDARD.decode(block).map_err(|error| {
+            ApiError::Internal(anyhow::Error::new(error).context("decode a Franky block's rows"))
+        })?;
+        bytes.extend(rows);
+    }
+    Ok(STANDARD.encode(bytes))
 }
 
 fn fields_of(meta: &Value, names: &[&str]) -> Map<String, Value> {
@@ -147,12 +184,16 @@ impl ChainOutput {
     }
 
     /// The chain's frame for the unary response of the current block.
-    pub(super) fn whole_block_frame(&mut self, frame: Value) -> Value {
+    ///
+    /// Errors: `ApiError::Internal` for a block's rows that are not base64.
+    pub(super) fn whole_block_frame(&mut self, frame: Value) -> Result<Value, ApiError> {
         self.chain_frame(frame, false)
     }
 
     /// The chain's frame for one streamed frame of the current block.
-    pub(super) fn streamed_frame(&mut self, frame: Value) -> Value {
+    ///
+    /// Errors: `ApiError::Internal` for a block's rows that are not base64.
+    pub(super) fn streamed_frame(&mut self, frame: Value) -> Result<Value, ApiError> {
         self.chain_frame(frame, self.incremental_streaming_output)
     }
 
@@ -177,6 +218,12 @@ impl ChainOutput {
         self.last_block
     }
 
+    /// Whether the last frame ended the chain: it carries a finish reason that
+    /// cuts no block.
+    pub(super) fn ends_chain(&self) -> bool {
+        !self.finish_reason.is_null() && !self.block_cut()
+    }
+
     pub(super) fn finish_block(&mut self) {
         let current = std::mem::take(&mut self.current);
         self.finished.extend(current);
@@ -193,15 +240,22 @@ impl ChainOutput {
         &self.finished.output_ids
     }
 
-    /// The text every finished block generated, in order.
-    pub(super) fn generated_text(&self) -> &str {
-        &self.finished.text
+    /// The token ids every finished block generated, in order.
+    pub(super) fn generated_token_ids(&self) -> Vec<u32> {
+        token_ids(&self.finished.output_ids)
     }
 
-    fn chain_frame(&mut self, mut frame: Value, is_delta: bool) -> Value {
+    /// The token ids every block generated, the current one's so far too.
+    pub(super) fn all_generated_token_ids(&self) -> Vec<u32> {
+        let mut ids = self.generated_token_ids();
+        ids.extend(token_ids(&self.current.output_ids));
+        ids
+    }
+
+    fn chain_frame(&mut self, mut frame: Value, is_delta: bool) -> Result<Value, ApiError> {
         self.record(&frame, is_delta);
         let Value::Object(fields) = &mut frame else {
-            return frame;
+            return Ok(frame);
         };
         let mut meta = match fields.remove("meta_info") {
             Some(Value::Object(meta)) => meta,
@@ -227,8 +281,21 @@ impl ChainOutput {
         if self.block_cut() {
             meta.insert("finish_reason".into(), Value::Null);
         }
+        for (index, field) in JOINED_ROWS.iter().enumerate() {
+            if !meta.contains_key(*field) {
+                continue;
+            }
+            // A block's frame carries its own rows; the chain's last carries all.
+            if self.block_cut() {
+                meta.remove(*field);
+                continue;
+            }
+            let blocks = self.finished.rows[index].iter();
+            let rows = joined_rows(blocks.chain(&self.current.rows[index]))?;
+            meta.insert((*field).into(), rows.into());
+        }
         fields.insert("meta_info".into(), Value::Object(meta));
-        frame
+        Ok(frame)
     }
 
     fn record(&mut self, frame: &Value, is_delta: bool) {
@@ -276,7 +343,9 @@ mod tests {
     fn a_later_cumulative_frame_continues_the_finished_blocks() {
         let mut output = ChainOutput::new("chain".into(), false, None);
         output.start_block(false);
-        let first = output.streamed_frame(frame("ab", &[1, 2], 2, length(2)));
+        let first = output
+            .streamed_frame(frame("ab", &[1, 2], 2, length(2)))
+            .unwrap();
         assert!(output.block_cut());
         assert_eq!(first["meta_info"]["finish_reason"], Value::Null);
         output.finish_block();
@@ -284,7 +353,7 @@ mod tests {
         output.start_block(true);
         let mut later = frame("c", &[3], 1, Value::Null);
         later["meta_info"]["prompt_tokens"] = json!(11);
-        let later = output.streamed_frame(later);
+        let later = output.streamed_frame(later).unwrap();
 
         assert_eq!(later["text"], "abc");
         assert_eq!(later["output_ids"], json!([1, 2, 3]));
@@ -305,12 +374,18 @@ mod tests {
     fn incremental_frames_stay_deltas_and_their_counts_add_up() {
         let mut output = ChainOutput::new("chain".into(), true, None);
         output.start_block(false);
-        output.streamed_frame(frame("a", &[1], 1, Value::Null));
-        output.streamed_frame(frame("b", &[2], 2, length(2)));
+        output
+            .streamed_frame(frame("a", &[1], 1, Value::Null))
+            .unwrap();
+        output
+            .streamed_frame(frame("b", &[2], 2, length(2)))
+            .unwrap();
         output.finish_block();
 
         output.start_block(false);
-        let delta = output.streamed_frame(frame("c", &[3], 1, Value::Null));
+        let delta = output
+            .streamed_frame(frame("c", &[3], 1, Value::Null))
+            .unwrap();
 
         assert_eq!(delta["text"], "c");
         assert_eq!(delta["output_ids"], json!([3]));
@@ -323,12 +398,16 @@ mod tests {
         let stop = json!({"type": "stop", "matched": 7});
         let mut output = ChainOutput::new("chain".into(), false, None);
         output.start_block(false);
-        let stopped = output.streamed_frame(frame("a", &[7], 1, stop.clone()));
+        let stopped = output
+            .streamed_frame(frame("a", &[7], 1, stop.clone()))
+            .unwrap();
         assert!(!output.block_cut());
         assert_eq!(stopped["meta_info"]["finish_reason"], stop);
 
         output.start_block(true);
-        let last = output.streamed_frame(frame("b", &[2], 1, length(1)));
+        let last = output
+            .streamed_frame(frame("b", &[2], 1, length(1)))
+            .unwrap();
         assert!(!output.block_cut());
         assert_eq!(last["meta_info"]["finish_reason"], length(1));
     }
@@ -337,14 +416,59 @@ mod tests {
     fn a_unary_block_is_one_whole_frame_even_with_incremental_streams() {
         let mut output = ChainOutput::new("chain".into(), true, None);
         output.start_block(false);
-        output.whole_block_frame(frame("ab", &[1, 2], 2, length(2)));
+        output
+            .whole_block_frame(frame("ab", &[1, 2], 2, length(2)))
+            .unwrap();
         output.finish_block();
         output.start_block(true);
 
-        let whole = output.whole_block_frame(frame("c", &[3], 1, length(1)));
+        let whole = output
+            .whole_block_frame(frame("c", &[3], 1, length(1)))
+            .unwrap();
 
         assert_eq!(whole["text"], "abc");
         assert_eq!(whole["output_ids"], json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn each_blocks_rows_join_in_the_chains_last_frame() {
+        let rows = |bytes: &[u8]| STANDARD.encode(bytes);
+        let mut output = ChainOutput::new("chain".into(), false, None);
+        output.start_block(false);
+        let mut first = frame("ab", &[1, 2], 2, length(2));
+        first["meta_info"]["routed_experts"] = json!(rows(&[1, 2, 3, 4]));
+        first["meta_info"]["franky_sandy_routed_experts"] = json!(rows(&[9]));
+        let cut = output.whole_block_frame(first).unwrap();
+        output.finish_block();
+        output.start_block(true);
+        let mut last = frame("c", &[3], 1, length(1));
+        last["meta_info"]["routed_experts"] = json!(rows(&[5, 6, 7, 8]));
+        last["meta_info"]["franky_sandy_routed_experts"] = json!(rows(&[10, 11]));
+
+        let whole = output.whole_block_frame(last).unwrap();
+
+        assert!(cut["meta_info"].get("routed_experts").is_none());
+        assert!(cut["meta_info"]
+            .get("franky_sandy_routed_experts")
+            .is_none());
+        assert_eq!(
+            whole["meta_info"]["routed_experts"],
+            json!(rows(&[1, 2, 3, 4, 5, 6, 7, 8]))
+        );
+        assert_eq!(
+            whole["meta_info"]["franky_sandy_routed_experts"],
+            json!(rows(&[9, 10, 11]))
+        );
+    }
+
+    #[test]
+    fn rows_that_are_not_base64_fail_the_chain() {
+        let mut output = ChainOutput::new("chain".into(), false, None);
+        output.start_block(true);
+        let mut last = frame("c", &[3], 1, length(1));
+        last["meta_info"]["routed_experts"] = json!("not base64!");
+
+        assert!(output.whole_block_frame(last).is_err());
     }
 
     #[test]
@@ -352,19 +476,23 @@ mod tests {
         let mut output = ChainOutput::new("chain".into(), false, Some(7));
         output.start_block(false);
         let boundary = json!({"type": "stop", "matched": 7});
-        let cut = output.whole_block_frame(frame("<3>", &[3, 7], 2, boundary));
+        let cut = output
+            .whole_block_frame(frame("<3>", &[3, 7], 2, boundary))
+            .unwrap();
 
         assert!(output.block_cut());
         assert!(output.ended_on_boundary());
         assert_eq!(cut["meta_info"]["finish_reason"], Value::Null);
 
         output.start_block(true);
-        let last = output.whole_block_frame(frame(
-            "<8>",
-            &[8, 7],
-            2,
-            json!({"type": "stop", "matched": 7}),
-        ));
+        let last = output
+            .whole_block_frame(frame(
+                "<8>",
+                &[8, 7],
+                2,
+                json!({"type": "stop", "matched": 7}),
+            ))
+            .unwrap();
         assert!(!output.block_cut());
         assert_eq!(
             last["meta_info"]["finish_reason"],

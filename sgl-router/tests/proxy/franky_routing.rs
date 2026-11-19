@@ -428,6 +428,8 @@ async fn a_failed_sandy_is_blamed_and_not_retried() {
 #[derive(Clone, Default)]
 struct BlockEngine {
     stop_at: usize,
+    /// Answers as Sandy does: its routed experts cover every input token.
+    prefill_only: bool,
     prompt_len: Arc<Mutex<Option<usize>>>,
     requests: Arc<Mutex<Vec<Value>>>,
     request_ids: Arc<Mutex<Vec<Option<String>>>>,
@@ -438,10 +440,23 @@ struct BlockEngine {
 
 impl BlockEngine {
     async fn start(stop_at: usize) -> (Self, String, Shutdown) {
-        let engine = Self {
+        Self::serve(Self {
             stop_at,
             ..Default::default()
-        };
+        })
+        .await
+    }
+
+    async fn start_sandy() -> (Self, String, Shutdown) {
+        Self::serve(Self {
+            stop_at: usize::MAX,
+            prefill_only: true,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn serve(engine: Self) -> (Self, String, Shutdown) {
         let app = axum::Router::new()
             .route("/generate", post(Self::generate))
             .route("/franky/end_chain", post(Self::end_chain))
@@ -490,8 +505,17 @@ impl BlockEngine {
             ids.truncate(position + 1);
             finish = json!({"type": "stop", "matched": ids[position]});
         }
+        let routed_experts = (request["return_routed_experts"] == json!(true)).then(|| {
+            let start = request["routed_experts_start_len"].as_u64().unwrap_or(0) as usize;
+            let end = if engine.prefill_only {
+                input
+            } else {
+                input + ids.len() - 1
+            };
+            position_rows(start..end)
+        });
         let frame = |ids: &[usize], finish: Value| {
-            json!({
+            let mut frame = json!({
                 "text": ids.iter().map(|id| format!("<{id}>")).collect::<String>(),
                 "output_ids": ids,
                 "meta_info": {
@@ -500,7 +524,11 @@ impl BlockEngine {
                     "completion_tokens": ids.len(),
                     "finish_reason": finish,
                 },
-            })
+            });
+            if let (Some(rows), false) = (&routed_experts, finish.is_null()) {
+                frame["meta_info"]["routed_experts"] = json!(rows);
+            }
+            frame
         };
         if request["stream"] != json!(true) {
             return Json(frame(&ids, finish)).into_response();
@@ -555,6 +583,27 @@ impl BlockEngine {
     }
 }
 
+/// One int32 row per position, the position itself, as SGLang encodes routed
+/// experts.
+fn position_rows(positions: std::ops::Range<usize>) -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = positions
+        .flat_map(|position| (position as i32).to_le_bytes())
+        .collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn rows_of(encoded: &Value) -> Vec<i32> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_str().unwrap())
+        .unwrap();
+    bytes
+        .chunks(4)
+        .map(|row| i32::from_le_bytes(row.try_into().unwrap()))
+        .collect()
+}
+
 fn generate(body: Value) -> Request<Body> {
     Request::post("/generate")
         .header("content-type", "application/json")
@@ -566,7 +615,7 @@ type Shutdown = tokio::sync::oneshot::Sender<()>;
 
 async fn blocks_router(stop_at: usize) -> (Arc<AppContext>, [BlockEngine; 2], [Shutdown; 2]) {
     let (ricky, ricky_url, ricky_stop) = BlockEngine::start(stop_at).await;
-    let (sandy, sandy_url, sandy_stop) = BlockEngine::start(usize::MAX).await;
+    let (sandy, sandy_url, sandy_stop) = BlockEngine::start_sandy().await;
     let ctx = franky_ctx_with_blocks(
         &[("r", &ricky_url, WorkerMode::Plain)],
         &[("s", &sandy_url)],
@@ -738,6 +787,7 @@ async fn requests_blocks_cannot_serve_are_refused() {
         json!({"input_ids": [1, 2], "sampling_params": {"max_new_tokens": 8, "n": 2}}),
         json!({"input_ids": [1, 2], "sampling_params": {"max_new_tokens": 8, "regex": "a+"}}),
         json!({"input_ids": [1, 2], "return_hidden_states": true}),
+        json!({"input_ids": [1, 2], "session_params": {"id": "s"}}),
     ] {
         let res = build_router(Arc::clone(&ctx))
             .oneshot(generate(body.clone()))
@@ -751,6 +801,152 @@ async fn requests_blocks_cannot_serve_are_refused() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     assert!(ricky.requests().is_empty());
+}
+
+/// Each block asks Ricky for the experts of its own tokens and Sandy for those
+/// of the tokens she has not prefilled, and the response joins them: Ricky's
+/// from his prompt's first token to his answer's last forward, Sandy's over
+/// every token she prefilled.
+#[tokio::test]
+async fn a_chain_joins_each_blocks_routed_experts_on_both_sides() {
+    let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "return_routed_experts": true,
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = answer_of(res).await;
+    assert_eq!(answer["output_ids"].as_array().unwrap().len(), 10);
+    let starts = |engine: &BlockEngine| -> Vec<Value> {
+        engine
+            .requests()
+            .iter()
+            .map(|request| request["routed_experts_start_len"].clone())
+            .collect()
+    };
+    assert_eq!(starts(&ricky), [Value::Null, json!(6), json!(10)]);
+    assert_eq!(starts(&sandy), [Value::Null, json!(3), json!(7)]);
+    assert_eq!(
+        rows_of(&answer["meta_info"]["routed_experts"]),
+        (0..12).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rows_of(&answer["meta_info"]["franky_sandy_routed_experts"]),
+        (0..11).collect::<Vec<_>>()
+    );
+}
+
+/// A router running blocks of 4 for a Sandy that tokenizes on her own, Kimi
+/// K3's; Ricky's tokens are the tiny byte-level tokenizer's.
+async fn own_tokenizer_router(
+    stop_at: usize,
+) -> (
+    Arc<AppContext>,
+    [BlockEngine; 2],
+    [Shutdown; 2],
+    tempfile::TempDir,
+) {
+    let (ricky, ricky_url, ricky_stop) = BlockEngine::start(stop_at).await;
+    let (sandy, sandy_url, sandy_stop) = BlockEngine::start_sandy().await;
+    let mut ctx = Arc::into_inner(franky_ctx_with_blocks(
+        &[("r", &ricky_url, WorkerMode::Plain)],
+        &[("s", &sandy_url)],
+        1,
+        false,
+        Some(4),
+        None,
+    ))
+    .unwrap();
+    let kimi = crate::common::kimi_k3_fixture::tokenizer();
+    let sandy_config = sgl_router::config::FrankySandyConfig {
+        tokenizer_path: kimi.path().join("tiktoken.model").display().to_string(),
+        chat_adapter: sgl_router::config::ChatTemplateAdapterKind::KimiK3,
+        keep_every: std::num::NonZeroUsize::MIN,
+    };
+    ctx.franky_sandy = Some(Arc::new(
+        sgl_router::tokenizer::franky_sandy::FrankySandyTokens::load(
+            &sandy_config,
+            Default::default(),
+        )
+        .unwrap(),
+    ));
+    (
+        Arc::new(ctx),
+        [ricky, sandy],
+        [ricky_stop, sandy_stop],
+        kimi,
+    )
+}
+
+/// Each block's Sandy ids extend the last block's with her tokens of Ricky's
+/// finished blocks, Ricky's blocks name where each starts in her tokens, and
+/// the response carries her tokens of the whole answer and the later blocks'
+/// starts, as one function made them.
+#[tokio::test]
+async fn a_chain_makes_sandys_tokens_of_each_finished_block() {
+    let (ctx, [ricky, sandy], _stop, _kimi) = own_tokenizer_router(10).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "franky_sandy_input_ids": [40, 41],
+        "return_routed_experts": true,
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = answer_of(res).await;
+    let ricky_requests = ricky.requests();
+    let sandy_requests = sandy.requests();
+    assert_eq!(ricky_requests.len(), 3);
+    let sandy_ids: Vec<Vec<Value>> = sandy_requests
+        .iter()
+        .map(|request| request["input_ids"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(sandy_ids[0], [json!(40), json!(41)]);
+    for (earlier, later) in sandy_ids.iter().zip(&sandy_ids[1..]) {
+        assert!(later.len() > earlier.len(), "{sandy_ids:?}");
+        assert!(later.starts_with(earlier), "{sandy_ids:?}");
+    }
+    let starts: Vec<usize> = sandy_ids.iter().map(Vec::len).collect();
+    for (block, (ricky_request, sandy_request)) in
+        ricky_requests.iter().zip(&sandy_requests).enumerate()
+    {
+        assert_eq!(
+            ricky_request["franky_sandy_input_ids"],
+            sandy_request["input_ids"]
+        );
+        assert_eq!(
+            ricky_request["franky_chain"]["sandy_block_starts"],
+            json!(starts[..block])
+        );
+        assert!(
+            sandy_request.get("franky_sandy_input_ids").is_none(),
+            "{sandy_request}"
+        );
+    }
+    let output = answer["meta_info"]["franky_sandy_output_ids"]
+        .as_array()
+        .unwrap();
+    assert!(output.starts_with(&sandy_ids[2][2..]), "{answer}");
+    assert!(output.len() > sandy_ids[2].len() - 2, "{answer}");
+    assert_eq!(
+        answer["meta_info"]["franky_sandy_block_starts"],
+        json!(starts[1..])
+    );
+    let sandy_rows = |request: &Value| request["routed_experts_start_len"].clone();
+    assert_eq!(
+        sandy_requests.iter().map(sandy_rows).collect::<Vec<_>>(),
+        [json!(0), json!(starts[0]), json!(starts[1])]
+    );
+    assert_eq!(
+        rows_of(&answer["meta_info"]["franky_sandy_routed_experts"]),
+        (0..starts[2] as i32).collect::<Vec<_>>()
+    );
 }
 
 /// Sandy reads her own view of a `/generate` prompt and Ricky his; the field

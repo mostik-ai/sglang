@@ -395,11 +395,21 @@ async fn a_sandy_with_its_own_tokenizer_refuses_what_the_router_cannot_render_fo
         json!({"model": DEEPSEEK_V4, "messages": [{"role": "user", "content": "Hi"}]});
     let completion = json!({"model": DEEPSEEK_V4, "prompt": "Hi", "max_tokens": 8});
     let generate = json!({"input_ids": [1, 2, 3]});
+    let generate_text = json!({"text": "Hi", "franky_sandy_input_ids": [7, 8]});
     for (path, body, names) in [
-        (CHAT_PATH, with_input_ids, "without input_ids"),
+        (
+            CHAT_PATH,
+            with_input_ids,
+            "sends Sandy's as franky_sandy_input_ids",
+        ),
         (CHAT_PATH, without_answers, "earlier answers"),
         ("/v1/completions", completion, "renders only chats"),
-        ("/generate", generate, "renders only chats"),
+        (
+            "/generate",
+            generate,
+            "franky_sandy_input_ids beside input_ids",
+        ),
+        ("/generate", generate_text, "one prompt's input_ids"),
     ] {
         let (FrankyPair { ricky, sandy, ctx }, _kimi) = pair_with_kimi_sandy().await;
 
@@ -410,4 +420,110 @@ async fn a_sandy_with_its_own_tokenizer_refuses_what_the_router_cannot_render_fo
         assert!(ricky.captured.lock().unwrap().last_body.is_none());
         assert!(sandy.captured.lock().unwrap().last_body.is_none());
     }
+}
+
+/// A trainer keeps both sides' ids over a session's turns and sends them: Ricky
+/// gets both sides' ids and earlier answers, Sandy her own ids alone.
+#[tokio::test]
+async fn a_generate_request_with_both_sides_ids_reaches_each_side() {
+    let (FrankyPair { ricky, sandy, ctx }, _kimi) = pair_with_kimi_sandy().await;
+    let body = json!({
+        "input_ids": [5, 6, 7, 8, 9, 10],
+        "franky_sandy_input_ids": [40, 41, 42, 43],
+        "franky_generated_spans": [[2, 4]],
+        "franky_sandy_spans": [[1, 3]],
+        "franky_sandy_block_starts": [[1, 2]],
+        "sampling_params": {"max_new_tokens": 2},
+    });
+
+    let (status, response) = post(Arc::new(ctx), "/generate", &body).await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let ricky_body = ricky.captured_json().await;
+    let sandy_body = sandy.captured_json().await;
+    assert_eq!(ricky_body["input_ids"], body["input_ids"]);
+    for field in [
+        "franky_sandy_input_ids",
+        "franky_generated_spans",
+        "franky_sandy_spans",
+        "franky_sandy_block_starts",
+    ] {
+        assert_eq!(ricky_body[field], body[field], "{ricky_body}");
+        assert!(sandy_body.get(field).is_none(), "{sandy_body}");
+    }
+    assert_eq!(sandy_body["input_ids"], json!([40, 41, 42, 43]));
+    assert_eq!(sandy_body["franky_room"], ricky_body["franky_room"]);
+}
+
+/// A unary answer comes with Sandy's tokens of the answer, which follow her
+/// prompt's ids, and no block starts after its first and only block.
+#[tokio::test]
+async fn a_unary_answer_carries_sandys_tokens_of_it() {
+    let (
+        FrankyPair {
+            ricky: _ricky,
+            sandy: _sandy,
+            ctx,
+        },
+        kimi,
+    ) = pair_with_kimi_sandy().await;
+    let ricky_tokenizer = ctx.tokenizers.get(DEEPSEEK_V4).unwrap();
+    let body = json!({
+        "input_ids": [5, 6, 7],
+        "franky_sandy_input_ids": [40, 41, 42, 43],
+        "sampling_params": {"max_new_tokens": 2},
+    });
+
+    let (status, response) = post(Arc::new(ctx), "/generate", &body).await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let response: Value = serde_json::from_str(&response).unwrap();
+    // The mock engine answers [1, 2].
+    let text =
+        sgl_router::tokenizer::adapter::decode_complete(&ricky_tokenizer, &[1, 2], true).unwrap();
+    let sandy = FrankySandyTokens::load(
+        &FrankySandyConfig {
+            tokenizer_path: kimi.path().join("tiktoken.model").display().to_string(),
+            chat_adapter: ChatTemplateAdapterKind::KimiK3,
+            keep_every: NonZeroUsize::MIN,
+        },
+        Default::default(),
+    )
+    .unwrap();
+    let answer = sandy.encode_answer_text(&text).unwrap();
+    assert_eq!(
+        response["meta_info"]["franky_sandy_output_ids"],
+        json!(answer)
+    );
+    assert_eq!(
+        response["meta_info"]["franky_sandy_block_starts"],
+        json!([])
+    );
+}
+
+/// A chat with `input_ids` that sends Sandy's too, as Miles' session server
+/// does, reaches each side with its own ids; the router renders nothing.
+#[tokio::test]
+async fn a_chat_with_both_sides_ids_reaches_each_side() {
+    let (FrankyPair { ricky, sandy, ctx }, _kimi) = pair_with_kimi_sandy().await;
+    let mut chat = chat_with_an_answer(DEEPSEEK_V4);
+    chat["input_ids"] = json!([5, 6, 7, 8]);
+    chat["franky_sandy_input_ids"] = json!([40, 41, 42]);
+    chat["franky_generated_spans"] = json!([[1, 3]]);
+    chat["franky_sandy_spans"] = json!([[1, 2]]);
+
+    let (status, response) = post(Arc::new(ctx), CHAT_PATH, &chat).await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let ricky_body = ricky.captured_json().await;
+    let sandy_body = sandy.captured_json().await;
+    assert_eq!(ricky_body["input_ids"], json!([5, 6, 7, 8]));
+    assert_eq!(ricky_body["franky_sandy_input_ids"], json!([40, 41, 42]));
+    assert_eq!(ricky_body["franky_generated_spans"], json!([[1, 3]]));
+    assert_eq!(ricky_body["franky_sandy_spans"], json!([[1, 2]]));
+    assert_eq!(sandy_body["input_ids"], json!([40, 41, 42]));
+    assert!(
+        sandy_body.get("franky_sandy_input_ids").is_none(),
+        "{sandy_body}"
+    );
 }

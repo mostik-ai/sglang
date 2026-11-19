@@ -27,11 +27,13 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use serde_json::Value;
 use sglang_api_types::runtime::v1::DisaggregatedParams;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 // Expose the selected decode worker to both PD workers and the client.
@@ -82,7 +84,12 @@ pub(super) async fn forward_request(
             if let Some(hint) = dispatched.decode_url_header {
                 response.headers_mut().insert(X_SGL_DECODE_URL, hint);
             }
-            response
+            match dispatched.sandy_body {
+                Some(sandy_body) => with_sandy_routed_experts(response, sandy_body)
+                    .await
+                    .unwrap_or_else(IntoResponse::into_response),
+                None => response,
+            }
         }
         Err(error) => error.into_response(),
     };
@@ -163,6 +170,9 @@ struct Dispatched<R> {
     log_context: RequestLogContext,
     decode_url_header: Option<HeaderValue>,
     retry_excluding: Vec<WorkerId>,
+    /// The body of the Sandy leg, for a request whose response carries
+    /// Sandy's routed experts.
+    sandy_body: Option<oneshot::Receiver<Bytes>>,
 }
 
 async fn dispatch<T: Transport>(
@@ -255,6 +265,14 @@ async fn dispatch<T: Transport>(
         engine_rid.as_deref(),
     )?;
     // Sandy computes the same prompt, or her own view of it, outside PD.
+    let (sandy_body_sink, sandy_body) =
+        match sandy.is_some() && request.returns_routed_experts && !request.streaming {
+            true => {
+                let (sink, receiver) = oneshot::channel();
+                (Some(sink), Some(receiver))
+            }
+            false => (None, None),
+        };
     let sandy_leg = match (sandy, &franky_room) {
         (Some(sandy), Some(room)) => {
             let body = request.sandy_outgoing_body(ctx, room, engine_rid.as_deref())?;
@@ -309,6 +327,7 @@ async fn dispatch<T: Transport>(
             room,
             stream_abort.clone(),
             None,
+            sandy_body_sink,
         );
         side_tasks.push((task, sandy));
     }
@@ -329,6 +348,7 @@ async fn dispatch<T: Transport>(
                 bootstrap.room,
                 stream_abort.clone(),
                 decode_slot.clone(),
+                None,
             );
             side_tasks.push((task, Arc::clone(&prefill)));
             // Counted from arrival, so decode selection sees requests waiting here.
@@ -434,6 +454,7 @@ async fn dispatch<T: Transport>(
         log_context,
         decode_url_header,
         retry_excluding,
+        sandy_body,
     })
 }
 
@@ -513,13 +534,15 @@ trait Transport: Clone + Send + Sync + 'static {
         decode_slot: Option<DecodeSlot>,
     ) -> impl Future<Output = Result<Self::Response, ApiError>> + Send;
 
-    /// Run a PD prefill to completion and judge it.
+    /// Run a PD prefill to completion and judge it; a successful one sends its
+    /// body to `body_sink`.
     fn prefill(
         self,
         proxy: Arc<Proxy>,
         worker: Arc<Worker>,
         path: &'static str,
         leg: Leg,
+        body_sink: Option<oneshot::Sender<Bytes>>,
     ) -> impl Future<Output = PrefillFailure<Self::Response>> + Send;
 }
 
@@ -610,6 +633,7 @@ impl Transport for Http {
         worker: Arc<Worker>,
         path: &'static str,
         leg: Leg,
+        body_sink: Option<oneshot::Sender<Bytes>>,
     ) -> PrefillFailure {
         let result = proxy
             .forward_json_to(
@@ -622,7 +646,7 @@ impl Transport for Http {
                 None,
             )
             .await;
-        prefill_failure(result).await
+        prefill_failure(result, body_sink).await
     }
 }
 
@@ -699,6 +723,7 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         worker: Arc<Worker>,
         _path: &'static str,
         leg: Leg,
+        _body_sink: Option<oneshot::Sender<Bytes>>,
     ) -> PrefillFailure<Self::Response> {
         let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
         let result = proxy
@@ -827,13 +852,14 @@ fn spawn_side_request<T: Transport>(
     room: u64,
     stream_abort: CancellationToken,
     slot: Option<DecodeSlot>,
+    body_sink: Option<oneshot::Sender<Bytes>>,
 ) -> tokio::task::JoinHandle<PrefillFailure<T::Response>> {
     let proxy = Arc::clone(&ctx.proxy);
     let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
         let _load_guards = load_guards;
         let failure = transport
-            .prefill(proxy, Arc::clone(&worker), path, leg)
+            .prefill(proxy, Arc::clone(&worker), path, leg, body_sink)
             .await;
         if let Some(slot) = &slot {
             slot.release();
@@ -862,13 +888,21 @@ fn spawn_side_request<T: Transport>(
 
 /// Client errors and backpressure pass through; only a prefill fault becomes
 /// `prefill_failed`.
-async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
+async fn prefill_failure(
+    result: Result<Response<Body>, ApiError>,
+    body_sink: Option<oneshot::Sender<Bytes>>,
+) -> PrefillFailure {
     let status = match result {
         // A streaming prefill reports a late failure as a 200 carrying an SSE error event.
         Ok(response) if response.status().is_success() => {
             let status = response.status();
             match axum::body::to_bytes(response.into_body(), usize::MAX).await {
-                Ok(body) if !sse::has_error_event(&body) => return None,
+                Ok(body) if !sse::has_error_event(&body) => {
+                    if let Some(sink) = body_sink {
+                        let _ = sink.send(body);
+                    }
+                    return None;
+                }
                 _ => status,
             }
         }
@@ -885,6 +919,47 @@ async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFai
     Some(Err(ApiError::PrefillFailed {
         status: Some(status),
     }))
+}
+
+/// Ricky's unary `/generate` response with the routed experts of Sandy's
+/// tokens as `meta_info.franky_sandy_routed_experts`, from Sandy's body; a
+/// Sandy whose engine captures no routed experts adds none.
+///
+/// Errors: `ApiError::Internal` when Sandy's leg ended without a body, or
+/// either body is not a JSON object.
+async fn with_sandy_routed_experts(
+    response: Response<Body>,
+    sandy_body: oneshot::Receiver<Bytes>,
+) -> Result<Response<Body>, ApiError> {
+    if !response.status().is_success() {
+        return Ok(response);
+    }
+    let sandy_body = sandy_body.await.map_err(|_| {
+        ApiError::Internal(anyhow::anyhow!(
+            "Sandy's leg ended without a response, so her routed experts are missing"
+        ))
+    })?;
+    let sandy: Value = serde_json::from_slice(&sandy_body).map_err(|error| {
+        ApiError::Internal(anyhow::Error::new(error).context("parse Sandy's response"))
+    })?;
+    let Some(experts) = sandy["meta_info"].get("routed_experts").cloned() else {
+        return Ok(response);
+    };
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let mut ricky: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        ApiError::Internal(anyhow::Error::new(error).context("parse Ricky's response"))
+    })?;
+    let Some(meta) = ricky.get_mut("meta_info").and_then(Value::as_object_mut) else {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "Ricky's response has no meta_info for Sandy's routed experts"
+        )));
+    };
+    meta.insert("franky_sandy_routed_experts".into(), experts);
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Ok(Response::from_parts(parts, Body::from(ricky.to_string())))
 }
 
 /// A side leg's failure ended the request, so the client-visible outcome belongs
