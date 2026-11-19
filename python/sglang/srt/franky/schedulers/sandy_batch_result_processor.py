@@ -10,10 +10,11 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.franky.transfer.send_queue import FrankySendQueue
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
 
 
@@ -47,6 +48,9 @@ class SandyBatchResultProcessor(SchedulerBatchResultProcessor):
     ) -> None:
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+            result.routed_experts_output = None
         # Waits for the forward, so the batch's taps are written.
         result.next_token_ids.tolist()
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -72,6 +76,7 @@ class SandyBatchResultProcessor(SchedulerBatchResultProcessor):
                 aborted.append(req)
             else:
                 req.time_stats.set_prefill_finished_time()
+                self._collect_prompt_routed_experts(req)
                 checkpoint_kv_cache(req, self.tree_cache)
                 self.franky_send_queue.after_chunk(
                     req=req, end=prefix_len + extend_len, last=True
@@ -87,3 +92,21 @@ class SandyBatchResultProcessor(SchedulerBatchResultProcessor):
                 can_run_cuda_graph=result.can_run_cuda_graph,
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
+
+    def _collect_prompt_routed_experts(self, req: Req) -> None:
+        """Sandy's request returns the routed experts of every token it read,
+        from ``routed_experts_start_len``: each token's forward makes its taps,
+        so unlike a request that samples, its last token counts too.
+        """
+        if not req.return_routed_experts:
+            return
+        capturer = get_global_experts_capturer()
+        # Only the rank that sends outputs keeps routed experts on the host.
+        if capturer is None or not capturer.has_host_cache:
+            return
+        req.routed_experts = capturer.get_topk(
+            req_pool_idx=req.kv.req_pool_idx,
+            seqlen=len(req.origin_input_ids) + 1,
+            req_to_token_pool=self.req_to_token_pool,
+            start_len=req.routed_experts_start_len,
+        )

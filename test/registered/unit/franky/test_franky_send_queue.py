@@ -112,6 +112,7 @@ def _req(rid="r", prompt_len=10, chain=None):
         finished_reason=None,
         cache_request_handle=f"handle-{rid}",
         return_logprob=False,
+        return_routed_experts=False,
     )
 
 
@@ -496,7 +497,10 @@ class TestSandyBatchResultProcessor(_Queue):
         )
         batch.prefill_stats = None
         result = SimpleNamespace(
-            copy_done=None, next_token_ids=torch.zeros(2), can_run_cuda_graph=False
+            copy_done=None,
+            routed_experts_output=None,
+            next_token_ids=torch.zeros(2),
+            can_run_cuda_graph=False,
         )
 
         self.processor.process_batch_result_prefill(batch, result)
@@ -510,6 +514,41 @@ class TestSandyBatchResultProcessor(_Queue):
         self.assertEqual(self.released, [])
         self.assertEqual(self.streamed, [])
         self.assertFalse(self.queue.is_empty())
+
+    def test_a_finished_prefill_returns_the_experts_of_every_token_it_read(self):
+        topk_calls = []
+        capturer = SimpleNamespace(
+            has_host_cache=True,
+            get_topk=lambda **kwargs: topk_calls.append(kwargs) or "rows",
+        )
+        with_capturer = patch(
+            "sglang.srt.franky.schedulers.sandy_batch_result_processor."
+            "get_global_experts_capturer",
+            return_value=capturer,
+        )
+        with_capturer.start()
+        self.addCleanup(with_capturer.stop)
+        self.queue._open_room = lambda req: _Sender()
+        req = self._req("last", inflight_middle_chunks=0)
+        req.return_routed_experts = True
+        req.routed_experts_start_len = 3
+        req.extend_end = 10
+        self.queue.add(req=req)
+        batch = SimpleNamespace(reqs=[req], prefix_lens=[0], extend_lens=[10])
+        batch.prefill_stats = None
+        result = SimpleNamespace(
+            copy_done=None,
+            routed_experts_output=None,
+            next_token_ids=torch.zeros(1),
+            can_run_cuda_graph=False,
+        )
+
+        self.processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(req.routed_experts, "rows")
+        # get_topk reads tokens [start_len, seqlen - 1): all 10 of them from 3.
+        self.assertEqual(topk_calls[0]["seqlen"], 11)
+        self.assertEqual(topk_calls[0]["start_len"], 3)
 
 
 if __name__ == "__main__":
