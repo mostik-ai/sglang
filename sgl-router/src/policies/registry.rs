@@ -335,7 +335,7 @@ pub fn select_decode_with_affinity(
 /// fails to parse or has no host (rare; discovery emits URLs the proxy
 /// has already used at least once for /server_info, so this is mostly
 /// defensive).
-fn host_of(worker_url: &str) -> Option<String> {
+pub(crate) fn host_of(worker_url: &str) -> Option<String> {
     url::Url::parse(worker_url)
         .ok()?
         .host_str()

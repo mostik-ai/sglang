@@ -101,6 +101,17 @@ fn franky_ctx_with_blocks(
     };
     let mut cfg = config(max_attempts, policy, franky_block_size);
     cfg.proxy.franky_boundary_token_id = franky_boundary_token_id;
+    franky_ctx_from(cfg, ricky, sandy, reorg)
+}
+
+/// A router built from `cfg` over Ricky workers that read taps and over Sandy
+/// workers.
+fn franky_ctx_from(
+    cfg: Config,
+    ricky: &[(&str, &str, WorkerMode)],
+    sandy: &[(&str, &str)],
+    reorg: bool,
+) -> Arc<AppContext> {
     let registry = Arc::new(WorkerRegistry::default());
     for (id, url, mode) in ricky {
         let spec = WorkerSpec {
@@ -258,6 +269,105 @@ async fn a_ricky_that_reads_taps_needs_a_sandy() {
             "no_sandy_workers_available"
         );
         assert!(ricky.captured.lock().unwrap().last_body.is_none());
+    }
+}
+
+/// A router that pairs each Ricky with a Sandy on his own host
+/// (--franky-same-host-sandy), one attempt a request.
+fn same_host_ctx(
+    ricky: &[(&str, &str, WorkerMode)],
+    sandy: &[(&str, &str)],
+    reorg: bool,
+) -> Arc<AppContext> {
+    let policy = if reorg {
+        PolicyKind::PowerOfTwo
+    } else {
+        PolicyKind::RoundRobin
+    };
+    let mut cfg = config(1, policy, None);
+    cfg.proxy.franky_same_host_sandy = true;
+    franky_ctx_from(cfg, ricky, sandy, reorg)
+}
+
+/// A Ricky takes his taps only from the Sandy on his own host, though the
+/// policy alone would also hand him the Sandy on the other host (round-robin
+/// alternates between the two): taps that cross hosts would never arrive.
+#[tokio::test]
+async fn a_ricky_takes_taps_only_from_a_sandy_on_his_host() {
+    for reorg in [false, true] {
+        let ricky = MockWorker::start_at("127.0.0.1", vec![]).await;
+        let near = MockWorker::start_at("127.0.0.1", vec![]).await;
+        let far = MockWorker::start_at("127.0.0.2", vec![]).await;
+        let ctx = same_host_ctx(
+            &[("r", &ricky.url, WorkerMode::Plain)],
+            &[("near", &near.url), ("far", &far.url)],
+            reorg,
+        );
+        let router = build_router(ctx);
+        for _ in 0..8 {
+            let res = router.clone().oneshot(chat()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "reorg={reorg}");
+            let room = &ricky.captured_json().await["franky_room"];
+            assert_eq!(room["bootstrap_host"], json!("127.0.0.1"), "reorg={reorg}");
+        }
+        assert!(
+            far.captured.lock().unwrap().last_body.is_none(),
+            "reorg={reorg}"
+        );
+    }
+}
+
+/// A Ricky whose host has no Sandy is refused rather than paired across hosts.
+#[tokio::test]
+async fn a_ricky_without_a_sandy_on_his_host_is_refused() {
+    for reorg in [false, true] {
+        let ricky = MockWorker::start_at("127.0.0.1", vec![]).await;
+        let far = MockWorker::start_at("127.0.0.2", vec![]).await;
+        let ctx = same_host_ctx(
+            &[("r", &ricky.url, WorkerMode::Plain)],
+            &[("far", &far.url)],
+            reorg,
+        );
+        let res = build_router(ctx).oneshot(chat()).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reorg={reorg}"
+        );
+        assert_eq!(
+            res.headers().get("x-router-error-code").unwrap(),
+            "no_sandy_workers_available"
+        );
+        assert!(far.captured.lock().unwrap().last_body.is_none());
+        assert!(ricky.captured.lock().unwrap().last_body.is_none());
+    }
+}
+
+/// A Ricky whose host has no Sandy is passed over while another Ricky has one,
+/// though round-robin alone would alternate to him.
+#[tokio::test]
+async fn a_ricky_without_a_sandy_on_his_host_is_passed_over() {
+    for reorg in [false, true] {
+        let alone = MockWorker::start_at("127.0.0.1", vec![]).await;
+        let paired = MockWorker::start_at("127.0.0.2", vec![]).await;
+        let sandy = MockWorker::start_at("127.0.0.2", vec![]).await;
+        let ctx = same_host_ctx(
+            &[
+                ("alone", &alone.url, WorkerMode::Plain),
+                ("paired", &paired.url, WorkerMode::Plain),
+            ],
+            &[("s", &sandy.url)],
+            reorg,
+        );
+        let router = build_router(ctx);
+        for _ in 0..8 {
+            let res = router.clone().oneshot(chat()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "reorg={reorg}");
+        }
+        assert!(
+            alone.captured.lock().unwrap().last_body.is_none(),
+            "reorg={reorg}"
+        );
     }
 }
 
