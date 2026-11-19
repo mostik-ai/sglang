@@ -197,6 +197,13 @@ pub struct ServerArgs {
         conflicts_with = "no_tokenizer"
     )]
     pub franky_chat_adapter: Option<ChatTemplateAdapterKind>,
+    /// Franky: pair each request's Ricky engine (its prefill engine under PD)
+    /// with a Sandy on his own host, for engines whose taps cannot cross hosts,
+    /// as when the transfer library has no transport between them: Rickys with
+    /// no Sandy on their host are passed over. A request gets 503
+    /// no_sandy_workers_available when no Ricky has one.
+    #[arg(long)]
+    pub franky_same_host_sandy: bool,
 
     /// PD: at most N requests per prefill DP rank go to decode before their
     /// first token; the rest wait and get their decode DP rank when sent.
@@ -727,6 +734,7 @@ impl Cli {
                 franky_block_size: self.server.franky_block_size,
                 franky_boundary_token_id: self.server.franky_boundary_token_id,
                 franky_chat_adapter: self.server.franky_chat_adapter,
+                franky_same_host_sandy: self.server.franky_same_host_sandy,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,

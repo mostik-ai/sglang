@@ -416,11 +416,12 @@ sgl-router --model-id ricky --chat-routing reorg --policy cache_aware \
   Sandy joins the router's model whatever name it serves under, and its tap
   port is its `franky_bootstrap_port`.
 - Each request to a Ricky worker also gets a Sandy, picked from all Sandy
-  workers, not per bucket, by `--policy` and the admission flags as a prefill
-  group is. `cache_aware` picks the Sandy holding the longest cached prefix of
-  the prompt (Sandy publishes KV events with `--kv-events-config`); the legacy
-  path picks by load for other policies. `--dp-aware` picks Sandy's rank as it
-  picks a prefill's.
+  workers (only those on his host with `--franky-same-host-sandy`), not per
+  bucket, by `--policy` and the admission flags as a prefill group is.
+  `cache_aware` picks the Sandy holding the longest cached prefix of the prompt
+  (Sandy publishes KV events with `--kv-events-config`); the legacy path picks
+  by load for other policies. `--dp-aware` picks Sandy's rank as it picks a
+  prefill's.
 - The Sandy request and every Ricky request (both legs under PD) carry the same
   `franky_room`: Sandy's host, its tap port and a random `room`. Sandy gets the
   same prompt on the same path, without PD fields.
@@ -429,6 +430,15 @@ sgl-router --model-id ricky --chat-routing reorg --policy cache_aware \
   and a retry avoids that Sandy.
 - With no Sandy available, a Ricky request gets `503 no_sandy_workers_available`.
   One model cannot mix Ricky workers with solo workers.
+- `--franky-same-host-sandy` pairs each Ricky engine (his prefill engine under
+  PD) with a Sandy on his own host, for engines whose taps cannot cross hosts,
+  as when the transfer library has no transport between them: the router picks
+  a Ricky only among those with a healthy Sandy on their host, then his Sandy
+  among those. Hosts match by the host part of the workers' URLs, compared as
+  strings, so one machine named by an IP and by a hostname counts as two
+  hosts. With no Ricky that has a Sandy on his host, a request gets
+  `503 no_sandy_workers_available`; a chain's later blocks keep the pair its
+  first block chose.
 - Franky pairs serve generation over HTTP only: native gRPC, embeddings,
   classify and rerank are refused.
 - With Kubernetes discovery, `--sandy-selector` (equality terms) finds Sandy

@@ -11,7 +11,7 @@ mod reorg;
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
-use crate::policies::registry::{PdPoolResolver, PdResolveError};
+use crate::policies::registry::{host_of, PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
@@ -35,7 +35,7 @@ use preparation::{
     forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
     CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -410,6 +410,14 @@ impl<'a> ModelRouting<'a> {
         excluded: &[WorkerId],
     ) -> Result<SelectedWorkers, ApiError> {
         let prefix = PrefixMemo::default();
+        let same_host = ctx.config.proxy.franky_same_host_sandy;
+        let without_sandy;
+        let excluded = if same_host {
+            without_sandy = with_rickys_without_a_sandy(ctx, &request.model, excluded)?;
+            without_sandy.as_slice()
+        } else {
+            excluded
+        };
         let mut workers = match self {
             Self::Legacy(policy) => {
                 // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
@@ -432,10 +440,69 @@ impl<'a> ModelRouting<'a> {
             }
         };
         if workers.prefill.needs_taps() {
+            let off_host;
+            let excluded = if same_host {
+                off_host = with_sandys_off_host(ctx, &request.model, &workers.prefill, excluded);
+                off_host.as_slice()
+            } else {
+                excluded
+            };
             workers.sandy = Some(pick_sandy(ctx, request, headers, excluded, &prefix).await?);
         }
         Ok(workers)
     }
+}
+
+/// `excluded` and every Ricky engine, plain or prefill, whose host has no
+/// Sandy outside `excluded`, so that the Ricky picked has a Sandy on his host.
+///
+/// Errors: `ApiError::NoSandyWorkersAvailable` when no Ricky has one.
+fn with_rickys_without_a_sandy(
+    ctx: &AppContext,
+    model: &ModelId,
+    excluded: &[WorkerId],
+) -> Result<Vec<WorkerId>, ApiError> {
+    let engines = ctx.registry.healthy_workers_for(model);
+    let available: Vec<_> = (engines.iter())
+        .filter(|engine| !excluded.contains(&engine.id))
+        .collect();
+    let sandy_hosts: HashSet<_> = (available.iter())
+        .filter(|engine| engine.mode() == WorkerMode::Sandy)
+        .map(|engine| host_of(&engine.url))
+        .collect();
+    let rickys: Vec<_> = (available.iter())
+        .filter(|engine| engine.needs_taps() && engine.mode() != WorkerMode::Decode)
+        .collect();
+    let far: Vec<_> = (rickys.iter())
+        .filter(|ricky| !sandy_hosts.contains(&host_of(&ricky.url)))
+        .map(|ricky| ricky.id.clone())
+        .collect();
+    if !rickys.is_empty() && far.len() == rickys.len() {
+        return Err(ApiError::NoSandyWorkersAvailable {
+            model: model.0.clone(),
+        });
+    }
+    Ok(excluded.iter().cloned().chain(far).collect())
+}
+
+/// `excluded` and every Sandy engine on another host than `ricky`'s, so that
+/// the Sandy picked for `ricky` sends its taps within the host.
+fn with_sandys_off_host(
+    ctx: &AppContext,
+    model: &ModelId,
+    ricky: &Worker,
+    excluded: &[WorkerId],
+) -> Vec<WorkerId> {
+    let host = host_of(&ricky.url);
+    let mut ids = excluded.to_vec();
+    ids.extend(
+        ctx.registry
+            .healthy_workers_for(model)
+            .into_iter()
+            .filter(|engine| engine.mode() == WorkerMode::Sandy && host_of(&engine.url) != host)
+            .map(|engine| engine.id.clone()),
+    );
+    ids
 }
 
 /// The Sandy that sends a Franky request's taps: the model's Sandy group picks
