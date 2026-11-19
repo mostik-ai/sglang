@@ -1,8 +1,9 @@
 """Correctness test for the symmetric-memory multimem all-gather kernel.
 
-Compares ``all_gather_inner`` (concat-along-hidden multimem.st gather) against
-NCCL all-gather for a sweep of token counts, hidden widths, and the
-``safe`` / ``skip_entry_sync`` knobs, in both eager and CUDA-graph modes.
+Compares ``all_gather_inner`` (concat-along-hidden multimem.st gather, and its
+P2P stores where the buffer has no multicast address) against NCCL all-gather
+for a sweep of token counts, hidden widths, and the ``safe`` /
+``skip_entry_sync`` knobs, in both eager and CUDA-graph modes.
 
 Usage::
 
@@ -18,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import atexit
+import dataclasses
 import logging
 import os
 
@@ -100,6 +102,18 @@ def _init_state_once():
     )
 
 
+class _NoMulticast:
+    """A rendezvous handle as on GPUs without NVLink multicast."""
+
+    multicast_ptr = 0
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+
+    def __getattr__(self, name: str):
+        return getattr(self._handle, name)
+
+
 def _nccl_all_gather(x: torch.Tensor, group: dist.ProcessGroup, world_size: int):
     """Reference gather matching ``tensor_model_parallel_all_gather(dim=-1)``:
     concat per-rank ``[T, H/W]`` shards in rank order into ``[T, H]``."""
@@ -120,6 +134,7 @@ def _nccl_all_gather(x: torch.Tensor, group: dist.ProcessGroup, world_size: int)
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("multicast", [True, False])
 @pytest.mark.parametrize("skip_entry_sync", [False, True])
 @pytest.mark.parametrize("safe", [False, True])
 @pytest.mark.parametrize("hidden", TEST_HIDDEN)
@@ -130,14 +145,19 @@ def test_symm_mem_all_gather(
     hidden: int,
     safe: bool,
     skip_entry_sync: bool,
+    multicast: bool,
 ) -> None:
     nccl_group = _init_nccl_group_once()
     state = _init_state_once()
     world_size = state.world_size
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
 
-    if state.symm_mem_hdl.multicast_ptr == 0:
+    if multicast and state.symm_mem_hdl.multicast_ptr == 0:
         pytest.skip(f"multimem multicast unavailable for world_size={world_size}")
+    if not multicast:
+        state = dataclasses.replace(
+            state, symm_mem_hdl=_NoMulticast(state.symm_mem_hdl)
+        )
 
     local_hidden = hidden // world_size
     if hidden % world_size != 0 or local_hidden % 8 != 0:
@@ -165,5 +185,5 @@ def test_symm_mem_all_gather(
 
 if __name__ == "__main__":
     # multimem multicast needs world_size in {4, 6, 8} (cc9) or {6, 8} (cc10);
-    # unsupported sizes self-skip via the multicast_ptr guard above.
+    # unsupported sizes self-skip their multicast cases via the guard above.
     multigpu_pytest_main(__name__, __file__, num_gpus=(4, 8))

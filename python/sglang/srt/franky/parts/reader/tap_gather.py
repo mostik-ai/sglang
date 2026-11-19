@@ -19,19 +19,20 @@ logger = logging.getLogger(__name__)
 
 
 class TapGather:
-    """Gathers every attention-TP rank's packed reader results. Where the GPUs
-    have NVLink multicast, each rank stores its rows into every rank's buffer in
-    one pass, without the gather's entry barrier: the layers between two readers
+    """Gathers every attention-TP rank's packed reader results. Within one node,
+    each rank stores its rows into every rank's symmetric buffer in one kernel:
+    one NVLink multicast store where the GPUs have multicast, else one P2P store
+    per rank. It skips the gather's entry barrier: the layers between two readers
     run collectives, so no rank writes the next reader's rows while another still
-    reads the last ones. Elsewhere, and for more rows than the buffer holds, NCCL
-    gathers them.
+    reads the last ones. Across nodes, and for more rows than the buffer holds,
+    NCCL gathers them.
     """
 
     def __init__(
-        self, *, group: GroupCoordinator, multicast: Optional[MultimemAllGatherState]
+        self, *, group: GroupCoordinator, symmetric: Optional[MultimemAllGatherState]
     ) -> None:
         self.group = group
-        self.multicast = multicast
+        self.symmetric = symmetric
 
     @staticmethod
     def build(*, group: GroupCoordinator, max_rows: int, row_size: int) -> TapGather:
@@ -39,12 +40,12 @@ class TapGather:
         outside CUDA graph capture.
 
         Args:
-            max_rows: the most rows a gather takes over NVLink multicast.
+            max_rows: the most rows a gather takes over NVLink.
             row_size: the bfloat16 elements of one packed row, a multiple of 8.
         """
         return TapGather(
             group=group,
-            multicast=_multicast_state(group, max_rows=max_rows, row_size=row_size),
+            symmetric=_symmetric_state(group, max_rows=max_rows, row_size=row_size),
         )
 
     def gather(self, packed: torch.Tensor) -> torch.Tensor:
@@ -56,9 +57,9 @@ class TapGather:
         """
         rows, queries, size = packed.shape
         num_ranks = self.group.world_size
-        if self.multicast is not None and rows <= self.multicast.max_token_num:
+        if self.symmetric is not None and rows <= self.symmetric.max_token_num:
             gathered = all_gather_inner(
-                self.multicast,
+                self.symmetric,
                 packed.view(rows, queries * size),
                 tp_hidden_dim=queries * size * num_ranks,
                 skip_entry_sync=True,
@@ -70,10 +71,11 @@ class TapGather:
         return gathered.view(num_ranks, rows, queries, size)
 
 
-def _multicast_state(
+def _symmetric_state(
     group: GroupCoordinator, *, max_rows: int, row_size: int
 ) -> Optional[MultimemAllGatherState]:
     if not all(in_the_same_node_as(group.cpu_group, source_rank=0)):
+        logger.warning("Franky readers gather with NCCL: the ranks span nodes.")
         return None
     try:
         state = create_state(
@@ -84,10 +86,11 @@ def _multicast_state(
         )
     except Exception as error:
         logger.warning(
-            "Franky readers gather with NCCL: no NVLink multicast (%s).", error
+            "Franky readers gather with NCCL: no symmetric memory (%s).", error
         )
         return None
-    if state.symm_mem_hdl.multicast_ptr == 0:
-        logger.warning("Franky readers gather with NCCL: no NVLink multicast here.")
-        return None
+    logger.info(
+        "Franky readers gather over NVLink %s.",
+        "multicast" if state.symm_mem_hdl.multicast_ptr != 0 else "P2P stores",
+    )
     return state

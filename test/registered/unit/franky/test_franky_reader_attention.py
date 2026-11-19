@@ -308,7 +308,7 @@ class TestTapAttention(CustomTestCase):
                 page_size=_PAGE_SIZE,
             ),
             builds_reading=True,
-            gather=None if group is None else TapGather(group=group, multicast=None),
+            gather=None if group is None else TapGather(group=group, symmetric=None),
             workspace=None,
         )
 
