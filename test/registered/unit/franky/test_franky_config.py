@@ -94,6 +94,16 @@ class TestFrankyConfig(_WithFiles):
         self.assertIsInstance(self._load().injector.sandy, ResidualInjectorConfig)
         self.assertIsInstance(self._load().injector.ricky, ResidualInjectorConfig)
 
+    def test_one_injector_serves_both_sides(self):
+        """Configs written before injectors were per side name one injector."""
+        config = copy.deepcopy(_CONFIG)
+        config["injector"] = {"type": "residual"}
+
+        loaded = FrankyConfig.load(self._write_config(config))
+
+        self.assertIsInstance(loaded.injector.sandy, ResidualInjectorConfig)
+        self.assertEqual(loaded.injector.sandy, loaded.injector.ricky)
+
     def test_bad_configs_are_refused(self):
         for reason, edit in {
             "Invalid value 'linear'": lambda c: c["encoder"].update(type="linear"),

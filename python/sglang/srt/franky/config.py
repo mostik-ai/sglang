@@ -46,9 +46,16 @@ class FrankyConfig(
 
     @staticmethod
     def load(path: str) -> FrankyConfig:
+        """A config whose ``injector`` names one injector, as before injectors
+        were per side, gives that injector to both sides.
+        """
         with open(path, "rb") as file:
             data = file.read()
         try:
-            return msgspec.json.decode(data, type=FrankyConfig)
+            fields = msgspec.json.decode(data)
+            injector = fields.get("injector") if isinstance(fields, dict) else None
+            if isinstance(injector, dict) and "type" in injector:
+                fields["injector"] = {"sandy": injector, "ricky": injector}
+            return msgspec.convert(fields, FrankyConfig)
         except msgspec.DecodeError as error:
             raise ValueError(f"Bad Franky config {path}: {error}") from error
