@@ -312,9 +312,11 @@ class GenerateReqInput:
     # it, which an aligned reader writes at.
     franky_write_ranges: Optional[List[List[int]]] = None
     # Franky with a Sandy that tokenizes on its own: Sandy's token ids of the
-    # input, and the runs of franky_generated_spans' answers in Sandy's tokens.
+    # input, the runs of franky_generated_spans' answers in Sandy's tokens, and
+    # per answer, Sandy's tokens before each of its blocks.
     franky_sandy_input_ids: Optional[List[int]] = None
     franky_sandy_spans: Optional[List[List[int]]] = None
+    franky_sandy_block_starts: Optional[List[List[int]]] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None

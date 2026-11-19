@@ -79,15 +79,19 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
                 write_ranges=write_ranges,
             )
         # Sandy tokenizes on its own: each block of the answer reads Sandy's tokens
-        # before it, this one all of Sandy's input. An earlier answer's blocks
-        # are not known in Sandy's tokens, so all of its tokens read the taps
-        # before it.
+        # before it, this one all of Sandy's input. An earlier answer whose blocks
+        # are not known in Sandy's tokens reads the taps before it with all of
+        # its tokens.
         starts = (*chain.sandy_block_starts, sandy_input_len)
         current = GeneratedSpan(
             start=start, sandy_start=starts[0], sandy_block_starts=starts[1:]
         )
         earlier = tuple(
-            msgspec.structs.replace(span, sandy_block_starts=())
+            (
+                span
+                if span.sandy_block_starts is not None
+                else msgspec.structs.replace(span, sandy_block_starts=())
+            )
             for span in earlier_answers
         )
         return FrankyGeneratedSpans(
@@ -204,24 +208,34 @@ def checked_earlier_answers(
     generation_start: int,
     sandy_answers: Optional[list[list[int]]],
     sandy_generation_start: Optional[int],
+    sandy_block_starts: Optional[list[list[int]]] = None,
 ) -> tuple[GeneratedSpan, ...]:
     """
     Args:
         sandy_answers: the same answers in Sandy's tokens, one per answer; None
             with ``sandy_generation_start`` when Sandy reads Ricky's tokens.
         sandy_generation_start: Sandy's tokens of the input.
+        sandy_block_starts: per answer, Sandy's tokens before each of its
+            blocks after the first, as a chain of blocks reported them; None
+            when unknown, and then every token of an answer reads the taps
+            before it.
     Returns:
         The answers as spans.
     Raises:
         ValueError: the answers are not non-empty runs in order inside the
-            prompt, on either side, or the sides do not match one to one.
+            prompt, on either side, the sides do not match one to one, or an
+            answer's block starts are not in order inside its run in Sandy's
+            tokens.
     """
     _check_runs(
         answers, generation_start=generation_start, field="franky_generated_spans"
     )
     if sandy_generation_start is None:
-        if sandy_answers is not None:
-            raise ValueError("franky_sandy_spans come with franky_sandy_input_ids.")
+        if sandy_answers is not None or sandy_block_starts is not None:
+            raise ValueError(
+                "franky_sandy_spans and franky_sandy_block_starts come with "
+                "franky_sandy_input_ids."
+            )
         return tuple(
             GeneratedSpan(start=start, sandy_start=start, end=end)
             for start, end in answers
@@ -237,10 +251,40 @@ def checked_earlier_answers(
             f"Each of the {len(answers)} answers in franky_generated_spans has a "
             f"run in Sandy's tokens, but franky_sandy_spans has {len(sandy_answers)}."
         )
+    block_starts = _checked_block_starts(sandy_block_starts, sandy_answers)
     return tuple(
-        GeneratedSpan(start=start, sandy_start=sandy_start, end=end)
-        for (start, end), (sandy_start, _) in zip(answers, sandy_answers)
+        GeneratedSpan(
+            start=start,
+            sandy_start=sandy_start,
+            end=end,
+            sandy_block_starts=later_starts,
+        )
+        for (start, end), (sandy_start, _), later_starts in zip(
+            answers, sandy_answers, block_starts
+        )
     )
+
+
+def _checked_block_starts(
+    block_starts: Optional[list[list[int]]], sandy_answers: list[list[int]]
+) -> list[tuple[int, ...]]:
+    """Per answer, Sandy's tokens before each of its blocks after the first."""
+    if block_starts is None:
+        return [()] * len(sandy_answers)
+    if len(block_starts) != len(sandy_answers):
+        raise ValueError(
+            f"franky_sandy_block_starts has {len(block_starts)} lists for the "
+            f"{len(sandy_answers)} answers of franky_sandy_spans; it needs one each."
+        )
+    for starts, (sandy_start, sandy_end) in zip(block_starts, sandy_answers):
+        bounds = [sandy_start, *starts, sandy_end]
+        if any(lower > upper for lower, upper in zip(bounds, bounds[1:])):
+            raise ValueError(
+                "Each list of franky_sandy_block_starts must stay in order inside "
+                f"its answer's run in Sandy's tokens [{sandy_start}, {sandy_end}), "
+                f"got {starts}."
+            )
+    return [tuple(starts) for starts in block_starts]
 
 
 def _check_runs(runs: list[list[int]], *, generation_start: int, field: str) -> None:

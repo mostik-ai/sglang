@@ -194,8 +194,8 @@ class TestFrankyGeneratedSpans(CustomTestCase):
                 sandy_generation_start=15,
             ),
             (
-                GeneratedSpan(start=2, sandy_start=3, end=5),
-                GeneratedSpan(start=7, sandy_start=8, end=9),
+                GeneratedSpan(start=2, sandy_start=3, end=5, sandy_block_starts=()),
+                GeneratedSpan(start=7, sandy_start=8, end=9, sandy_block_starts=()),
             ),
         )
         for sandy_answers, sandy_generation_start in (
@@ -213,6 +213,81 @@ class TestFrankyGeneratedSpans(CustomTestCase):
                     sandy_answers=sandy_answers,
                     sandy_generation_start=sandy_generation_start,
                 )
+
+    def test_an_earlier_answer_keeps_the_sandy_block_starts_its_decode_read(self):
+        # A Ricky answer [2, 14) of 4-token blocks; Sandy's copy [3, 16) has its
+        # blocks at 3, 7 and 10.
+        answers = checked_earlier_answers(
+            [[2, 14]],
+            generation_start=20,
+            sandy_answers=[[3, 16]],
+            sandy_generation_start=25,
+            sandy_block_starts=[[7, 10]],
+        )
+        chain = FrankyChain(id="c", block=2, block_size=4, sandy_block_starts=(25,))
+
+        spans = FrankyGeneratedSpans.of(
+            earlier_answers=answers,
+            num_input_tokens=24,
+            chain=chain,
+            sandy_input_len=27,
+        )
+
+        self.assertEqual(
+            answers,
+            (
+                GeneratedSpan(
+                    start=2, sandy_start=3, end=14, sandy_block_starts=(7, 10)
+                ),
+            ),
+        )
+        taps = spans.taps_to_read(torch.arange(2, 14))
+        self.assertEqual(taps.tolist(), [3] * 4 + [7] * 4 + [10] * 4)
+        self.assertEqual(spans.rows_reading_at_most(6), 5)
+        self.assertEqual(spans.rows_reading_at_most(9), 9)
+
+    def test_sandy_block_starts_must_follow_each_answers_run(self):
+        self.assertEqual(
+            checked_earlier_answers(
+                [[2, 5], [7, 9]],
+                generation_start=12,
+                sandy_answers=[[3, 16], [17, 18]],
+                sandy_generation_start=20,
+                sandy_block_starts=[[3, 16], []],
+            ),
+            (
+                GeneratedSpan(
+                    start=2, sandy_start=3, end=5, sandy_block_starts=(3, 16)
+                ),
+                GeneratedSpan(start=7, sandy_start=17, end=9, sandy_block_starts=()),
+            ),
+        )
+        for block_starts in (
+            [[7]],
+            [[2, 7], []],
+            [[9, 7], []],
+            [[17], []],
+            [[], [16]],
+        ):
+            with (
+                self.subTest(block_starts=block_starts),
+                self.assertRaises(ValueError),
+            ):
+                checked_earlier_answers(
+                    [[2, 5], [7, 9]],
+                    generation_start=12,
+                    sandy_answers=[[3, 16], [17, 18]],
+                    sandy_generation_start=20,
+                    sandy_block_starts=block_starts,
+                )
+        with self.assertRaises(ValueError):
+            checked_earlier_answers(
+                [[2, 5]],
+                generation_start=12,
+                sandy_answers=None,
+                sandy_generation_start=None,
+                sandy_block_starts=[[2]],
+            )
 
     def test_a_prompt_without_answers_names_only_sandys_input_length(self):
         self.assertEqual(

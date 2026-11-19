@@ -1414,6 +1414,7 @@ class OpenAIServingChat(OpenAIServingBase):
             franky_generated_spans=request.franky_generated_spans,
             franky_sandy_input_ids=request.franky_sandy_input_ids,
             franky_sandy_spans=request.franky_sandy_spans,
+            franky_sandy_block_starts=request.franky_sandy_block_starts,
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,

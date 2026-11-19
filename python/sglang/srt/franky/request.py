@@ -58,6 +58,7 @@ class FrankyRequest(msgspec.Struct, frozen=True, kw_only=True):
             and not obj.franky_generated_spans
             and obj.franky_sandy_input_ids is None
             and obj.franky_sandy_spans is None
+            and obj.franky_sandy_block_starts is None
             and obj.franky_write_ranges is None
         ):
             return None
@@ -89,6 +90,7 @@ class FrankyRequest(msgspec.Struct, frozen=True, kw_only=True):
                 generation_start=prompt_len
                 - (0 if chain is None else chain.num_generated_before),
                 sandy_answers=obj.franky_sandy_spans,
+                sandy_block_starts=obj.franky_sandy_block_starts,
                 sandy_generation_start=(
                     chain.sandy_answer_start(sandy_input_len=sandy_input_len)
                     if chain is not None and sandy_input_len is not None
