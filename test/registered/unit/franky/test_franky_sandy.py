@@ -8,14 +8,15 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional
 
-from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
-from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
+from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE
+from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts.encoder.all.encoder import AllEncoder
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
@@ -121,18 +122,23 @@ class _Files(CustomTestCase):
         save_file(weights, weights_path)
         return config_path, weights_path, weights
 
-    def _attach(self, *, model, config_path, weights_path):
-        parts = FrankyParts.attach(
-            model=model,
-            side="sandy",
-            config_path=config_path,
-            weights_path=weights_path,
-            dtype=TAP_DTYPE,
-            device="cpu",
-        )
+    def _attach(self, *, model, config_path, weights_path, stripes=None):
+        with patch.object(
+            FrankyParts,
+            "attention_tp_stripes",
+            staticmethod(lambda: stripes or TapStripes(num_ranks=1, rank=0)),
+        ):
+            parts = FrankyParts.attach(
+                model=model,
+                side="sandy",
+                config_path=config_path,
+                weights_path=weights_path,
+                dtype=TAP_DTYPE,
+                device="cpu",
+            )
         parts.init_tap_cache(
-            num_tokens=64,
-            kv_allocator=_kv_allocator(),
+            num_kv_tokens=64,
+            kv_page_size=_PAGE_SIZE,
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.zeros((2, 64), dtype=torch.int32)
             ),
@@ -158,15 +164,12 @@ class _Files(CustomTestCase):
         return proxies
 
 
-def _kv_allocator():
-    allocator = FrankyKvAllocator.__new__(FrankyKvAllocator)
-    allocator.page_size = _PAGE_SIZE
-    return allocator
+def _slots(parts: FrankyParts, index: int) -> torch.Tensor:
+    return parts.tap_cache.buffers.pages(index).view(-1, _OUTPUT_SIZE)
 
 
 def _taps(parts: FrankyParts, index: int, kv_slots) -> torch.Tensor:
-    cache: FrankyTapCache = parts.tap_cache
-    return cache._buffers[index][cache.slots_of(kv_slots=kv_slots)]
+    return _slots(parts, index)[kv_slots]
 
 
 class TestLinearEncoder(_Files):
@@ -268,8 +271,79 @@ class TestSandyParts(_Files):
         real = _taps(parts, 0, torch.tensor([_PAGE_SIZE, _PAGE_SIZE + 1]))
         self.assertTrue(torch.all(real != 0))
         self.assertTrue(
-            torch.all(parts.tap_cache._buffers[0][_PAGE_SIZE + 2 : 2 * _PAGE_SIZE] == 0)
+            torch.all(_slots(parts, 0)[_PAGE_SIZE + 2 : 2 * _PAGE_SIZE] == 0)
         )
+
+    def test_each_rank_keeps_the_taps_of_its_tap_pages(self):
+        """Tap page ``t`` holds KV slots ``[4t, 4t + 4)``; rank ``t % 2`` keeps it
+        at local page ``t // 2``, and the other rank's writes go to its last
+        local page, which nothing reads.
+        """
+        config_path, weights_path, _ = self._write(encoder_type="singular", layers=[3])
+        self.kv_slots = torch.tensor([4, 5, 6, 7, 8])
+        whole = _Model()
+        whole_parts = self._attach(
+            model=whole, config_path=config_path, weights_path=weights_path
+        )
+        self._run_layers(model=whole, start_layer=0, end_layer=_NUM_LAYERS)
+        expected = _taps(whole_parts, 0, self.kv_slots)
+
+        for rank, kept, local_slots in ((1, [0, 1, 2, 3], [0, 1, 2, 3]), (0, [4], [4])):
+            with self.subTest(rank=rank):
+                model = _Model()
+                parts = self._attach(
+                    model=model,
+                    config_path=config_path,
+                    weights_path=weights_path,
+                    stripes=TapStripes(num_ranks=2, rank=rank),
+                )
+
+                self._run_layers(model=model, start_layer=0, end_layer=_NUM_LAYERS)
+
+                slots = _slots(parts, 0)
+                self.assertEqual(parts.tap_cache.buffers.num_pages, 10)
+                self.assertTrue(torch.equal(slots[local_slots], expected[kept]))
+                written = (slots != 0).any(dim=-1).nonzero().flatten().tolist()
+                discarded = list(range(9 * _PAGE_SIZE, 10 * _PAGE_SIZE))
+                self.assertEqual(sorted(set(written) - set(discarded)), local_slots)
+                self.assertEqual(
+                    parts.tap_cache.local_pages(kv_slots=torch.arange(4, 12)).tolist(),
+                    [0, -1] if rank == 1 else [-1, 1],
+                )
+
+    def test_the_budget_charges_this_ranks_share_of_its_stages_taps(self):
+        config_path, weights_path, _ = self._write(encoder_type="all", layers=[2, 5])
+        tap_bytes = 2 * _OUTPUT_SIZE * TAP_DTYPE.itemsize
+
+        self.assertEqual(
+            [
+                self._attach(
+                    model=_Model(),
+                    config_path=config_path,
+                    weights_path=weights_path,
+                    stripes=TapStripes(num_ranks=num_ranks, rank=0),
+                )
+                .kv_options()
+                .tap_bytes_per_token
+                for num_ranks in (1, 2)
+            ],
+            [tap_bytes, tap_bytes // 2],
+        )
+
+    def test_sandys_kv_page_must_hold_whole_tap_pages(self):
+        config_path, weights_path, _ = self._write(encoder_type="singular", layers=[3])
+        parts = self._attach(
+            model=_Model(), config_path=config_path, weights_path=weights_path
+        )
+
+        with self.assertRaisesRegex(ValueError, "not whole tap pages"):
+            parts.init_tap_cache(
+                num_kv_tokens=64,
+                kv_page_size=_PAGE_SIZE + 2,
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.zeros((2, 64), dtype=torch.int32)
+                ),
+            )
 
 
 class TestAttach(_Files):

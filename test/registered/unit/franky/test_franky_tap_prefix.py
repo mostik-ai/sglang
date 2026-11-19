@@ -1,10 +1,13 @@
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.franky.transfer.receiver import FrankyReceiver
 from sglang.srt.franky.transfer.senders.room import FrankyRoomSender
@@ -117,6 +120,90 @@ class TestFrankyTapsPastTheCachedPrefix(CustomTestCase):
         self.assertEqual(receiver.landed(), 64)
         manager.pages_landed = 3
         self.assertEqual(receiver.landed(), 70)
+
+
+def _tap_manager(*, attn_tp_size, pp_size, attn_cp_size=1):
+    manager = FrankyTapManager.__new__(FrankyTapManager)
+    manager.attn_tp_size = attn_tp_size
+    manager.pp_size = pp_size
+    manager.attn_cp_size = attn_cp_size
+    return manager
+
+
+def _sending_engine(*, attn_tp_size, pp_size, attn_cp_size=1):
+    return SimpleNamespace(
+        attn_tp_size=attn_tp_size, pp_size=pp_size, attn_cp_size=attn_cp_size
+    )
+
+
+class TestFrankyTapManager(CustomTestCase):
+    def _send(self, prefill_pages, receiving_pages):
+        manager = _tap_manager(attn_tp_size=1, pp_size=1)
+        with patch.object(NixlKVManager, "send_kvcache", return_value="handle") as base:
+            handle = manager.send_kvcache(
+                "peer",
+                np.array(prefill_pages, dtype=np.int32),
+                [100],
+                np.array(receiving_pages, dtype=np.int32),
+                0,
+            )
+        return handle, base
+
+    def test_only_pages_both_ranks_keep_move(self):
+        handle, base = self._send([4, -1, 5, 6, -1], [9, 8, -1, 7, -1])
+
+        self.assertEqual(handle, "handle")
+        sent = base.call_args.args
+        self.assertEqual(sent[1].tolist(), [4, 6])
+        self.assertEqual(sent[3].tolist(), [9, 7])
+
+    def test_a_pair_of_ranks_without_a_shared_page_sends_nothing(self):
+        handle, base = self._send([4, -1, 5], [-1, 8, -1])
+
+        self.assertIsNone(handle)
+        base.assert_not_called()
+
+    def test_every_receiving_rank_reads_every_sending_rank_of_every_stage(self):
+        manager = _tap_manager(attn_tp_size=2, pp_size=1)
+        sending_engine = _sending_engine(attn_tp_size=4, pp_size=2)
+
+        manager._resolve_rank_mapping(sending_engine)
+
+        self.assertIsNone(sending_engine.target_tp_rank)
+        self.assertEqual(sending_engine.target_tp_ranks, [0, 1, 2, 3])
+        self.assertEqual(sending_engine.target_cp_ranks, [0])
+        self.assertEqual(sending_engine.target_pp_ranks, [0, 1])
+        self.assertEqual(sending_engine.required_prefill_response_num, 8)
+        self.assertEqual(sending_engine.required_dst_info_num, 2)
+
+    def test_each_sending_rank_waits_for_every_receiving_rank_and_stage(self):
+        manager = _tap_manager(attn_tp_size=4, pp_size=2)
+        sending_engine = _sending_engine(attn_tp_size=8, pp_size=1)
+
+        manager._resolve_rank_mapping(sending_engine)
+
+        self.assertEqual(sending_engine.required_dst_info_num, 8)
+        self.assertEqual(sending_engine.required_prefill_response_num, 8)
+
+    def test_attention_context_parallelism_is_refused(self):
+        for manager, sending_engine in (
+            (
+                _tap_manager(attn_tp_size=2, pp_size=1),
+                _sending_engine(attn_tp_size=2, pp_size=1, attn_cp_size=2),
+            ),
+            (
+                _tap_manager(attn_tp_size=2, pp_size=1, attn_cp_size=2),
+                _sending_engine(attn_tp_size=2, pp_size=1),
+            ),
+        ):
+            with (
+                self.subTest(
+                    sending=sending_engine.attn_cp_size,
+                    receiving=manager.attn_cp_size,
+                ),
+                self.assertRaisesRegex(ValueError, "context parallelism"),
+            ):
+                manager._resolve_rank_mapping(sending_engine)
 
 
 if __name__ == "__main__":

@@ -172,7 +172,6 @@ class TestHandleFranky(_WithFiles):
             "--enable-layernorm-sp": {"enable_layernorm_sp": True},
             "--enable-two-batch-overlap": {"enable_two_batch_overlap": True},
             "--enable-pdmux": {"enable_pdmux": True},
-            "page size 16": {"page_size": 16},
             "--enable-unified-memory": {"enable_unified_memory": True},
             "--enable-hisparse": {"enable_hisparse": True},
             "--enable-kv-cache-sharding": {"enable_kv_cache_sharding": True},
@@ -194,6 +193,7 @@ class TestHandleFranky(_WithFiles):
                 "disaggregation_transfer_backend": "nixl",
             },
             "encoder layer 12": {"num_hidden_layers": 10},
+            "page size 16": {"page_size": 16},
         }.items():
             with self.subTest(reason):
                 server_args = self._server_args(side="sandy", **fields)
@@ -229,21 +229,17 @@ class TestHandleFranky(_WithFiles):
                     handle_franky(server_args)
                 handle_franky(self._server_args(side="sandy", **fields))
 
-    def test_a_tap_pool_ratio_needs_a_ricky_that_owns_tap_pages(self):
+    def test_a_tap_pool_ratio_sizes_rickys_tap_pool_whatever_its_tokenizer(self):
         own_tokenizer = copy.deepcopy(_CONFIG)
         own_tokenizer["shared_tokenizer"] = False
-        handle_franky(
-            self._server_args(
-                side="ricky", config=own_tokenizer, franky_tap_pool_ratio=0.1
-            )
-        )
-        for side, config in (("ricky", _CONFIG), ("sandy", own_tokenizer)):
-            with self.subTest(side=side):
-                server_args = self._server_args(
-                    side=side, config=config, franky_tap_pool_ratio=0.1
+        for config in (_CONFIG, own_tokenizer):
+            handle_franky(
+                self._server_args(
+                    side="ricky", config=config, franky_tap_pool_ratio=0.1
                 )
-                with self.assertRaisesRegex(ValueError, "--franky-tap-pool-ratio 0.1"):
-                    handle_franky(server_args)
+            )
+        with self.assertRaisesRegex(ValueError, "--franky-tap-pool-ratio 0.1"):
+            handle_franky(self._server_args(side="sandy", franky_tap_pool_ratio=0.1))
 
     def test_kv_pages_may_be_any_multiple_of_the_tap_page(self):
         for side in ("sandy", "ricky"):

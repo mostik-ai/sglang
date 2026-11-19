@@ -114,11 +114,11 @@ class ServingCompletionTestCase(unittest.TestCase):
             prompt=[1, 2],
             max_tokens=1,
             franky_room=room,
-            franky_sandy_input_len=3,
+            franky_sandy_input_ids=[7, 8, 9],
         )
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.franky_room, room)
-        self.assertEqual(internal.franky_sandy_input_len, 3)
+        self.assertEqual(internal.franky_sandy_input_ids, [7, 8, 9])
 
     def test_single_request_rejects_batched_cache_salt(self):
         req = CompletionRequest(

@@ -1,7 +1,10 @@
-"""Franky end to end on two GPUs: a Sandy server writes taps, NIXL moves them to a
-Ricky server, and Ricky's readers read them, chunk by chunk as they land. Ricky's
+"""Franky end to end: a Sandy server writes taps, NIXL moves them to a Ricky
+server, and Ricky's readers read them, chunk by chunk as they land. Ricky's
 greedy logprobs must match HF transformers running Sandy's model with the
 encoders and Ricky's model with the readers; without the readers they must not.
+With TP 2 on both sides, every attention-TP rank keeps its stripe of the taps,
+each Sandy rank sends its pages to the Ricky ranks that keep them, and Ricky's
+ranks merge their readers' attention.
 """
 
 import json
@@ -90,6 +93,8 @@ def _reader(weights, index, layer_output, taps, num_taps):
 
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")
 class TestFrankyEndToEnd(CustomTestCase):
+    tp_size = 1
+
     @classmethod
     def setUpClass(cls):
         cls.directory = tempfile.mkdtemp(prefix="franky_e2e_")
@@ -99,7 +104,7 @@ class TestFrankyEndToEnd(CustomTestCase):
         cls.ricky_url = f"http://127.0.0.1:{find_available_port(31300)}"
         cls.processes = [
             cls._launch("sandy", cls.sandy_url, gpu=0),
-            cls._launch("ricky", cls.ricky_url, gpu=1),
+            cls._launch("ricky", cls.ricky_url, gpu=cls.tp_size),
         ]
 
     @classmethod
@@ -119,6 +124,7 @@ class TestFrankyEndToEnd(CustomTestCase):
             "--chunked-prefill-size", "64",
             "--mem-fraction-static", "0.6",
             "--base-gpu-id", str(gpu),
+            "--tp-size", str(cls.tp_size),
         ]  # fmt: skip
         if torch.cuda.get_device_capability()[0] >= 10:
             # On Blackwell, a Qwen3.5 rule replaces --page-size unless the
@@ -394,6 +400,11 @@ class TestFrankyEndToEnd(CustomTestCase):
         # average, some past 0.3.
         self.assertLess(gap.mean().item(), 0.03, gap.tolist())
         self.assertLess(gap.max().item(), 0.2, gap.tolist())
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 4, "requires 4 GPUs")
+class TestFrankyEndToEndTp2(TestFrankyEndToEnd):
+    tp_size = 2
 
 
 if __name__ == "__main__":

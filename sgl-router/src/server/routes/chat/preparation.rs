@@ -619,16 +619,16 @@ impl PreparedRequest {
         self.edit_body(|body| body["franky_generated_spans"] = json!(span_pairs(spans)))
     }
 
-    /// Gives Ricky's legs Sandy's input length and the runs of the earlier
-    /// answers in Sandy's tokens, `generated_spans` being their runs in Ricky's,
-    /// and keeps Sandy's ids for its leg.
+    /// Gives Ricky's legs Sandy's input ids, which key Ricky's taps, and the
+    /// runs of the earlier answers in Sandy's tokens, `generated_spans` being
+    /// their runs in Ricky's, and keeps Sandy's ids for its leg.
     pub(super) fn add_franky_sandy_chat(
         &mut self,
         generated_spans: &[Range<usize>],
         sandy: SandyChat,
     ) -> Result<(), ApiError> {
         self.edit_body(|body| {
-            body["franky_sandy_input_len"] = json!(sandy.input_ids.len());
+            body["franky_sandy_input_ids"] = json!(sandy.input_ids);
             if !generated_spans.is_empty() {
                 body["franky_generated_spans"] = json!(span_pairs(generated_spans));
                 body["franky_sandy_spans"] = json!(span_pairs(&sandy.generated_spans));
@@ -669,7 +669,7 @@ impl PreparedRequest {
         for ricky_field in [
             "franky_generated_spans",
             "franky_sandy_spans",
-            "franky_sandy_input_len",
+            "franky_sandy_input_ids",
         ] {
             fields.remove(ricky_field);
         }
@@ -2072,13 +2072,13 @@ mod tests {
         assert_eq!(ricky["input_ids"], json!([1, 2, 3, 4, 5, 6]));
         assert_eq!(ricky["franky_generated_spans"], json!([[1, 3]]));
         assert_eq!(ricky["franky_sandy_spans"], json!([[2, 4]]));
-        assert_eq!(ricky["franky_sandy_input_len"], json!(5));
+        assert_eq!(ricky["franky_sandy_input_ids"], json!([7, 8, 9, 10, 11]));
         assert_eq!(sandy["input_ids"], json!([7, 8, 9, 10, 11]));
         assert_eq!(sandy["franky_room"], ricky["franky_room"]);
         for ricky_field in [
             "franky_generated_spans",
             "franky_sandy_spans",
-            "franky_sandy_input_len",
+            "franky_sandy_input_ids",
         ] {
             assert!(sandy.get(ricky_field).is_none(), "{ricky_field}");
         }

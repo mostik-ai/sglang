@@ -1588,12 +1588,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
+            sandy_input_len = (
+                None
+                if obj.franky_sandy_input_ids is None
+                else len(obj.franky_sandy_input_ids)
+            )
             franky_chain = (
                 FrankyChain.from_request(
                     franky_chain=obj.franky_chain,
                     rid=obj.rid,
                     prompt_len=len(input_ids_arr or ()),
-                    sandy_input_len=obj.franky_sandy_input_len,
+                    sandy_input_len=sandy_input_len,
                     on_sandy=get_franky().franky_side == "sandy",
                 )
                 if obj.franky_chain is not None
@@ -1605,12 +1610,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 - (franky_chain.num_generated_before if franky_chain else 0),
                 sandy_answers=obj.franky_sandy_spans,
                 sandy_generation_start=(
-                    franky_chain.sandy_answer_start(
-                        sandy_input_len=obj.franky_sandy_input_len
-                    )
-                    if franky_chain is not None
-                    and obj.franky_sandy_input_len is not None
-                    else obj.franky_sandy_input_len
+                    franky_chain.sandy_answer_start(sandy_input_len=sandy_input_len)
+                    if franky_chain is not None and sandy_input_len is not None
+                    else sandy_input_len
                 ),
             )
 
@@ -1639,7 +1641,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ),
                 franky_chain=franky_chain,
                 franky_generated_spans=franky_generated_spans,
-                franky_sandy_input_len=obj.franky_sandy_input_len,
+                franky_sandy_input_ids=obj.franky_sandy_input_ids,
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,

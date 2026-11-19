@@ -4,17 +4,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans, GeneratedSpan
-from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
-from sglang.srt.franky.cache.prefill_budget import FrankyPrefillBudget
-from sglang.srt.franky.cache.tap_cache import FrankyReqState, FrankyTapCache
+from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
+from sglang.srt.franky.cache.tap_read_rows import TapReadRows
+from sglang.srt.franky.cache.tap_reservations import FrankyTapReservations
+from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.chains.chain import FrankyChain
-from sglang.srt.franky.chains.holds import FrankyChainHolds, FrankyHeldTaps
+from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder
 from sglang.srt.franky.schedulers.ricky import RickyScheduler
 from sglang.srt.franky.schedulers.sandy import SandyScheduler
@@ -26,6 +26,7 @@ from sglang.srt.franky.transfer.messages import (
 )
 from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
 from sglang.srt.franky.transfer.receive_queue import FrankyReceiveQueue
+from sglang.srt.franky.transfer.req_state import FrankyReqState
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     FINISH_MATCHED_TOKEN,
@@ -39,6 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     TreeLock,
 )
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -47,20 +49,20 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _PAGE_SIZE = 16
-_NUM_TOKENS = 1024
+_NUM_SLOTS = 16
+_MAX_TAPS = 512
 
 
 class _Receiver:
     def __init__(self, *, manager, franky_room, tap_pages, num_tokens, prefix_len):
         self.manager = manager
         self.tap_pages = tap_pages.tolist()
+        self.num_tokens = num_tokens
         self.prefix_len = prefix_len
         self.bootstrap_room = franky_room.room
         self.state = KVPoll.WaitingForInput
-        self.landed_tokens = 0
-        self.pages_registered = True
+        self.landed_tokens = prefix_len
         self.abort_notified = False
-        self.required_prefill_response_num = 1
         self.closed = False
 
     def poll(self):
@@ -83,22 +85,14 @@ class _Receiver:
 class _Tree:
     def __init__(self):
         self.locked = []
-        self.node_tokens = {}
-        self.evictable = 0
 
     def lock(self, node):
         self.locked.append(node)
         return SimpleNamespace(node=node)
 
     def unlock(self, lock):
-        if lock is None:
-            return
-        self.locked.remove(lock.node)
-        if lock.node not in self.locked:
-            self.evictable += self.node_tokens.get(lock.node, 0)
-
-    def evictable_size(self):
-        return self.evictable
+        if lock is not None:
+            self.locked.remove(lock.node)
 
 
 class _Req:
@@ -107,19 +101,19 @@ class _Req:
         rid,
         *,
         prompt_len,
-        cached_prefix_len=0,
+        first_id=0,
         room=True,
         chain=None,
-        sandy_input_len=None,
+        sandy_input_ids=None,
+        generated_spans=(),
     ):
         self.rid = rid
         self.franky_chain = chain
-        self.franky_generated_spans = ()
-        self.franky_sandy_input_len = sandy_input_len
+        self.franky_generated_spans = generated_spans
+        self.franky_sandy_input_ids = sandy_input_ids
         self.finished_reason = None
-        self.origin_input_ids = list(range(prompt_len))
+        self.origin_input_ids = list(range(first_id, first_id + prompt_len))
         self.output_ids = []
-        self.cached_prefix_len = cached_prefix_len
         self.franky = None
         self.franky_room = (
             FrankyRoom(bootstrap_host="sandy", bootstrap_port=8996, room=7)
@@ -131,13 +125,7 @@ class _Req:
         self.extra_key = None
         self.skip_radix_cache_insert = False
         self.done = False
-        self.copies_mamba_state = []
         self.time_stats = SchedulerReqTimeStats()
-
-    def init_next_round_input(self, tree_cache, cow_mamba=None):
-        self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
-        self.prefix_len = self.cached_prefix_len
-        self.copies_mamba_state.append(cow_mamba is not False)
 
     def finished(self):
         return self.done
@@ -158,23 +146,8 @@ class _Manager:
     def __init__(self):
         self.acked_rooms = set()
 
-    def is_abort_release_safe(self, room, required_acks):
-        return room in self.acked_rooms
-
     def clear_deferred_abort_state(self, room):
         self.acked_rooms.discard(room)
-
-
-def _landed(taps_ready, *, generated_spans=None, own_tap_pages=None):
-    return FrankyReqState(
-        tap_len=100,
-        taps_ready=taps_ready,
-        taken_kv_slots=torch.empty(0, dtype=torch.int64),
-        taken_from=0,
-        used_end=0,
-        generated_spans=generated_spans,
-        own_tap_pages=own_tap_pages,
-    )
 
 
 def _held(chain_id, *, node, num_tokens, block=1):
@@ -182,6 +155,23 @@ def _held(chain_id, *, node, num_tokens, block=1):
         franky_chain=FrankyChain(block_size=8, id=chain_id, block=block),
         last_node=node,
         origin_input_ids=[0] * num_tokens,
+    )
+
+
+def _single_turn(prompt_len):
+    return FrankyGeneratedSpans(
+        spans=(GeneratedSpan(start=prompt_len, sandy_start=prompt_len),)
+    )
+
+
+def _tap_cache(*, num_ranks=1, rank=0, num_slots=_NUM_SLOTS):
+    return RickyTapCache.build(
+        encoder_ids=(0,),
+        output_size=2,
+        page_size=_PAGE_SIZE,
+        num_taps=num_slots * num_ranks * _PAGE_SIZE,
+        stripes=TapStripes(num_ranks=num_ranks, rank=rank),
+        device="cpu",
     )
 
 
@@ -209,38 +199,26 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.tree = _Tree()
         self.manager = _Manager()
         self.store = _PPStore()
-        self.allocator = FrankyKvAllocator(
-            _NUM_TOKENS,
-            page_size=_PAGE_SIZE,
-            dtype=torch.bfloat16,
-            device="cpu",
-            kvcache=None,
-            need_sort=False,
-        )
-        self.allocator.use_triton_kernels = False
         receiver = patch.object(receive_queue_module, "FrankyReceiver", self._receiver)
         receiver.start()
         self.addCleanup(receiver.stop)
-        self.queue = self._queue(mamba_room=None)
+        self.queue = self._queue()
 
-    def _queue(self, *, mamba_room, own_pages=False):
-        tap_cache = FrankyTapCache(
-            encoder_ids=(0,),
-            output_size=2,
-            page_size=_PAGE_SIZE,
-            kv_page_size=_PAGE_SIZE,
-            num_tokens=_NUM_TOKENS,
-            req_to_token=torch.zeros((2, _NUM_TOKENS), dtype=torch.int32),
-            device="cpu",
-            own_pages=own_pages,
-        )
+    def _queue(
+        self, *, num_ranks=1, rank=0, num_slots=_NUM_SLOTS, shared_tokenizer=True
+    ):
+        self.tap_cache = _tap_cache(num_ranks=num_ranks, rank=rank, num_slots=num_slots)
         self.holds = FrankyChainHolds(
-            tree_cache=self.tree, hold_seconds=60, own_pages=tap_cache.own_pages
+            tree_cache=self.tree, tap_cache=self.tap_cache, hold_seconds=60
         )
+        return self._queue_on(shared_tokenizer=shared_tokenizer, mamba_room=None)
+
+    def _queue_on(self, *, shared_tokenizer, mamba_room):
         return FrankyReceiveQueue(
-            tap_cache=tap_cache,
-            kv_allocator=self.allocator,
-            tree_cache=self.tree,
+            tap_cache=self.tap_cache,
+            reservations=FrankyTapReservations(
+                tap_cache=self.tap_cache, chain_holds=self.holds, max_taps=_MAX_TAPS
+            ),
             tap_manager=self.manager,
             rank_reports=FrankyRankReports(
                 attn_tp_cpu_group=dist.group.WORLD,
@@ -249,8 +227,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
             ),
             chain_holds=self.holds,
             mamba_room=mamba_room,
-            page_size=_PAGE_SIZE,
-            reserved_decode_tokens=64,
+            shared_tokenizer=shared_tokenizer,
             release_timeout_seconds=600,
             fail_request=lambda req, reason: self.failed.append(req.rid),
         )
@@ -277,54 +254,161 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.queue.poll()
         return req
 
-    def test_taps_land_only_in_the_pages_past_the_cached_prefix(self):
-        req = self._arrive(_Req("r", prompt_len=70, cached_prefix_len=32))
+    def _finish(self, req, reason):
+        req.franky.taps_ready = req.franky.tap_len
+        req.done = True
+        req.finished_reason = reason
+
+    def _run(self, req, reason=FINISH_MATCHED_TOKEN(matched=0)):
+        self._arrive(req)
+        slots = self.queue.reservations.of(req.rid).slots.tolist()
+        self._finish(req, reason)
+        self.queue.poll()
+        return slots
+
+    def _cached_taps(self, sandy_ids):
+        cached = self.tap_cache.match(sandy_ids)
+        self.tap_cache.release(cached.lock)
+        return cached.num_taps
+
+    def test_an_arrival_takes_a_stripe_per_page_and_all_its_taps_land(self):
+        req = self._arrive(_Req("r", prompt_len=70))
 
         [receiver] = self.receivers
-        taken_pages = (req.franky.taken_kv_slots[::_PAGE_SIZE] // _PAGE_SIZE).tolist()
-        self.assertEqual(receiver.tap_pages, taken_pages)
-        self.assertEqual(receiver.prefix_len, 32)
-        self.assertEqual(req.franky.taps_ready, 32)
-        self.assertEqual(len(req.franky.taken_kv_slots), 70 - 32)
-        self.assertEqual(req.franky.taken_from, 32)
+        reservation = self.queue.reservations.of("r")
+        self.assertEqual(len(reservation.slots), 5)
+        self.assertEqual(receiver.tap_pages, reservation.slots.tolist())
+        self.assertEqual(receiver.prefix_len, 0)
+        self.assertEqual(receiver.num_tokens, 70)
+        self.assertEqual(req.franky.tap_len, 70)
+        self.assertEqual(req.franky.taps_ready, 0)
+        self.assertEqual(self.tap_cache.num_free_slots(), _NUM_SLOTS - 5)
 
-    def test_taps_count_from_the_cached_prefix(self):
-        req = self._arrive(_Req("r", prompt_len=70, cached_prefix_len=32))
-        self.receivers[0].landed_tokens = 48
+    def test_each_rank_lists_only_the_pages_it_keeps(self):
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                self.receivers = []
+                self.queue = self._queue(num_ranks=2, rank=rank)
 
-        messages = self._step(other_stage={"landed:r": 48, "ok:r": 1})
+                self._arrive(_Req("r", prompt_len=70))
 
-        self.assertEqual(messages, [FrankyTapsReady(request_rid="r", taps_ready=48)])
-        self.assertEqual(req.franky.taps_ready, 48)
+                slots = self.queue.reservations.of("r").slots.tolist()
+                self.assertEqual(len(slots), 3)
+                self.assertEqual(
+                    self.receivers[0].tap_pages,
+                    [slots[page // 2] if page % 2 == rank else -1 for page in range(5)],
+                )
 
-    def test_a_request_notes_when_it_took_its_pages_and_its_first_chunk_could_run(self):
-        req = self._arrive(_Req("r", prompt_len=70, cached_prefix_len=32))
+    def test_a_later_request_reads_cached_whole_stripes_and_sandy_skips_them(self):
+        first_slots = self._run(_Req("first", prompt_len=70))
+
+        later = self._arrive(_Req("later", prompt_len=90))
+
+        receiver = self.receivers[-1]
+        slots = self.queue.reservations.of("later").slots.tolist()
+        self.assertEqual(slots[:4], first_slots[:4])
+        self.assertEqual(receiver.prefix_len, 64)
+        self.assertEqual(receiver.tap_pages, slots[4:])
+        self.assertEqual(later.franky.taps_ready, 64)
+        self.assertEqual(later.time_stats.franky_taps_held, 64)
+
+    def test_a_fully_cached_input_still_lands_its_last_page(self):
+        first_slots = self._run(_Req("first", prompt_len=64))
+
+        self._arrive(_Req("again", prompt_len=64))
+
+        receiver = self.receivers[-1]
+        slots = self.queue.reservations.of("again").slots.tolist()
+        self.assertEqual(slots[:3], first_slots[:3])
+        self.assertEqual(receiver.prefix_len, 48)
+        self.assertEqual(receiver.tap_pages, slots[3:])
+        self.assertEqual(len(receiver.tap_pages), 1)
+
+    def test_a_request_whose_taps_all_landed_leaves_its_whole_stripes_cached(self):
+        self._run(_Req("r", prompt_len=70))
+
+        self.assertTrue(self.queue.is_empty())
+        self.assertEqual(self.tap_cache.num_free_slots(), _NUM_SLOTS)
+        self.assertEqual(self.tap_cache.num_free_pages(), (_NUM_SLOTS - 4, 4))
+        self.assertEqual(self._cached_taps(list(range(70))), 64)
+
+    def test_rows_that_read_no_taps_run_before_any_tap_lands(self):
+        for shared_tokenizer, sandy_input_ids, tap_len in (
+            (True, None, 70),
+            (False, list(range(100, 150)), 50),
+        ):
+            with self.subTest(shared_tokenizer=shared_tokenizer):
+                self.queue = self._queue(shared_tokenizer=shared_tokenizer)
+                req = _Req("r", prompt_len=70, sandy_input_ids=sandy_input_ids)
+
+                self.queue.add(req=req)
+
+                self.assertEqual(req.franky.tap_len, tap_len)
+                self.assertEqual(req.franky.taps_ready, 0)
+                self.assertEqual(req.franky.rows_ready(), 69)
+                self.assertEqual(req.time_stats.franky_taps_ready_time, 0.0)
+
+                self.queue.poll()
+
+                self.assertGreaterEqual(
+                    req.time_stats.franky_taps_ready_time,
+                    req.time_stats.franky_pages_taken_time,
+                )
+                self.assertGreater(req.time_stats.franky_pages_taken_time, 0.0)
+
+    def test_with_sandys_own_tokens_the_stripes_count_sandys_tokens(self):
+        self.queue = self._queue(shared_tokenizer=False)
+        sandy_ids = list(range(100, 150))
+
+        req = self._arrive(_Req("r", prompt_len=70, sandy_input_ids=sandy_ids))
+
+        [receiver] = self.receivers
+        self.assertEqual(len(receiver.tap_pages), 4)
+        self.assertEqual(receiver.num_tokens, 50)
+        self.assertEqual(req.franky.generated_spans.spans[-1].sandy_start, 50)
+
+    def test_sandys_own_tokens_key_the_cached_taps(self):
+        self.queue = self._queue(shared_tokenizer=False)
+        sandy_ids = list(range(100, 170))
+        self._run(_Req("first", prompt_len=20, sandy_input_ids=sandy_ids))
+
+        self._arrive(_Req("same", prompt_len=30, sandy_input_ids=sandy_ids + [1]))
+        self._arrive(
+            _Req("other", prompt_len=20, sandy_input_ids=list(range(200, 270)))
+        )
+
+        self.assertEqual([r.prefix_len for r in self.receivers[1:]], [64, 0])
+
+    def test_a_request_notes_when_it_took_its_stripes_and_its_first_chunk_could_run(
+        self,
+    ):
+        req = _Req("r", prompt_len=70)
+        req.prefix_len = 69
         stats = req.time_stats
+
+        self._arrive(req)
+
         self.assertGreater(stats.franky_pages_taken_time, 0.0)
         self.assertEqual(stats.franky_tap_len, 70)
+        self.assertEqual(stats.franky_taps_held, 0)
         self.assertEqual(stats.franky_taps_ready_time, 0.0)
-        self.receivers[0].landed_tokens = 48
+        self.receivers[0].landed_tokens = 70
 
-        self._step(other_stage={"landed:r": 48, "ok:r": 1})
+        self._step(other_stage={"landed:r": 70, "ok:r": 1})
 
         self.assertGreater(stats.franky_taps_ready_time, stats.franky_pages_taken_time)
 
-    def test_a_request_without_a_room_can_run_once_it_took_its_pages(self):
-        req = self._arrive(_Req("r", prompt_len=64, room=False))
-        stats = req.time_stats
-        self.assertGreater(stats.franky_pages_taken_time, 0.0)
-        self.assertGreaterEqual(
-            stats.franky_taps_ready_time, stats.franky_pages_taken_time
+    def test_taps_count_from_the_cached_prefix(self):
+        self._run(_Req("first", prompt_len=70))
+        later = self._arrive(_Req("later", prompt_len=90))
+        self.receivers[-1].landed_tokens = 80
+
+        messages = self._step(other_stage={"landed:later": 80, "ok:later": 1})
+
+        self.assertEqual(
+            messages, [FrankyTapsReady(request_rid="later", taps_ready=80)]
         )
-
-    def test_an_arrival_that_does_not_fit_holds_back_the_ones_behind_it(self):
-        self._arrive(_Req("first", prompt_len=512))
-        second = self._arrive(_Req("second", prompt_len=400))
-        third = self._arrive(_Req("third", prompt_len=16))
-
-        self.assertIsNone(second.franky)
-        self.assertIsNone(third.franky)
-        self.assertEqual(self.failed, [])
+        self.assertEqual(later.franky.taps_ready, 80)
 
     def test_taps_are_ready_up_to_the_lowest_landing_of_every_stage(self):
         req = self._arrive(_Req("r", prompt_len=64))
@@ -336,27 +420,66 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.assertEqual(messages, [FrankyTapsReady(request_rid="r", taps_ready=32)])
         self.assertEqual(req.franky.taps_ready, 32)
 
-    def test_a_request_that_ends_early_keeps_its_pages_until_its_room_closes(self):
-        req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=16))
+    def test_an_arrival_that_does_not_fit_holds_back_the_ones_behind_it(self):
+        self._arrive(_Req("first", prompt_len=200))
+        second = self._arrive(_Req("second", prompt_len=100))
+        third = self._arrive(_Req("third", prompt_len=16))
+
+        self.assertEqual(len(self.receivers), 1)
+        self.assertTrue(self.queue.reservations.waits("second"))
+        self.assertTrue(self.queue.reservations.waits("third"))
+        self.assertEqual(self.failed, [])
+        self.assertEqual(second.franky.rows_ready(), 99)
+        self.assertEqual(third.franky.rows_ready(), 15)
+
+    def test_a_waiting_arrival_takes_its_stripes_once_they_come_back(self):
+        first = self._arrive(_Req("first", prompt_len=200))
+        self._arrive(_Req("second", prompt_len=100))
+
+        self._finish(first, FINISH_MATCHED_TOKEN(matched=0))
+        self.queue.poll()
+
+        self.assertEqual(len(self.receivers), 2)
+        self.assertIsNotNone(self.queue.reservations.of("second"))
+
+    def test_a_request_that_ends_early_keeps_its_stripes_until_its_room_closes(self):
+        req = self._arrive(_Req("r", prompt_len=64))
         receiver = self.receivers[0]
-        req.franky.hand_to_chunk(start=16, end=32)
-        available = self.allocator.available_size()
+        free_slots = self.tap_cache.num_free_slots()
 
         self.queue.forget(req=req)
         self._step(other_stage={"closed:r": 1})
 
         self.assertTrue(receiver.abort_notified)
-        self.assertEqual(self.allocator.available_size(), available)
-        self.assertEqual(self.tree.locked, ["node-r"])
+        self.assertEqual(self.tap_cache.num_free_slots(), free_slots)
 
         self.manager.acked_rooms.add(receiver.bootstrap_room)
         messages = self._step(other_stage={"closed:r": 1})
 
         self.assertEqual(messages, [FrankyRoomClosed(request_rid="r")])
-        self.assertEqual(self.allocator.available_size(), available + 2 * _PAGE_SIZE)
-        self.assertEqual(self.tree.locked, [])
+        self.assertEqual(self.tap_cache.num_free_slots(), _NUM_SLOTS)
+        self.assertEqual(self._cached_taps(list(range(64))), 0)
         self.assertTrue(receiver.closed)
         self.assertTrue(self.queue.is_empty())
+
+    def test_a_request_that_ends_after_its_taps_landed_keeps_them_cached(self):
+        req = self._arrive(_Req("r", prompt_len=64))
+        req.franky.taps_ready = 64
+
+        self.queue.forget(req=req)
+
+        self.assertTrue(self.queue.is_empty())
+        self.assertEqual(self._cached_taps(list(range(64))), 64)
+
+    def test_an_aborted_waiting_request_takes_no_stripes(self):
+        self._arrive(_Req("first", prompt_len=200))
+        waiting = self._arrive(_Req("waiting", prompt_len=100))
+
+        self.queue.forget(req=waiting)
+        self.queue.poll()
+
+        self.assertFalse(self.queue.reservations.waits("waiting"))
+        self.assertEqual(len(self.receivers), 1)
 
     def test_a_failed_room_fails_its_request(self):
         self._arrive(_Req("r", prompt_len=64))
@@ -366,255 +489,38 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
         self.assertEqual(self.failed, ["r"])
 
-    def test_a_returning_request_whose_taps_left_the_cache_fails(self):
-        req = self._arrive(_Req("r", prompt_len=64))
-        req.franky.taps_ready = 64
-        req.cached_prefix_len = 32
-
-        self._arrive(req)
-
-        self.assertEqual(self.failed, ["r"])
-
-    def test_a_returning_request_never_runs_on_the_pages_it_gave_back(self):
-        req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=16))
-        req.franky.taps_ready = 64
-        req.output_ids = list(range(8))
-        req.cached_prefix_len = 64
-
-        self.queue.add(req=req)
-
-        self.assertIsNone(req.franky)
-        self.queue.poll()
-        self.assertEqual(req.franky.taken_from, 64)
-        self.assertEqual(len(req.franky.taken_kv_slots), 8)
-        self.assertEqual(req.franky.tap_len, 64)
-
-    def test_with_sandys_own_tokens_all_its_taps_land_in_pages_the_request_owns(
-        self,
-    ):
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        own_pages = self.queue.tap_cache.own_pages
-        free_pages = own_pages.num_free()
-
-        req = self._arrive(
-            _Req("r", prompt_len=70, cached_prefix_len=32, sandy_input_len=50)
-        )
-
-        [receiver] = self.receivers
-        self.assertEqual(receiver.tap_pages, req.franky.own_tap_pages.tolist())
-        self.assertEqual(len(receiver.tap_pages), 4)
-        self.assertEqual(receiver.prefix_len, 0)
-        self.assertEqual(own_pages.num_free(), free_pages - 4)
-        self.assertEqual(req.franky.tap_len, 50)
-        self.assertEqual(req.franky.taps_ready, 0)
-        self.assertEqual(len(req.franky.taken_kv_slots), 70 - 32)
-        # Prompt rows read no taps, so all but the row making the answer's
-        # first token may run before any tap lands.
-        self.assertEqual(req.franky.rows_ready(), 69)
-
-    def test_an_arrival_waits_for_tap_pages_it_can_own(self):
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        first = self._arrive(_Req("first", prompt_len=16, sandy_input_len=1000))
-        second = self._arrive(_Req("second", prompt_len=16, sandy_input_len=100))
-
-        self.assertIsNotNone(first.franky)
-        self.assertIsNone(second.franky)
-        self.assertEqual(self.failed, [])
-
     def test_a_request_names_sandys_tokens_exactly_when_sandy_tokenizes_alone(self):
-        self._arrive(_Req("shared", prompt_len=16, sandy_input_len=20))
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        self._arrive(_Req("own", prompt_len=16))
-        self._arrive(_Req("too-long", prompt_len=16, sandy_input_len=_NUM_TOKENS + 1))
+        self.queue.add(req=_Req("shared", prompt_len=16, sandy_input_ids=[1, 2]))
+        self.assertEqual(self.failed, [], "failures wait for the next poll")
+        self.queue.poll()
+        self.queue = self._queue(shared_tokenizer=False)
+        for req in (
+            _Req("own", prompt_len=16),
+            _Req(
+                "too-long",
+                prompt_len=16,
+                sandy_input_ids=list(range(_MAX_TAPS + 1)),
+            ),
+        ):
+            self.queue.add(req=req)
+        self.queue.poll()
 
         self.assertEqual(self.failed, ["shared", "own", "too-long"])
+        self.assertTrue(self.queue.is_empty())
+        self.assertEqual(self.receivers, [])
 
-    def test_a_returning_request_keeps_the_tap_pages_it_owns(self):
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        own_pages = self.queue.tap_cache.own_pages
-        req = self._arrive(_Req("r", prompt_len=64, sandy_input_len=40))
-        pages = req.franky.own_tap_pages
-        free_pages = own_pages.num_free()
-        req.franky.taps_ready = 40
-        req.output_ids = list(range(8))
+    def test_a_returning_request_keeps_its_taps_and_its_receiver(self):
+        req = self._arrive(_Req("r", prompt_len=64))
+        reservation = self.queue.reservations.of("r")
+        req.franky.taps_ready = 32
+        state = req.franky
 
         self._arrive(req)
 
-        self.assertIs(req.franky.own_tap_pages, pages)
-        self.assertEqual(own_pages.num_free(), free_pages)
+        self.assertIs(req.franky, state)
+        self.assertEqual(req.franky.taps_ready, 32)
+        self.assertIs(self.queue.reservations.of("r"), reservation)
         self.assertEqual(len(self.receivers), 1)
-        self.assertEqual(req.franky.rows_ready(), sys.maxsize)
-
-    def test_owned_tap_pages_come_back_when_the_request_ends(self):
-        for reason in (FINISH_MATCHED_TOKEN(matched=0), FINISH_LENGTH(length=8)):
-            with self.subTest(reason=reason):
-                self.queue = self._queue(mamba_room=None, own_pages=True)
-                own_pages = self.queue.tap_cache.own_pages
-                free_pages = own_pages.num_free()
-                req = self._arrive(_Req("r", prompt_len=64, sandy_input_len=40))
-
-                self._finish(req, reason)
-                self.queue.poll()
-
-                self.assertEqual(own_pages.num_free(), free_pages)
-                self.assertTrue(self.queue.is_empty())
-
-    def _own_tap_block(
-        self, block, *, prompt_len, sandy_input_len, starts=(), cached_prefix_len=0
-    ):
-        return _Req(
-            f"c-{block}",
-            prompt_len=prompt_len,
-            cached_prefix_len=cached_prefix_len,
-            chain=FrankyChain(
-                id="c", block=block, block_size=8, sandy_block_starts=starts
-            ),
-            sandy_input_len=sandy_input_len,
-        )
-
-    def _run_own_tap_block(self, block, **kwargs):
-        req = self._arrive(self._own_tap_block(block, **kwargs))
-        pages = req.franky.own_tap_pages.tolist()
-        self._finish(req, FINISH_LENGTH(length=8))
-        self.queue.poll()
-        return pages
-
-    def test_a_blocks_tap_pages_wait_for_the_next_block_which_lands_the_rest(self):
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        own_pages = self.queue.tap_cache.own_pages
-        free_pages = own_pages.num_free()
-        first_pages = self._run_own_tap_block(1, prompt_len=64, sandy_input_len=50)
-        self.assertEqual(own_pages.num_free(), free_pages - 4)
-
-        second = self._arrive(
-            self._own_tap_block(
-                2, prompt_len=72, cached_prefix_len=64, sandy_input_len=90, starts=(50,)
-            )
-        )
-
-        pages = second.franky.own_tap_pages.tolist()
-        self.assertEqual(pages[:4], first_pages)
-        self.assertEqual(len(pages), 6)
-        self.assertEqual(own_pages.num_free(), free_pages - 6)
-        receiver = self.receivers[-1]
-        self.assertEqual(receiver.prefix_len, 48, "3 whole pages of the 50 taps")
-        self.assertEqual(receiver.tap_pages, pages[3:])
-        self.assertEqual(second.franky.taps_ready, 48)
-        self.assertIsNone(self.holds.take_taps(chain_id="c"))
-
-    def test_a_blocks_rows_that_read_only_held_taps_run_before_any_tap_lands(self):
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        self._run_own_tap_block(1, prompt_len=64, sandy_input_len=50)
-        self._run_own_tap_block(
-            2, prompt_len=72, cached_prefix_len=64, sandy_input_len=90, starts=(50,)
-        )
-
-        third = self._arrive(
-            self._own_tap_block(
-                3,
-                prompt_len=80,
-                cached_prefix_len=32,
-                sandy_input_len=130,
-                starts=(50, 90),
-            )
-        )
-
-        self.assertEqual(third.franky.taps_ready, 80)
-        self.assertEqual(
-            third.franky.rows_ready(),
-            71,
-            "rows up to 70 make the first block's tokens, which read 50 taps; row "
-            "71 makes the second block's first token, which reads 90",
-        )
-
-    def test_a_block_whose_sandy_input_ends_a_page_lands_its_last_page_again(self):
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        own_pages = self.queue.tap_cache.own_pages
-        first_pages = self._run_own_tap_block(1, prompt_len=64, sandy_input_len=64)
-        free_pages = own_pages.num_free()
-
-        second = self._arrive(
-            self._own_tap_block(
-                2, prompt_len=72, cached_prefix_len=64, sandy_input_len=64, starts=(64,)
-            )
-        )
-
-        self.assertEqual(second.franky.own_tap_pages.tolist(), first_pages)
-        self.assertEqual(own_pages.num_free(), free_pages)
-        receiver = self.receivers[-1]
-        self.assertEqual(receiver.prefix_len, 48)
-        self.assertEqual(receiver.tap_pages, first_pages[3:])
-
-    def test_a_block_aborted_while_waiting_gives_back_its_chains_tap_pages(self):
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        own_pages = self.queue.tap_cache.own_pages
-        free_pages = own_pages.num_free()
-        self._run_own_tap_block(1, prompt_len=64, sandy_input_len=50)
-        self._arrive(_Req("big", prompt_len=900, sandy_input_len=16))
-        second = self._arrive(
-            self._own_tap_block(
-                2, prompt_len=72, cached_prefix_len=64, sandy_input_len=90, starts=(50,)
-            )
-        )
-        self.assertIsNone(second.franky)
-
-        self.queue.forget(req=second)
-
-        self.assertEqual(own_pages.num_free(), free_pages - 1)
-
-    def test_a_block_reading_fewer_sandy_tokens_than_its_chain_holds_fails(self):
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        own_pages = self.queue.tap_cache.own_pages
-        free_pages = own_pages.num_free()
-        self._run_own_tap_block(1, prompt_len=64, sandy_input_len=50)
-
-        second = self._arrive(
-            self._own_tap_block(
-                2, prompt_len=72, cached_prefix_len=64, sandy_input_len=40, starts=(40,)
-            )
-        )
-        self.queue.forget(req=second)
-
-        self.assertEqual(self.failed, ["c-2"])
-        self.assertEqual(own_pages.num_free(), free_pages)
-
-    def _hold_tap_pages(self, chain_id, *, num_pages, block=1):
-        pages = self.queue.tap_cache.own_pages.take(num_pages=num_pages)
-        self.holds.hold_for_next_block(
-            _held(chain_id, node=f"held-{chain_id}", num_tokens=16, block=block),
-            taps=FrankyHeldTaps(pages=pages, num_taps=num_pages * _PAGE_SIZE),
-        )
-
-    def test_a_new_arrival_short_of_tap_pages_waits_and_the_holds_stay(self):
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        self._hold_tap_pages("a", num_pages=30)
-        self._hold_tap_pages("b", num_pages=30)
-
-        req = self._arrive(_Req("r", prompt_len=16, sandy_input_len=160))
-
-        self.assertIsNone(req.franky)
-        self.assertEqual(self.failed, [])
-        self.assertEqual(self.tree.locked, ["held-a", "held-b"])
-        self.assertIsNotNone(self.holds.take_taps(chain_id="a"))
-        self.assertIsNotNone(self.holds.take_taps(chain_id="b"))
-
-    def test_a_held_chains_next_block_short_of_tap_pages_releases_another(self):
-        self.queue = self._queue(mamba_room=None, own_pages=True)
-        self._run_own_tap_block(1, prompt_len=64, sandy_input_len=50)
-        self._hold_tap_pages("late", num_pages=30, block=3)
-        self._hold_tap_pages("early", num_pages=30)
-
-        second = self._arrive(
-            self._own_tap_block(
-                2, prompt_len=72, cached_prefix_len=64, sandy_input_len=90, starts=(50,)
-            )
-        )
-
-        self.assertIsNotNone(second.franky)
-        self.assertEqual(
-            self.tree.locked, ["held-late", "node-c-2"], "the fewest blocks go"
-        )
-        self.assertIsNotNone(self.holds.take_taps(chain_id="late"))
 
     def test_a_request_without_a_room_runs_at_once_and_caches_apart(self):
         req = _Req("r", prompt_len=64, room=False)
@@ -622,125 +528,10 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self._arrive(req)
 
         self.assertEqual(self.receivers, [])
-        self.assertEqual(req.franky.taps_ready, 64)
         self.assertEqual(req.franky.tap_len, 0)
+        self.assertEqual(req.franky.rows_ready(), sys.maxsize)
         self.assertEqual(req.extra_key, "user|franky=no-taps")
-
-    def _finish(self, req, reason):
-        req.franky.taps_ready = req.franky.tap_len
-        req.done = True
-        req.finished_reason = reason
-
-    def test_a_block_at_its_token_limit_holds_its_prompt_for_the_next_block(self):
-        req = self._arrive(
-            _Req("c-1", prompt_len=64, chain=FrankyChain(block_size=8, id="c"))
-        )
-
-        self._finish(req, FINISH_LENGTH(length=8))
-        self.queue.poll()
-
-        self.assertEqual(self.tree.locked, ["node-c-1"])
         self.assertTrue(self.queue.is_empty())
-
-    def test_a_stopped_or_last_block_releases_its_chains_hold(self):
-        for second_chain, reason in (
-            (FrankyChain(block_size=8, id="s"), FINISH_MATCHED_TOKEN(matched=0)),
-            (
-                FrankyChain(block_size=8, id="l", last_block=True),
-                FINISH_LENGTH(length=8),
-            ),
-        ):
-            first = self._arrive(
-                _Req(
-                    f"{second_chain.id}-1",
-                    prompt_len=64,
-                    chain=FrankyChain(block_size=8, id=second_chain.id),
-                )
-            )
-            self._finish(first, FINISH_LENGTH(length=8))
-            self.queue.poll()
-            self.assertEqual(self.tree.locked, [f"node-{second_chain.id}-1"])
-
-            second = self._arrive(
-                _Req(f"{second_chain.id}-2", prompt_len=96, chain=second_chain)
-            )
-            self._finish(second, reason)
-            self.queue.poll()
-
-            self.assertEqual(self.tree.locked, [])
-
-    def test_a_block_aborted_before_it_took_pages_releases_its_chains_hold(self):
-        first = self._arrive(
-            _Req("c-1", prompt_len=64, chain=FrankyChain(block_size=8, id="c"))
-        )
-        self._finish(first, FINISH_LENGTH(length=8))
-        self.queue.poll()
-        self._arrive(_Req("big", prompt_len=900))
-        second = self._arrive(
-            _Req("c-2", prompt_len=96, chain=FrankyChain(block_size=8, id="c", block=2))
-        )
-        self.assertIsNone(second.franky)
-
-        self.queue.forget(req=second)
-
-        self.assertEqual(self.holds.locked_nodes(), set())
-
-    def test_an_aborted_blocks_prefix_lock_waits_for_its_room(self):
-        req = self._arrive(_Req("r", prompt_len=96, cached_prefix_len=64))
-
-        self.queue.forget(req=req)
-
-        self.assertEqual(
-            self.tree.locked, ["node-r"], "the arrival's lock waits for its room"
-        )
-
-    def test_an_arrival_without_a_cached_prefix_locks_nothing(self):
-        self._arrive(_Req("r", prompt_len=64))
-
-        self.assertEqual(self.tree.locked, [])
-
-    def test_a_new_arrival_that_does_not_fit_waits_and_the_holds_stay(self):
-        self.tree.node_tokens = {"held-a": 400, "held-b": 400}
-        self.holds.hold_for_next_block(_held("a", node="held-a", num_tokens=400))
-        self.holds.hold_for_next_block(_held("b", node="held-b", num_tokens=400))
-        self._arrive(_Req("first", prompt_len=512))
-
-        second = self._arrive(_Req("second", prompt_len=400))
-
-        self.assertIsNone(second.franky)
-        self.assertEqual(self.failed, [])
-        self.assertEqual(self.tree.locked, ["held-a", "held-b"])
-
-    def test_a_held_chains_next_block_that_does_not_fit_releases_another(self):
-        self.tree.node_tokens = {"held-a": 400, "held-b": 400}
-        self.holds.hold_for_next_block(
-            _held("a", node="held-a", num_tokens=400, block=2)
-        )
-        self.holds.hold_for_next_block(_held("b", node="held-b", num_tokens=400))
-        self.holds.hold_for_next_block(_held("c", node="node-c-1", num_tokens=64))
-        self._arrive(_Req("first", prompt_len=512))
-
-        second = self._arrive(
-            _Req(
-                "c-2", prompt_len=448, chain=FrankyChain(id="c", block=2, block_size=8)
-            )
-        )
-
-        self.assertIsNotNone(second.franky)
-        self.assertEqual(self.tree.locked, ["held-a"], "b has the fewest blocks")
-
-    def test_held_chains_next_blocks_take_pages_before_earlier_arrivals(self):
-        self.holds.hold_for_next_block(_held("c", node="node-c-1", num_tokens=64))
-        new = _Req("new", prompt_len=16)
-        block = _Req(
-            "c-2", prompt_len=16, chain=FrankyChain(id="c", block=2, block_size=8)
-        )
-        self.queue.add(req=new)
-        self.queue.add(req=block)
-
-        self.queue.poll()
-
-        self.assertEqual(list(self.queue.receptions), ["c-2", "new"])
 
     def test_kv_past_the_prompt_never_enters_the_cache(self):
         req = self._arrive(_Req("r", prompt_len=64))
@@ -753,91 +544,142 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
         self.assertTrue(req.skip_radix_cache_insert)
 
+    def _block(self, block, *, prompt_len, chain_id="c", first_id=0, last=False):
+        return _Req(
+            f"{chain_id}-{block}",
+            prompt_len=prompt_len,
+            first_id=first_id,
+            chain=FrankyChain(id=chain_id, block=block, block_size=8, last_block=last),
+        )
+
+    def test_a_block_at_its_token_limit_holds_its_prompt_and_taps_for_the_next(
+        self,
+    ):
+        self._run(self._block(1, prompt_len=64), FINISH_LENGTH(length=8))
+
+        self.assertEqual(self.tree.locked, ["node-c-1"])
+        self.assertEqual(self.tap_cache.num_free_slots(), _NUM_SLOTS - 4)
+        self.assertEqual(self.tap_cache.num_free_pages(), (_NUM_SLOTS - 4, 0))
+        self.assertTrue(self.queue.is_empty())
+
+    def test_the_next_block_reads_the_held_taps_and_lets_the_hold_go_once_it_runs(
+        self,
+    ):
+        first_slots = self._run(self._block(1, prompt_len=64), FINISH_LENGTH(length=8))
+
+        second = self._arrive(self._block(2, prompt_len=72))
+
+        receiver = self.receivers[-1]
+        slots = self.queue.reservations.of("c-2").slots.tolist()
+        self.assertEqual(slots[:4], first_slots)
+        self.assertEqual(receiver.prefix_len, 64)
+        self.assertEqual(receiver.tap_pages, slots[4:])
+        self.assertEqual(second.franky.taps_ready, 64)
+        self.assertEqual(
+            second.franky.rows_ready(),
+            71,
+            "rows up to 70 make the first block's tokens, which read 64 taps",
+        )
+        self.assertEqual(self.tree.locked, ["node-c-1"])
+
+        self.queue.on_started(reqs=[second])
+
+        self.assertEqual(self.tree.locked, [])
+
+    def test_a_stopped_or_last_block_releases_its_chains_hold(self):
+        for chain_id, first_id, last, reason in (
+            ("s", 1000, False, FINISH_MATCHED_TOKEN(matched=0)),
+            ("l", 2000, True, FINISH_LENGTH(length=8)),
+        ):
+            with self.subTest(chain_id=chain_id):
+                self._run(
+                    self._block(1, prompt_len=64, chain_id=chain_id, first_id=first_id),
+                    FINISH_LENGTH(length=8),
+                )
+                self.assertEqual(self.tree.locked, [f"node-{chain_id}-1"])
+
+                self._run(
+                    self._block(
+                        2,
+                        prompt_len=72,
+                        chain_id=chain_id,
+                        first_id=first_id,
+                        last=last,
+                    ),
+                    reason,
+                )
+
+                self.assertEqual(self.tree.locked, [])
+                self.assertEqual(self.tap_cache.num_free_slots(), _NUM_SLOTS)
+
+    def test_a_new_arrival_short_of_stripes_waits_and_the_holds_stay(self):
+        self._run(
+            self._block(1, prompt_len=96, chain_id="a", first_id=1000),
+            FINISH_LENGTH(length=8),
+        )
+        self._run(
+            self._block(1, prompt_len=96, chain_id="b", first_id=2000),
+            FINISH_LENGTH(length=8),
+        )
+
+        req = self._arrive(_Req("r", prompt_len=96, first_id=3000))
+
+        self.assertTrue(self.queue.reservations.waits("r"))
+        self.assertEqual(self.failed, [])
+        self.assertEqual(self.tree.locked, ["node-a-1", "node-b-1"])
+        self.assertEqual(req.franky.rows_ready(), 95)
+
+    def test_a_held_chains_next_block_short_of_stripes_releases_another(self):
+        self._run(
+            self._block(3, prompt_len=96, chain_id="late", first_id=1000),
+            FINISH_LENGTH(length=8),
+        )
+        self._run(
+            self._block(1, prompt_len=96, chain_id="early", first_id=2000),
+            FINISH_LENGTH(length=8),
+        )
+        self._run(self._block(1, prompt_len=32), FINISH_LENGTH(length=8))
+
+        second = self._arrive(self._block(2, prompt_len=72))
+
+        self.assertIsNotNone(self.queue.reservations.of("c-2"))
+        self.assertEqual(second.franky.taps_ready, 32)
+        self.assertEqual(
+            self.tree.locked, ["node-late-3", "node-c-1"], "the fewest blocks go"
+        )
+
+    def test_held_chains_next_blocks_take_stripes_before_earlier_arrivals(self):
+        self._run(self._block(1, prompt_len=16), FINISH_LENGTH(length=8))
+        new = _Req("new", prompt_len=16, first_id=1000)
+        block = self._block(2, prompt_len=24)
+        self.queue.add(req=new)
+        self.queue.add(req=block)
+
+        self.queue.poll()
+
+        self.assertEqual(list(self.queue.receptions), ["c-2", "new"])
+
+    def test_a_block_aborted_while_waiting_releases_its_chains_hold(self):
+        self._run(self._block(1, prompt_len=64), FINISH_LENGTH(length=8))
+        self._arrive(_Req("big", prompt_len=192, first_id=1000))
+        second = self._arrive(self._block(2, prompt_len=72))
+        self.assertTrue(self.queue.reservations.waits("c-2"))
+
+        self.queue.forget(req=second)
+
+        self.assertEqual(self.holds.locked_nodes(), set())
+        self.assertEqual(self.tap_cache.num_free_pages(), (0, 4))
+
     def _with_mamba_room(self, *, num_states):
         pool = SimpleNamespace(
             size=4,
             available_size=lambda: 4,
             mamba_allocator=SimpleNamespace(size=num_states),
         )
-        self.queue = self._queue(
-            mamba_room=FrankyMambaRoom(req_to_token_pool=pool, states_per_request=5)
+        self.queue = self._queue_on(
+            shared_tokenizer=True,
+            mamba_room=FrankyMambaRoom(req_to_token_pool=pool, states_per_request=5),
         )
-
-    def test_an_arrival_matches_its_prefix_without_copying_its_mamba_state(self):
-        req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=32))
-
-        self.assertEqual(req.copies_mamba_state, [False])
-
-    def test_a_blocks_arrival_takes_over_its_chains_hold(self):
-        first = self._arrive(
-            _Req("c-1", prompt_len=64, chain=FrankyChain(block_size=8, id="c"))
-        )
-        self._finish(first, FINISH_LENGTH(length=8))
-        self.queue.poll()
-        second = _Req(
-            "c-2",
-            prompt_len=72,
-            cached_prefix_len=64,
-            chain=FrankyChain(block_size=8, id="c", block=2),
-        )
-        second.last_node = "node-c-1"
-
-        self._arrive(second)
-
-        self.assertEqual(self.tree.locked, ["node-c-1"])
-        self.assertEqual(self.holds.locked_nodes(), set())
-
-    def test_a_started_request_no_longer_pins_its_prefix(self):
-        req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=32))
-
-        self.queue.on_started(reqs=[req])
-
-        self.assertEqual(self.tree.locked, [])
-        req.franky.taps_ready = 64
-        self.queue.forget(req=req)
-        self.assertTrue(self.queue.is_empty())
-
-    def test_a_new_arrival_past_the_mamba_room_waits_and_the_holds_stay(self):
-        self._with_mamba_room(num_states=7)
-        self.holds.hold_for_next_block(_held("a", node="held-a", num_tokens=16))
-        self.holds.hold_for_next_block(_held("b", node="held-b", num_tokens=16))
-
-        req = self._arrive(_Req("r", prompt_len=64, cached_prefix_len=32))
-
-        self.assertIsNone(req.franky)
-        self.assertEqual(self.tree.locked, ["held-a", "held-b"])
-
-    def test_a_held_chains_next_block_past_the_mamba_room_releases_another(self):
-        self._with_mamba_room(num_states=7)
-        self.holds.hold_for_next_block(
-            _held("a", node="held-a", num_tokens=16, block=2)
-        )
-        self.holds.hold_for_next_block(_held("c", node="node-c-1", num_tokens=16))
-        block = _Req(
-            "c-2",
-            prompt_len=64,
-            cached_prefix_len=32,
-            chain=FrankyChain(id="c", block=2, block_size=8),
-        )
-        block.last_node = "node-c-2"
-
-        self._arrive(block)
-
-        self.assertIsNotNone(block.franky)
-        self.assertEqual(self.tree.locked, ["node-c-2"])
-
-    def test_an_arrival_waits_while_waiting_prefixes_fill_the_mamba_room(self):
-        self._with_mamba_room(num_states=7)
-        first = self._arrive(_Req("a", prompt_len=64, cached_prefix_len=32))
-        self._arrive(_Req("b", prompt_len=64, cached_prefix_len=32))
-
-        third = self._arrive(_Req("c", prompt_len=64, cached_prefix_len=32))
-
-        self.assertIsNone(third.franky)
-        self.assertEqual(self.failed, [])
-        self.queue.on_started(reqs=[first])
-        self.queue.poll()
-        self.assertIsNotNone(third.franky)
 
     def test_holds_past_the_mamba_room_go_least_progress_first(self):
         self._with_mamba_room(num_states=7)
@@ -850,20 +692,108 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
         self.assertEqual(self.tree.locked, ["held-a", "held-c"])
 
-    def test_a_prefix_shared_by_waiting_requests_takes_one_state(self):
+    def test_only_chain_holds_pin_mamba_states(self):
         self._with_mamba_room(num_states=22)
-        for rid in ("a", "b"):
-            req = _Req(rid, prompt_len=64, cached_prefix_len=32)
-            req.last_node = "system-prompt"
-            self._arrive(req)
         self.holds.hold_for_next_block(_held("c", node="held-c", num_tokens=16))
+        for rid in ("a", "b"):
+            self._arrive(_Req(rid, prompt_len=64, first_id=1000))
 
         self.assertEqual(self.queue.num_startable_requests(), 4)
 
     def test_an_engine_without_a_mamba_pool_sets_no_limit(self):
-        self._arrive(_Req("r", prompt_len=64, cached_prefix_len=32))
+        self._arrive(_Req("r", prompt_len=64))
 
         self.assertIsNone(self.queue.num_startable_requests())
+
+
+class TestRickySchedulerTaps(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.tap_cache = _tap_cache(num_ranks=2, rank=1)
+        self.read_rows = TapReadRows(num_rows=4, max_stripes=8, device="cpu")
+        holds = FrankyChainHolds(
+            tree_cache=None, tap_cache=self.tap_cache, hold_seconds=60
+        )
+        self.reservations = FrankyTapReservations(
+            tap_cache=self.tap_cache, chain_holds=holds, max_taps=_MAX_TAPS
+        )
+        self.scheduler = object.__new__(RickyScheduler)
+        self.scheduler.franky_receive_queue = SimpleNamespace(
+            reservations=self.reservations
+        )
+        self.scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                franky_parts=SimpleNamespace(
+                    tap_cache=self.tap_cache, read_rows=self.read_rows
+                )
+            )
+        )
+
+    def _reserved(self, rid, *, row, num_taps):
+        req = SimpleNamespace(
+            rid=rid,
+            franky_chain=None,
+            finished=lambda: False,
+            kv=SimpleNamespace(req_pool_idx=row),
+            origin_input_ids=list(range(num_taps)),
+            franky=FrankyReqState(
+                tap_len=num_taps,
+                taps_ready=0,
+                generated_spans=_single_turn(num_taps),
+            ),
+            disagg_kv_sender=None,
+        )
+        self.reservations.expect(rid, req=req, sandy_ids=req.origin_input_ids)
+        self.reservations.poll()
+        return req
+
+    def test_a_prefill_batch_binds_each_requests_stripes_and_spans(self):
+        reading = self._reserved("reading", row=2, num_taps=100)
+        plain = SimpleNamespace(
+            rid="plain",
+            kv=SimpleNamespace(req_pool_idx=1),
+            origin_input_ids=list(range(8)),
+            franky=FrankyReqState(tap_len=0, taps_ready=0),
+        )
+
+        self.scheduler._bind_tap_rows([reading, plain])
+
+        slots = self.reservations.of("reading").slots.tolist()
+        self.assertEqual(self.read_rows.stripe_slots[2, :4].tolist(), slots)
+        self.assertEqual(self.read_rows.stripe_slots[1].tolist(), [0] * 8)
+        self.assertEqual(self.read_rows.decode_taps.tolist(), [0, 0, 100, 0])
+        self.assertIs(self.read_rows.spans_of(2), reading.franky.generated_spans)
+        self.assertIsNone(self.read_rows.spans_of(1))
+
+    def test_pd_prefill_relays_the_taps_once_they_all_landed(self):
+        req = self._reserved("r", row=0, num_taps=100)
+        relayed = []
+        req.disagg_kv_sender = SimpleNamespace(
+            relays_taps=False,
+            relay_taps=lambda *, tap_pages: relayed.append(tap_pages.tolist()),
+        )
+
+        self.scheduler._relay_landed_taps(req)
+        self.assertEqual(relayed, [])
+
+        req.franky.taps_ready = 100
+        self.scheduler._relay_landed_taps(req)
+
+        slots = self.reservations.of("r").slots.tolist()
+        self.assertEqual(
+            relayed,
+            [[slots[page // 2] if page % 2 == 1 else -1 for page in range(7)]],
+        )
+
+    def test_a_request_without_taps_relays_nothing(self):
+        sender = MagicMock(relays_taps=False)
+        req = SimpleNamespace(
+            franky=FrankyReqState(tap_len=0, taps_ready=0), disagg_kv_sender=sender
+        )
+
+        self.scheduler._relay_landed_taps(req)
+
+        sender.relay_taps.assert_not_called()
 
 
 class TestFrankyStartableRequests(CustomTestCase):
@@ -888,7 +818,9 @@ class TestSandyHeldChains(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.tree = _Tree()
-        self.holds = FrankyChainHolds(tree_cache=self.tree, hold_seconds=60)
+        self.holds = FrankyChainHolds(
+            tree_cache=self.tree, tap_cache=None, hold_seconds=60
+        )
         self.holds.hold_for_next_block(_held("asker", node="asker", num_tokens=16))
         self.holds.hold_for_next_block(_held("far", node="far", num_tokens=16, block=4))
         self.holds.hold_for_next_block(_held("near", node="near", num_tokens=16))
@@ -928,6 +860,8 @@ class TestFrankyPrefillAdder(CustomTestCase):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         self.tree_cache = MagicMock()
         self.tree_cache.evictable_size.return_value = 0
+        self.tree_cache.full_evictable_size.return_value = 0
+        self.tree_cache.supports_mamba.return_value = False
         self.tree_cache.disable = False
         self.tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         self.tree_cache.dec_lock_ref.return_value = DecLockRefResult()
@@ -937,14 +871,10 @@ class TestFrankyPrefillAdder(CustomTestCase):
         self.tree_cache.buffer_pipeline = None
         self.allocator = MagicMock()
         self.allocator.page_size = _PAGE_SIZE
-        self.allocator.available_size.return_value = 0
+        self.allocator.available_size.return_value = 100_000
         self.allocator.request_slot_reserve.return_value = 0
-        self.allocator.prefill_budget.side_effect = (
-            lambda *, tree_cache, num_mixed_decode_tokens: FrankyPrefillBudget(
-                self.allocator,
-                tree_cache,
-                num_mixed_decode_tokens=num_mixed_decode_tokens,
-            )
+        self.allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
+            PrefillBudget(self.allocator, tree_cache, **kwargs)
         )
 
     def _adder(self, *, rem_chunk_tokens=256):
@@ -960,7 +890,7 @@ class TestFrankyPrefillAdder(CustomTestCase):
             rem_chunk_tokens=rem_chunk_tokens,
         )
 
-    def _req(self, rid, *, prompt_len, prefix_len=0, taps_ready):
+    def _req(self, rid, *, prompt_len, prefix_len=0, taps_ready, spans=None):
         req = MagicMock(spec=Req)
         type(req).extend_len = Req.extend_len
         req.rid = rid
@@ -985,22 +915,26 @@ class TestFrankyPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
-        req.franky = _landed(taps_ready)
+        req.franky = FrankyReqState(
+            tap_len=prompt_len,
+            taps_ready=taps_ready,
+            generated_spans=spans or _single_turn(prompt_len),
+        )
         return req
 
-    def test_a_first_chunk_ends_at_the_landed_taps_on_taken_slots(self):
+    def test_a_first_chunk_runs_every_row_that_reads_no_unlanded_tap(self):
         adder = self._adder()
-        req = self._req("r", prompt_len=100, taps_ready=32)
+        req = self._req("r", prompt_len=100, taps_ready=0)
 
         adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
 
-        self.assertEqual(req.extend_end, 32)
+        self.assertEqual(req.extend_end, 99)
         self.assertIs(adder.new_chunked_req, req)
-        self.allocator.expect_extend.assert_called_with(reqs=[req])
+        self.assertFalse(adder.exact_chunk_fill)
 
-    def test_a_request_without_new_taps_waits_and_lets_others_in(self):
+    def test_a_request_whose_next_row_reads_unlanded_taps_waits(self):
         adder = self._adder()
-        waiting = self._req("waiting", prompt_len=100, prefix_len=32, taps_ready=32)
+        waiting = self._req("waiting", prompt_len=100, prefix_len=99, taps_ready=64)
 
         result = adder.add_one_req(
             waiting, has_chunked_req=False, truncation_align_size=None
@@ -1009,9 +943,30 @@ class TestFrankyPrefillAdder(CustomTestCase):
         self.assertEqual(result, AddReqResult.CONTINUE)
         self.assertEqual(adder.can_run_list, [])
 
+    def test_a_request_whose_taps_all_landed_runs_whole(self):
+        adder = self._adder()
+        req = self._req("r", prompt_len=100, taps_ready=100)
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertIsNone(adder.new_chunked_req)
+
+    def test_kv_memory_bounds_a_request_whose_taps_all_landed(self):
+        self.allocator.available_size.return_value = 32
+        adder = self._adder()
+        req = self._req("r", prompt_len=100, taps_ready=100)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertNotEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [])
+
     def test_while_a_chunked_request_goes_on_only_a_whole_request_joins(self):
         adder = self._adder()
-        partial = self._req("partial", prompt_len=100, taps_ready=32)
+        partial = self._req("partial", prompt_len=100, taps_ready=0)
         whole = self._req("whole", prompt_len=40, taps_ready=40)
 
         for req in (partial, whole):
@@ -1023,12 +978,6 @@ class TestFrankyPrefillAdder(CustomTestCase):
     def test_with_sandys_own_tokens_a_chunk_ends_before_the_first_unlanded_read(
         self,
     ):
-        """Ricky's 100 prompt tokens hold an answer at 40..59 whose copy starts at
-        Sandy's token 30; Sandy's input is 80 tokens. With 30 taps landed, the
-        rows before the one making the new answer's first token may run. Mamba
-        checkpoints land on page ends, so with a Mamba prefix cache a first chunk
-        ends on a page.
-        """
         self.tree_cache.supports_mamba.return_value = True
         self.tree_cache.supports_prefix_sharing.return_value = True
         adder = self._adder()
@@ -1041,9 +990,6 @@ class TestFrankyPrefillAdder(CustomTestCase):
         self.assertIs(adder.new_chunked_req, req)
 
     def test_without_mamba_a_first_chunk_runs_every_row_its_taps_allow(self):
-        """A first chunk cut to a page would leave rows 96..98 for one more
-        forward before the taps land; each forward holds the scheduler."""
-        self.tree_cache.supports_mamba.return_value = False
         adder = self._adder()
         req = self._own_tokens_req()
 
@@ -1053,34 +999,42 @@ class TestFrankyPrefillAdder(CustomTestCase):
         self.assertIs(adder.new_chunked_req, req)
         self.assertFalse(adder.exact_chunk_fill)
 
-    def _own_tokens_req(self):
-        req = self._req("r", prompt_len=100, taps_ready=30)
-        req.franky = _landed(
-            30,
-            generated_spans=FrankyGeneratedSpans(
+    def _own_tokens_req(self, *, prefix_len=0, taps_ready=30):
+        return self._req(
+            "r",
+            prompt_len=100,
+            prefix_len=prefix_len,
+            taps_ready=taps_ready,
+            spans=FrankyGeneratedSpans(
                 spans=(
                     GeneratedSpan(start=40, sandy_start=30, end=60),
                     GeneratedSpan(start=100, sandy_start=80),
                 )
             ),
-            own_tap_pages=torch.arange(4, 9, dtype=torch.int32),
         )
-        return req
 
-    def test_a_continuing_chunk_ends_at_the_landed_taps(self):
+    def test_a_continuing_chunk_ends_at_the_rows_its_landed_taps_allow(self):
         adder = self._adder()
-        req = self._req("r", prompt_len=100, prefix_len=32, taps_ready=64)
+        req = self._own_tokens_req(prefix_len=32, taps_ready=29)
 
         self.assertIs(adder.add_chunked_req(req), req)
-        self.assertEqual(req.extend_end, 64)
+        self.assertEqual(req.extend_end, 39)
 
-    def test_the_prefill_delayer_counts_only_requests_with_landed_taps(self):
-        """Taps land one request at a time; counting requests that still wait on
-        taps would let every lone ready request start its own prefill."""
+    def test_the_prefill_delayer_counts_only_requests_with_rows_to_run(self):
         scheduler = object.__new__(RickyScheduler)
         scheduler.waiting_queue = [
-            SimpleNamespace(franky=_landed(64), prefix_len=0),
-            SimpleNamespace(franky=_landed(32), prefix_len=32),
+            SimpleNamespace(
+                franky=FrankyReqState(
+                    tap_len=64, taps_ready=0, generated_spans=_single_turn(64)
+                ),
+                prefix_len=0,
+            ),
+            SimpleNamespace(
+                franky=FrankyReqState(
+                    tap_len=64, taps_ready=32, generated_spans=_single_turn(64)
+                ),
+                prefix_len=63,
+            ),
             SimpleNamespace(franky=None, prefix_len=0),
         ]
 

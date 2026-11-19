@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import release_kv_cache
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+    from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
     from sglang.srt.franky.chains.holds import FrankyChainHolds
     from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
     from sglang.srt.franky.transfer.senders.sender import FrankyTapSender
@@ -57,7 +57,7 @@ class FrankySendQueue:
     def __init__(
         self,
         *,
-        tap_cache: FrankyTapCache,
+        tap_cache: SandyTapCache,
         req_to_token_pool: ReqToTokenPool,
         tree_cache: BasePrefixCache,
         output_streamer: SchedulerOutputStreamer,
@@ -179,7 +179,9 @@ class FrankySendQueue:
         if end <= send.landed_end:
             return
         slots = self._req_to_token[send.req.kv.req_pool_idx, send.landed_end : end]
-        send.copying.append(FrankyHostPages(self._tap_cache.pages_of(slots=slots)))
+        send.copying.append(
+            FrankyHostPages(self._tap_cache.local_pages(kv_slots=slots))
+        )
         send.landed_end = end
         self._hand_over(send)
 

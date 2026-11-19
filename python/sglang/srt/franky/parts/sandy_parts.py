@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import nn
 from typing_extensions import override
 
+from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
 from sglang.srt.franky.parts.franky_parts import FrankyParts, load_part
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 if TYPE_CHECKING:
+    from sglang.srt.franky.cache.tap_stripes import TapStripes
     from sglang.srt.franky.config import FrankyConfig
     from sglang.srt.franky.parts.encoder.encoder import Encoder
     from sglang.srt.franky.parts.franky_mixin import FrankyMixin
     from sglang.srt.franky.parts.injector.injector import Injector
     from sglang.srt.franky.parts.injector.layer_output import LayerOutput
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 
@@ -35,6 +38,7 @@ class SandyParts(FrankyParts):
         start_layer: int,
         end_layer: int,
         device: str,
+        stripes: TapStripes,
     ) -> None:
         self._encoders = encoders
         self._start_layer = start_layer
@@ -53,11 +57,13 @@ class SandyParts(FrankyParts):
         self._open_at_start = _open_at(all_inputs, edge=start_layer)
         self._open_at_end = _open_at(all_inputs, edge=end_layer)
         self._states: dict[int, torch.Tensor] = {}
+        self.tap_cache: Optional[SandyTapCache] = None
         super().__init__(
             config=config,
             injector=injector,
             layer_indices=frozenset(layer - 1 for layer in self._encoders_of_layer),
             device=device,
+            stripes=stripes,
         )
 
     @classmethod
@@ -97,6 +103,29 @@ class SandyParts(FrankyParts):
             start_layer=start_layer,
             end_layer=end_layer,
             device=device,
+            stripes=cls.attention_tp_stripes(),
+        )
+
+    @override
+    def init_tap_cache(
+        self,
+        *,
+        num_kv_tokens: int,
+        kv_page_size: int,
+        req_to_token_pool: ReqToTokenPool,
+    ) -> None:
+        if kv_page_size % self.config.tap_page_size != 0:
+            raise ValueError(
+                f"Sandy's KV page of {kv_page_size} tokens is not whole tap pages of "
+                f"{self.config.tap_page_size} tokens, and its taps live at its KV slots."
+            )
+        self.tap_cache = SandyTapCache.build(
+            encoder_ids=self._tap_encoder_ids(),
+            output_size=self.config.encoder.output_size,
+            page_size=self.config.tap_page_size,
+            num_kv_slots=num_kv_tokens + kv_page_size,
+            stripes=self.stripes,
+            device=self.device,
         )
 
     @override

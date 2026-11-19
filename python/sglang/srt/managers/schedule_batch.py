@@ -154,9 +154,9 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.franky.cache.generated_spans import GeneratedSpan
-    from sglang.srt.franky.cache.tap_cache import FrankyReqState
     from sglang.srt.franky.chains.chain import FrankyChain
     from sglang.srt.franky.transfer.messages import FrankyRoom
+    from sglang.srt.franky.transfer.req_state import FrankyReqState
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
@@ -1070,7 +1070,7 @@ class Req(ReqDllmMixin):
         franky_room: Optional[FrankyRoom] = None,
         franky_chain: Optional[FrankyChain] = None,
         franky_generated_spans: tuple[GeneratedSpan, ...] = (),
-        franky_sandy_input_len: Optional[int] = None,
+        franky_sandy_input_ids: Optional[list[int]] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1422,7 +1422,7 @@ class Req(ReqDllmMixin):
         self.franky_chain: Optional[FrankyChain] = franky_chain
         self.franky_generated_spans = franky_generated_spans
         # Sandy's tokens of the input when Sandy tokenizes on its own, else None.
-        self.franky_sandy_input_len = franky_sandy_input_len
+        self.franky_sandy_input_ids = franky_sandy_input_ids
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
@@ -1787,9 +1787,6 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
-        if self.franky is not None:
-            # Ricky took KV pages past this prefix at arrival, and taps landed in them.
-            max_prefix_len = min(max_prefix_len, self.franky.taken_from)
         if self.is_dllm():
             # Appended masks and a partial prompt/output block are not reusable
             # KV: bidirectional attention depends on the rest of that block.

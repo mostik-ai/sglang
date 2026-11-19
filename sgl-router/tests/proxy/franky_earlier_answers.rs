@@ -360,7 +360,7 @@ async fn a_sandy_with_its_own_tokenizer_reads_its_rendering_and_ricky_its_spans(
     let ricky_ids = ricky_body["input_ids"].as_array().unwrap();
     let sandy_ids = sandy_body["input_ids"].as_array().unwrap();
     assert_ne!(sandy_ids, ricky_ids);
-    assert_eq!(ricky_body["franky_sandy_input_len"], json!(sandy_ids.len()));
+    assert_eq!(ricky_body["franky_sandy_input_ids"], json!(sandy_ids));
     assert_eq!(
         ricky_body["franky_generated_spans"],
         json!([[ricky_ids.len() - 1, ricky_ids.len()]])
@@ -379,7 +379,7 @@ async fn a_sandy_with_its_own_tokenizer_reads_its_rendering_and_ricky_its_spans(
     for ricky_field in [
         "franky_generated_spans",
         "franky_sandy_spans",
-        "franky_sandy_input_len",
+        "franky_sandy_input_ids",
     ] {
         assert!(sandy_body.get(ricky_field).is_none(), "{sandy_body}");
     }

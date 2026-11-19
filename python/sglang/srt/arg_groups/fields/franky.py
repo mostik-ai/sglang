@@ -48,10 +48,10 @@ class Franky(msgspec.Struct):
     ] = 60.0
     franky_tap_pool_ratio: A[
         float,
-        "Taps a ricky holds per KV slot when its sandy tokenizes on its own. "
-        "Requests then hold taps only while they run, and chains between two "
-        "blocks, but the prefix cache keeps their KV after them, so a PD prefill "
-        "engine fits far more KV with a lower ratio; with fewer tap pages, fewer "
-        "chats run at once and the rest wait. Default is 1: taps for every KV "
-        "slot.",
+        "Taps a ricky's tap pool holds per KV slot, split over its attention-TP "
+        "ranks. Requests hold taps while they run and chains between two blocks; "
+        "a prefix cache over sandy's tokens keeps the taps of finished requests "
+        "until room is needed. A PD prefill engine fits far more KV with a lower "
+        "ratio; with fewer taps, fewer requests read at once and the rest wait. "
+        "Default is 1: taps for every KV slot.",
     ] = 1.0

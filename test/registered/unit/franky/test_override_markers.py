@@ -11,12 +11,6 @@ from sglang.srt.disaggregation.nixl.conn import (
     NixlKVReceiver,
     NixlKVSender,
 )
-from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
-from sglang.srt.franky.cache.prefill_budget import (
-    FrankyPrefillBudget,
-    FrankySwaPrefillBudget,
-)
-from sglang.srt.franky.cache.swa_kv_allocator import FrankySwaKvAllocator
 from sglang.srt.franky.parts.encoder.all.encoder import AllEncoder
 from sglang.srt.franky.parts.encoder.linear.encoder import LinearEncoder
 from sglang.srt.franky.parts.encoder.masked.encoder import MaskedEncoder
@@ -55,9 +49,6 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.prefill_budget import PrefillBudget, SWAPrefillBudget
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -68,10 +59,6 @@ _SUBCLASSES = (
     (SandyBatchResultProcessor, SchedulerBatchResultProcessor),
     (RickyScheduler, Scheduler),
     (FrankyPrefillAdder, PrefillAdder),
-    (FrankyPrefillBudget, PrefillBudget),
-    (FrankyKvAllocator, PagedTokenToKVPoolAllocator),
-    (FrankySwaKvAllocator, SWATokenToKVPoolAllocator),
-    (FrankySwaPrefillBudget, SWAPrefillBudget),
     (AllEncoder, LinearEncoder),
     (MaskedEncoder, LinearEncoder),
     (SingularEncoder, LinearEncoder),

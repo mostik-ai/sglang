@@ -33,8 +33,9 @@ hidden_states = self.franky_after_layer(
 and the rows it holds: DeepSeek V4.1 runs its layers past the tail switch only on each request's last rows, and a
 reader there reads the taps of those rows.
 
-**KV.** Taps live at the token's KV slot, so Ricky needs an allocator whose slots last as long as a token's KV: the
-paged one, or the sliding-window one with a full pool, whose full-pool slots hold the taps (DeepSeek V4).
+**KV.** A model needs nothing from Franky in its KV cache. On Sandy a token's taps live with its KV slot, so Sandy's
+KV page must be whole tap pages; Ricky keeps taps in a pool of its own (`RickyTapCache`), whatever its KV allocator.
+Both split tap pages over their attention-TP ranks (`TapStripes`).
 
 **3. For Sandy under PP, at the stage edges:**
 

@@ -3019,7 +3019,7 @@ class Scheduler(
                 franky_room=recv_req.franky_room,
                 franky_chain=recv_req.franky_chain,
                 franky_generated_spans=recv_req.franky_generated_spans,
-                franky_sandy_input_len=recv_req.franky_sandy_input_len,
+                franky_sandy_input_ids=recv_req.franky_sandy_input_ids,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,

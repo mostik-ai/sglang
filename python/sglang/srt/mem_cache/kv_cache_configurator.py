@@ -2856,12 +2856,7 @@ class KVCacheConfigurator:
                     isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
                     and not token_to_kv_pool.needs_paged_swa_allocator
                 ):
-                    paged_allocator_cls = (
-                        PagedTokenToKVPoolAllocator
-                        if self.franky_kv_options is None
-                        else self.franky_kv_options.paged_allocator_cls
-                    )
-                    token_to_kv_pool_allocator = paged_allocator_cls(
+                    token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                         sizes.full_max_total_num_tokens,
                         page_size=get_schedule().page_size,
                         dtype=self.kv_cache_dtype,
@@ -2879,12 +2874,7 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 elif self.is_hybrid_swa:
-                    swa_allocator_cls = (
-                        SWATokenToKVPoolAllocator
-                        if self.franky_kv_options is None
-                        else self.franky_kv_options.swa_allocator_cls
-                    )
-                    token_to_kv_pool_allocator = swa_allocator_cls(
+                    token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         sizes.full_max_total_num_tokens,
                         sizes.swa_max_total_num_tokens,
                         page_size=get_schedule().page_size,
@@ -2938,10 +2928,6 @@ class KVCacheConfigurator:
                             current_platform.get_paged_allocator_cls()
                             or PagedTokenToKVPoolAllocator
                         )
-                        if self.franky_kv_options is not None:
-                            paged_allocator_cls = (
-                                self.franky_kv_options.paged_allocator_cls
-                            )
                         token_to_kv_pool_allocator = paged_allocator_cls(
                             sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size

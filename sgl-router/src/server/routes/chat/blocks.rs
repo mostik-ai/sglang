@@ -131,10 +131,10 @@ impl SandyIds {
 }
 
 /// Gives Ricky's block body where each block starts in Sandy's tokens, and
-/// Sandy's input: this block's start.
+/// Sandy's input ids up to this block's start, which key Ricky's taps.
 fn add_sandy_block(body: &mut Map<String, Value>, chain: &mut Value, sandy: &SandyBlock) {
     chain["sandy_block_starts"] = json!(sandy.earlier_starts);
-    body.insert("franky_sandy_input_len".into(), sandy.ids.len().into());
+    body.insert("franky_sandy_input_ids".into(), json!(sandy.ids));
 }
 
 impl BlockChain {
@@ -582,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn ricky_reads_the_blocks_sandy_starts_and_sandys_input_length() {
+    fn ricky_reads_the_blocks_sandy_starts_and_sandys_input_ids() {
         let mut body = Map::new();
         let mut chain = json!({"id": "c", "block": 3});
         let block = SandyBlock {
@@ -593,6 +593,6 @@ mod tests {
         add_sandy_block(&mut body, &mut chain, &block);
 
         assert_eq!(chain["sandy_block_starts"], json!([3, 5]));
-        assert_eq!(body["franky_sandy_input_len"], json!(6));
+        assert_eq!(body["franky_sandy_input_ids"], json!([1, 2, 3, 4, 5, 6]));
     }
 }

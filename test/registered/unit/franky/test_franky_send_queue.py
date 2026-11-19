@@ -14,7 +14,8 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
+from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.schedulers.sandy_batch_result_processor import (
@@ -86,6 +87,17 @@ class _PPStore(dict):
         return [self.get(key), self.other_stages.get(key)]
 
 
+def _sandy_cache(*, page_size=_PAGE_SIZE, num_ranks=1, rank=0) -> SandyTapCache:
+    return SandyTapCache.build(
+        encoder_ids=(0,),
+        output_size=2,
+        page_size=page_size,
+        num_kv_slots=32 + _PAGE_SIZE,
+        stripes=TapStripes(num_ranks=num_ranks, rank=rank),
+        device="cpu",
+    )
+
+
 def _req(rid="r", prompt_len=10, chain=None):
     return SimpleNamespace(
         rid=rid,
@@ -140,15 +152,7 @@ class _Queue(CustomTestCase):
         release.start()
         self.addCleanup(release.stop)
         self.queue = FrankySendQueue(
-            tap_cache=FrankyTapCache(
-                encoder_ids=(0,),
-                output_size=2,
-                page_size=_PAGE_SIZE,
-                kv_page_size=_PAGE_SIZE,
-                num_tokens=32,
-                req_to_token=req_to_token,
-                device="cpu",
-            ),
+            tap_cache=_sandy_cache(),
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             tree_cache=self.tree,
             output_streamer=SimpleNamespace(
@@ -159,7 +163,9 @@ class _Queue(CustomTestCase):
                 attn_cp_cpu_group=dist.group.WORLD,
                 pp_store=self.store,
             ),
-            chain_holds=FrankyChainHolds(tree_cache=self.lock_tree, hold_seconds=60),
+            chain_holds=FrankyChainHolds(
+                tree_cache=self.lock_tree, tap_cache=None, hold_seconds=60
+            ),
             page_size=_PAGE_SIZE,
             open_room=lambda req: self.sender,
         )
@@ -249,15 +255,7 @@ class TestLandingInTapPages(_Queue):
     def test_a_kv_page_lands_as_its_tap_pages(self):
         """With tap pages smaller than Sandy's KV pages, each KV page lands as the
         tap pages it holds, in prompt order."""
-        self.queue._tap_cache = FrankyTapCache(
-            encoder_ids=(0,),
-            output_size=2,
-            page_size=_PAGE_SIZE // 2,
-            kv_page_size=_PAGE_SIZE,
-            num_tokens=32,
-            req_to_token=self.queue._req_to_token,
-            device="cpu",
-        )
+        self.queue._tap_cache = _sandy_cache(page_size=_PAGE_SIZE // 2)
         req = _req()
         self.queue.add(req=req)
         req.prefix_len = 10
@@ -265,6 +263,23 @@ class TestLandingInTapPages(_Queue):
         self.queue.after_chunk(req=req, end=10, last=True)
 
         self.assertEqual(self.sender.landed, [[10, 11, 4, 5, 14]])
+
+
+class TestLandingStripedTaps(_Queue):
+    def test_each_rank_lands_every_page_marking_the_pages_other_ranks_keep(self):
+        landed = []
+        for rank in range(2):
+            self.sender.landed = []
+            self.queue._tap_cache = _sandy_cache(num_ranks=2, rank=rank)
+            req = _req(rid=f"r{rank}")
+            self.queue.add(req=req)
+            req.prefix_len = 10
+
+            self.queue.after_chunk(req=req, end=10, last=True)
+
+            landed.append(self.sender.landed)
+
+        self.assertEqual(landed, [[[-1, 1, -1]], [[2, -1, 3]]])
 
 
 class TestRelease(_Queue):

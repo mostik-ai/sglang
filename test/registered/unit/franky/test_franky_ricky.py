@@ -20,16 +20,15 @@ from sglang.srt.franky.cache.generated_spans import (
     FrankyGeneratedSpans,
     GeneratedSpan,
 )
-from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
-from sglang.srt.franky.cache.tap_cache import TAP_DTYPE
+from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
 from sglang.srt.franky.parts.injector.residual.output import StreamOutput
-from sglang.srt.franky.parts.reader.query import reader as query_reader
+from sglang.srt.franky.parts.reader import tap_attention
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -67,14 +66,24 @@ class _Model(nn.Module):
 
 
 def _flash_attention_on_cpu(
-    *, q, k_cache, v_cache, page_table, cache_seqlens, softmax_scale, causal, out
+    *,
+    q,
+    k_cache,
+    v_cache,
+    page_table,
+    cache_seqlens,
+    softmax_scale,
+    causal,
+    out,
+    return_softmax_lse=False,
 ):
     """FlashAttention's paged KV cache call needs a GPU, so this does what it does,
     one query row at a time: a row attends to the first ``cache_seqlens`` keys of
-    its pages, and a row with no key gets zero.
+    its pages, and a row with no key gets zero and a log-sum-exp of minus infinity.
     """
     page_size = k_cache.shape[1]
     keys_of_slots = k_cache.reshape(-1, k_cache.shape[-1])
+    lse = torch.full(q.shape[:1] + q.shape[2:3] + (1,), float("-inf"))
     for row in range(q.shape[0]):
         num_keys = int(cache_seqlens[row])
         if num_keys == 0:
@@ -86,7 +95,8 @@ def _flash_attention_on_cpu(
         keys = keys_of_slots[slots].float()
         scores = q[row, 0].float() @ keys.T * softmax_scale
         out[row, 0] = (torch.softmax(scores, dim=-1) @ keys).to(out.dtype)
-    return out
+        lse[row, :, 0] = torch.logsumexp(scores, dim=-1)
+    return (out, lse) if return_softmax_lse else out
 
 
 def _after_layer(model, *, layer_idx, layer_output, residual, forward_batch):
@@ -130,6 +140,15 @@ def _pr_query_reader(*, queries, taps, visible, weights, prefix):
     return _pr_mlp(joined, weights, prefix)
 
 
+def _spans(tap_len, *, block_size=None):
+    if tap_len == 0:
+        return None
+    return FrankyGeneratedSpans(
+        spans=(GeneratedSpan(start=tap_len, sandy_start=tap_len),),
+        block_size=block_size,
+    )
+
+
 class _Files(CustomTestCase):
     def setUp(self):
         super().setUp()
@@ -138,16 +157,14 @@ class _Files(CustomTestCase):
         server_args = get_context().override_server_args()
         server_args.install()
         self.addCleanup(server_args.restore)
+        self.enterContext(get_parallel().override(attn_tp_size=1, attn_tp_rank=0))
         torch.manual_seed(0)
         attention = patch.object(
-            query_reader, "flash_attn_with_kvcache", _flash_attention_on_cpu
+            tap_attention, "flash_attn_with_kvcache", _flash_attention_on_cpu
         )
         attention.start()
         self.addCleanup(attention.stop)
-        # Row r holds its request's KV slots from slot 8 * r on.
         self.req_to_token = torch.zeros((5, _CONTEXT), dtype=torch.int32)
-        for row in _TAP_LENS:
-            self.req_to_token[row] = torch.arange(8 * row, 8 * row + _CONTEXT)
 
     def _write(self):
         config_path = os.path.join(self.directory, "franky.json")
@@ -202,38 +219,38 @@ class _Files(CustomTestCase):
             device="cpu",
         )
         parts.init_tap_cache(
-            num_tokens=8 * len(self.req_to_token) + _CONTEXT,
-            kv_allocator=_kv_allocator(),
+            num_kv_tokens=8 * len(self.req_to_token) + _CONTEXT,
+            kv_page_size=_PAGE_SIZE,
             req_to_token_pool=SimpleNamespace(req_to_token=self.req_to_token),
         )
         self.taps = {}
-        for encoder_id in parts._tap_encoder_ids():
-            for row, tap_len in _TAP_LENS.items():
-                taps = torch.randn(tap_len, _TAP_SIZE, dtype=TAP_DTYPE)
-                parts.tap_cache.write(
-                    encoder_id=encoder_id,
-                    taps=taps,
-                    kv_slots=self.req_to_token[row, :tap_len].long(),
-                )
-                parts.tap_cache.set_generated_spans(
-                    req_pool_indices=[row],
-                    generated_spans=[
-                        FrankyGeneratedSpans(
-                            spans=(GeneratedSpan(start=tap_len, sandy_start=tap_len),)
-                        )
-                        if tap_len
-                        else None
-                    ],
-                    num_input_tokens=[tap_len],
-                )
-                self.taps[encoder_id, row] = taps
+        for row, tap_len in _TAP_LENS.items():
+            slots = self._land(parts, row=row, tap_len=tap_len)
+            self._bind(
+                parts, row=row, slots=slots, spans=_spans(tap_len), first=tap_len
+            )
         return parts
 
+    def _land(self, parts, *, row, tap_len):
+        if tap_len == 0:
+            return None
+        tap_cache = parts.tap_cache
+        slots = tap_cache.take(-(-tap_len // tap_cache.stripe_size))
+        tokens = torch.arange(tap_len)
+        local = slots[tokens // _PAGE_SIZE] * _PAGE_SIZE + tokens % _PAGE_SIZE
+        for encoder_id in parts._tap_encoder_ids():
+            taps = torch.randn(tap_len, _TAP_SIZE, dtype=TAP_DTYPE)
+            tap_cache.buffers.write(encoder_id=encoder_id, taps=taps, slots=local)
+            self.taps[encoder_id, row] = taps
+        return slots
 
-def _kv_allocator():
-    allocator = FrankyKvAllocator.__new__(FrankyKvAllocator)
-    allocator.page_size = _PAGE_SIZE
-    return allocator
+    def _bind(self, parts, *, row, slots, spans, first):
+        parts.read_rows.bind(
+            req_pool_indices=[row],
+            slots=[slots],
+            spans=[spans],
+            num_input_tokens=[first],
+        )
 
 
 def _extend_batch(*, rows, prefix_lens, extend_lens):
@@ -267,7 +284,6 @@ class TestReaders(_Files):
         config_path, weights_path, weights = self._write()
         model = _Model()
         self._attach(model=model, config_path=config_path, weights_path=weights_path)
-        # Row 1 runs its whole prompt; row 2 runs past its taps; row 3 has none.
         batch = _extend_batch(
             rows=[1, 2, 3], prefix_lens=[0, 2, 0], extend_lens=[5, 4, 2]
         )
@@ -320,13 +336,10 @@ class TestReaders(_Files):
         parts = self._attach(
             model=model, config_path=config_path, weights_path=weights_path
         )
-        parts.tap_cache.set_generated_spans(
+        parts.read_rows.bind(
             req_pool_indices=[4],
-            generated_spans=[
-                FrankyGeneratedSpans(
-                    spans=(GeneratedSpan(start=5, sandy_start=5),), block_size=4
-                )
-            ],
+            slots=[None],
+            spans=[_spans(5, block_size=4)],
             num_input_tokens=[13],
         )
         layer_output = torch.randn(10, _HIDDEN_SIZE)
@@ -353,37 +366,64 @@ class TestReaders(_Files):
             hidden_states - layer_output, expected, atol=2e-3, rtol=2e-3
         )
 
-    def test_a_reader_on_some_rows_reads_each_rows_own_taps(self):
-        """DeepSeek V4.1 runs its late layers only on each request's last rows; a
-        reader there gets those rows and must read what they would read in a
-        forward of every row. An index past the last row reads nothing."""
+    def _rows_of_a_forward(self):
         config_path, weights_path, _ = self._write()
-        model = _Model()
         parts = self._attach(
-            model=model, config_path=config_path, weights_path=weights_path
+            model=_Model(), config_path=config_path, weights_path=weights_path
         )
         batch = _extend_batch(rows=[1, 2], prefix_lens=[0, 2], extend_lens=[5, 4])
         residual = torch.randn(9, _HIDDEN_SIZE)
-        reader = parts._readers[0]
-        everything = reader(
-            tap_cache=parts.tap_cache,
-            encoder_id=0,
+        return parts, batch, residual
+
+    def test_a_later_reader_on_some_rows_reads_each_rows_own_taps(self):
+        """DeepSeek V4.1 runs its late layers only on each request's last rows; a
+        reader there gets those rows and must read what they would read in a
+        forward of every row. An index past the last row reads nothing."""
+        parts, batch, residual = self._rows_of_a_forward()
+        parts._readers[0](
+            taps=parts._attentions[0],
             residual=residual,
             forward_batch=batch,
             rows=None,
         )
-        rows = torch.tensor([4, 8, 9])
+        reader = parts._readers[1]
+        everything = reader(
+            taps=parts._attentions[1],
+            residual=residual,
+            forward_batch=batch,
+            rows=None,
+        )
 
         some = reader(
-            tap_cache=parts.tap_cache,
-            encoder_id=0,
+            taps=parts._attentions[1],
             residual=torch.cat([residual[[4, 8]], residual[:1]]),
             forward_batch=batch,
-            rows=rows,
+            rows=torch.tensor([4, 8, 9]),
         )
 
         torch.testing.assert_close(some[:2], everything[[4, 8]])
         self.assertTrue(torch.equal(some[2], torch.zeros(_HIDDEN_SIZE)))
+
+    def test_a_first_reader_on_some_rows_reads_each_rows_own_taps(self):
+        """The forward's first reader makes the reading for every row of the
+        forward, even when it holds only some of them."""
+        parts, batch, residual = self._rows_of_a_forward()
+        reader = parts._readers[0]
+        everything = reader(
+            taps=parts._attentions[0],
+            residual=residual,
+            forward_batch=batch,
+            rows=None,
+        )
+
+        some = reader(
+            taps=parts._attentions[0],
+            residual=residual[[4, 8]],
+            forward_batch=batch,
+            rows=torch.tensor([4, 8]),
+        )
+
+        torch.testing.assert_close(some, everything[[4, 8]])
 
     def test_tokens_without_taps_and_padded_tokens_get_exactly_zero(self):
         """A CUDA graph pads the batch with tokens of no request."""
@@ -455,14 +495,10 @@ class TestReaders(_Files):
 
 
 class TestRickyParts(_Files):
-    def test_a_pp_stage_loads_only_its_readers_and_holds_all_taps(self):
-        """Reader layer ``L`` reads after the model's layer ``L``, counted from 1,
-        so it belongs to the stage that ends at ``L``. Every stage holds all
-        encoders' taps, since PD's transfer pairs entries by id.
-        """
+    def _stages(self):
         config_path, weights_path, _ = self._write()
         edges = (0, 1, 3, _NUM_LAYERS)
-        stages = [
+        return [
             self._attach(
                 model=_Model(start_layer=start_layer, end_layer=end_layer),
                 config_path=config_path,
@@ -471,9 +507,60 @@ class TestRickyParts(_Files):
             for start_layer, end_layer in zip(edges, edges[1:])
         ]
 
+    def test_a_pp_stage_loads_only_its_readers_and_holds_all_taps(self):
+        """Reader layer ``L`` reads after the model's layer ``L``, counted from 1,
+        so it belongs to the stage that ends at ``L``. Every stage holds all
+        encoders' taps, since PD's transfer pairs entries by id.
+        """
+        stages = self._stages()
+
         self.assertEqual([tuple(stage._readers) for stage in stages], [(0,), (1,), ()])
         self.assertEqual([stage._tap_encoder_ids() for stage in stages], [(0, 1)] * 3)
         self.assertEqual(stages[2].kv_options().tap_bytes_per_token, 2 * _TAP_SIZE * 2)
+        self.assertEqual(
+            [stage.tap_cache.buffers.encoder_ids for stage in stages], [(0, 1)] * 3
+        )
+
+    def test_the_first_reader_of_each_stage_makes_the_forwards_reading(self):
+        stages = self._stages()
+
+        self.assertEqual(
+            [
+                {
+                    index: attention.starts_forward
+                    for index, attention in stage._attentions.items()
+                }
+                for stage in stages
+            ],
+            [{0: True}, {1: True}, {}],
+        )
+
+    def test_readers_share_one_reading_a_forward(self):
+        config_path, weights_path, _ = self._write()
+        parts = self._attach(
+            model=_Model(), config_path=config_path, weights_path=weights_path
+        )
+
+        self.assertEqual(
+            [attention.starts_forward for attention in parts._attentions.values()],
+            [True, False],
+        )
+        self.assertIs(parts._attentions[0].readings, parts._attentions[1].readings)
+        self.assertIsNone(parts._attentions[0].group)
+
+    def test_the_pool_holds_the_taps_of_the_kv_tokens_and_rows_fit_the_context(
+        self,
+    ):
+        config_path, weights_path, _ = self._write()
+        parts = self._attach(
+            model=_Model(), config_path=config_path, weights_path=weights_path
+        )
+
+        self.assertEqual(parts.tap_cache.num_slots, (8 * 5 + _CONTEXT) // _PAGE_SIZE)
+        self.assertEqual(
+            parts.read_rows.stripe_slots.shape, (5, _CONTEXT // _PAGE_SIZE)
+        )
+        self.assertEqual(parts.max_taps, _CONTEXT)
 
 
 if __name__ == "__main__":

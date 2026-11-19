@@ -488,15 +488,15 @@ router gets `--franky-sandy-tokenizer-path` (Sandy's model files) and
 - The router renders each Franky chat twice, with each model's template and
   tokenizer, and finds the earlier answers in both renderings.
 - Sandy gets its own ids as `input_ids`, without the fields below.
-- Ricky gets its own ids, `franky_sandy_input_len` (Sandy's ids), and for the
-  earlier answers `franky_generated_spans` and `franky_sandy_spans`, the same
+- Ricky gets its own ids, `franky_sandy_input_ids` (Sandy's ids, which key
+  Ricky's cached taps), and for the earlier answers `franky_generated_spans` and `franky_sandy_spans`, the same
   answers' runs in Sandy's ids, one to one. A Ricky token of an answer reads
   Sandy's taps before that answer's run.
 - `--franky-sandy-keep-every K` (default 1) shortens Sandy's ids: they keep the
   earlier answers whole and, outside them, only every Kth token of Sandy's
   rendering, counted from its start, so a chat's earlier turns keep the same
-  tokens in Sandy's cache. Ricky's `franky_sandy_input_len` and
-  `franky_sandy_spans` count the kept tokens.
+  tokens in Sandy's cache. Ricky's `franky_sandy_input_ids` and
+  `franky_sandy_spans` hold the kept tokens.
 - A chat gets `400` when it sends `input_ids`, when the router leaves it to the
   engine or Sandy's template does not render it, and when the two renderings
   hold different numbers of answers. `/v1/completions` and `/generate` get

@@ -9,6 +9,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.franky.chains.chain import FrankyChain
+    from sglang.srt.managers.schedule_batch import Req
 
 
 class GeneratedSpan(msgspec.Struct, frozen=True, kw_only=True):
@@ -86,6 +87,19 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
             spans=(*earlier, current), block_size=chain.block_size
         )
 
+    @staticmethod
+    def of_request(req: Req) -> FrankyGeneratedSpans:
+        """The spans of a Ricky request, from its earlier answers, its chain and
+        the input Sandy reads for it.
+        """
+        sandy_ids = req.franky_sandy_input_ids
+        return FrankyGeneratedSpans.of(
+            earlier_answers=req.franky_generated_spans,
+            num_input_tokens=len(req.origin_input_ids),
+            chain=req.franky_chain,
+            sandy_input_len=None if sandy_ids is None else len(sandy_ids),
+        )
+
     def taps_to_read(self, tokens: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -161,7 +175,7 @@ def checked_earlier_answers(
     )
     if sandy_generation_start is None:
         if sandy_answers is not None:
-            raise ValueError("franky_sandy_spans come with franky_sandy_input_len.")
+            raise ValueError("franky_sandy_spans come with franky_sandy_input_ids.")
         return tuple(
             GeneratedSpan(start=start, sandy_start=start, end=end)
             for start, end in answers

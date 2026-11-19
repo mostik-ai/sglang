@@ -2,24 +2,23 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 from safetensors.torch import load_file
 
-from sglang.srt.franky.cache.kv_allocator import FrankyKvAllocator
 from sglang.srt.franky.cache.kv_options import FrankyKvOptions
-from sglang.srt.franky.cache.swa_kv_allocator import FrankySwaKvAllocator
-from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache, TrtllmWorkspace
+from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE
+from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.config import FrankyConfig
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from torch import nn
 
     from sglang.srt.franky.parts.injector.injector import Injector
     from sglang.srt.franky.parts.injector.layer_output import LayerOutput
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
@@ -36,14 +35,18 @@ class FrankyParts(ABC):
         injector: Injector,
         layer_indices: frozenset[int],
         device: str,
+        stripes: TapStripes,
         tap_pool_ratio: float = 1.0,
     ) -> None:
+        """
+        Args:
+            stripes: how the attention-TP ranks split the taps.
+        """
         self.config = config
         self.injector = injector
         self.device = device
-        self.tap_cache: Optional[FrankyTapCache] = None
+        self.stripes = stripes
         self._tap_pool_ratio = tap_pool_ratio
-        # The layers of this PP stage that have a part, counted from 0.
         self._layer_indices = layer_indices
 
     @staticmethod
@@ -106,70 +109,33 @@ class FrankyParts(ABC):
         raise NotImplementedError
 
     def kv_options(self) -> FrankyKvOptions:
+        """What the taps add to the KV budget: this rank's tap bytes per KV token."""
+        tap_bytes = (
+            self._tap_pool_ratio
+            * len(self._tap_encoder_ids())
+            * self.config.encoder.output_size
+            * TAP_DTYPE.itemsize
+        )
         return FrankyKvOptions(
-            tap_bytes_per_token=math.ceil(
-                self._tap_pool_ratio
-                * len(self._tap_encoder_ids())
-                * self.config.encoder.output_size
-                * TAP_DTYPE.itemsize
-            ),
-            paged_allocator_cls=FrankyKvAllocator,
-            swa_allocator_cls=FrankySwaKvAllocator,
+            tap_bytes_per_token=math.ceil(tap_bytes / self.stripes.num_ranks)
         )
 
+    @abstractmethod
     def init_tap_cache(
         self,
         *,
-        num_tokens: int,
-        kv_allocator: BaseTokenToKVPoolAllocator,
+        num_kv_tokens: int,
+        kv_page_size: int,
         req_to_token_pool: ReqToTokenPool,
     ) -> None:
-        """Build the tap cache, once the KV budget has set ``num_tokens``: taps for
-        each of those KV slots, or for ``tap_pool_ratio`` of them in tap pages
-        that requests own.
-        """
-        if not isinstance(kv_allocator, (FrankyKvAllocator, FrankySwaKvAllocator)):
-            raise ValueError(
-                "Franky needs the paged KV allocator or the sliding-window one with "
-                f"a full pool, got {type(kv_allocator).__name__}."
-            )
-        self.tap_cache = FrankyTapCache(
-            encoder_ids=self._tap_encoder_ids(),
-            output_size=self.config.encoder.output_size,
-            page_size=self.config.tap_page_size,
-            kv_page_size=kv_allocator.page_size,
-            num_tokens=self._num_tap_tokens(
-                num_kv_tokens=num_tokens,
-                kv_page_size=kv_allocator.page_size,
-                context_len=req_to_token_pool.req_to_token.shape[1],
-            ),
-            req_to_token=req_to_token_pool.req_to_token,
-            device=self.device,
-            own_pages=self._owns_tap_pages(),
-            attention_workspace=self._attention_workspace(),
-        )
+        """Build this side's tap cache, once the KV budget set ``num_kv_tokens``."""
+        raise NotImplementedError
 
-    def _num_tap_tokens(
-        self, *, num_kv_tokens: int, kv_page_size: int, context_len: int
-    ) -> int:
-        if self._tap_pool_ratio == 1:
-            return num_kv_tokens
-        if not self._owns_tap_pages():
-            raise ValueError(
-                f"Tap pool ratio {self._tap_pool_ratio}: taps live at KV slots unless "
-                "requests own tap pages, so they fit in exactly the KV slots."
-            )
-        tap_page_size = self.config.tap_page_size
-        num_tokens = (
-            int(self._tap_pool_ratio * num_kv_tokens) // kv_page_size * kv_page_size
-        )
-        if num_tokens // tap_page_size < -(-context_len // tap_page_size):
-            raise ValueError(
-                f"Tap pool ratio {self._tap_pool_ratio} holds the taps of {num_tokens} "
-                f"tokens, fewer than one request at the context length {context_len}; "
-                "raise --franky-tap-pool-ratio."
-            )
-        return num_tokens
+    @staticmethod
+    def attention_tp_stripes() -> TapStripes:
+        """How this engine's attention-TP ranks split the taps."""
+        parallel = get_parallel()
+        return TapStripes(num_ranks=parallel.attn_tp_size, rank=parallel.attn_tp_rank)
 
     def runs_after(self, *, layer_idx: int) -> bool:
         """Whether a part of this PP stage runs after layer ``layer_idx``,
@@ -188,14 +154,6 @@ class FrankyParts(ABC):
 
     def read_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         """Take what an earlier PP stage carried."""
-
-    def _attention_workspace(self) -> Optional[TrtllmWorkspace]:
-        """The buffer the readers' attention kernel needs, if any."""
-        return None
-
-    def _owns_tap_pages(self) -> bool:
-        """Whether this side's requests keep their taps in pages of their own."""
-        return False
 
     def write_pp(self, *, pp_proxy_tensors: PPProxyTensors) -> None:
         """Hand what the next PP stage needs."""

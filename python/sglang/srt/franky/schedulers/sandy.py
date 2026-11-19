@@ -74,8 +74,8 @@ class SandyScheduler(Scheduler):
             if parallel.tp_rank == 0 and parallel.pp_rank == 0
             else None
         )
-        self.franky_tap_manager = FrankyTapManager.from_tap_cache(
-            tap_cache=self.tp_worker.model_runner.franky_parts.tap_cache,
+        self.franky_tap_manager = FrankyTapManager.from_buffers(
+            buffers=self.tp_worker.model_runner.franky_parts.tap_cache.buffers,
             side=DisaggregationMode.PREFILL,
             server_args=self.server_args,
             bootstrap_port=port,
@@ -249,6 +249,6 @@ class SandyScheduler(Scheduler):
             franky_room=req.franky_room,
             num_pages=ceil_div(
                 len(req.origin_input_ids),
-                self.tp_worker.model_runner.franky_parts.tap_cache.page_size,
+                self.tp_worker.model_runner.franky_parts.tap_cache.buffers.page_size,
             ),
         )

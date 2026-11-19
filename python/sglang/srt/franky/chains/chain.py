@@ -115,7 +115,7 @@ class FrankyChain(msgspec.Struct, frozen=True, kw_only=True):
         if sandy_input_len is None:
             if starts:
                 raise ValueError(
-                    "sandy_block_starts come with franky_sandy_input_len: they "
+                    "sandy_block_starts come with franky_sandy_input_ids: they "
                     "count the tokens of a Sandy that tokenizes on its own."
                 )
             return

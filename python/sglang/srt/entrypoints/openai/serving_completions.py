@@ -127,7 +127,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             franky_room=request.franky_room,
             franky_generated_spans=request.franky_generated_spans,
-            franky_sandy_input_len=request.franky_sandy_input_len,
+            franky_sandy_input_ids=request.franky_sandy_input_ids,
             franky_sandy_spans=request.franky_sandy_spans,
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,

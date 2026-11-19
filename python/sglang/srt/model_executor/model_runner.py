@@ -767,8 +767,8 @@ class ModelRunner:
     def maybe_init_franky_tap_cache(self):
         if self.franky_parts is not None:
             self.franky_parts.init_tap_cache(
-                num_tokens=self.max_total_num_tokens,
-                kv_allocator=self.token_to_kv_pool_allocator,
+                num_kv_tokens=self.max_total_num_tokens,
+                kv_page_size=self.token_to_kv_pool_allocator.page_size,
                 req_to_token_pool=self.req_to_token_pool,
             )
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-import numpy.typing as npt
 from typing_extensions import override
 
 from sglang.srt.disaggregation.nixl.conn import NixlKVSender
@@ -16,9 +15,8 @@ if TYPE_CHECKING:
 
 class FrankyRelaySender(NixlKVSender):
     """PD's KV sender on Ricky prefill that also relays the request's taps to
-    Ricky decode, and ends only when both transfers ended: the taps of each KV
-    page it sends, or, for a request that owns its tap pages, all of them at the
-    last chunk.
+    Ricky decode in the same room, once they all landed here, and ends only
+    when both transfers ended.
     """
 
     kv_mgr: FrankyRelayManager
@@ -35,42 +33,24 @@ class FrankyRelaySender(NixlKVSender):
         )
         self.tap_sender: Optional[FrankyRoomSender] = None
 
-    @override
-    def init(self, num_kv_indices: int, aux_index: Optional[int] = None) -> None:
-        super().init(num_kv_indices, aux_index)
-        tap_cache = self.kv_mgr.tap_cache
-        if tap_cache.own_pages is None:
-            self.tap_sender = self._open_tap_room(
-                num_pages=num_kv_indices * tap_cache.pages_per_kv_page
-            )
+    def relay_taps(self, *, tap_pages: np.ndarray) -> None:
+        """Relay all of the request's taps at once.
 
-    @override
-    def send(
-        self,
-        kv_indices: npt.NDArray,
-        state_indices: Optional[list] = None,
-        num_kv_tokens: Optional[int] = None,
-        indices_event: Optional[object] = None,
-    ) -> None:
-        super().send(
-            kv_indices,
-            state_indices,
-            num_kv_tokens=num_kv_tokens,
-            indices_event=indices_event,
-        )
-        tap_cache = self.kv_mgr.tap_cache
-        if tap_cache.own_pages is None:
-            self.tap_sender.land(
-                tap_pages=tap_cache.pages_of_kv_pages(kv_pages=kv_indices)
-            )
-
-    def relay_own_taps(self, *, tap_pages: np.ndarray) -> None:
-        """Relay the taps of a request that owns its tap pages, all at once: its
-        last chunk read them all.
+        Args:
+            tap_pages: int32, per page of the request, its local page here or -1.
         """
-        if self.tap_sender is None:
-            self.tap_sender = self._open_tap_room(num_pages=len(tap_pages))
-            self.tap_sender.land(tap_pages=tap_pages)
+        if self.tap_sender is not None:
+            return
+        self.tap_sender = FrankyRoomSender(
+            manager=self.kv_mgr.tap_relay,
+            franky_room=self._relay_room(),
+            num_pages=len(tap_pages),
+        )
+        self.tap_sender.land(tap_pages=tap_pages)
+
+    @property
+    def relays_taps(self) -> bool:
+        return self.tap_sender is not None
 
     @override
     def poll(self) -> int:
@@ -88,13 +68,6 @@ class FrankyRelaySender(NixlKVSender):
         super().clear()
         if self.tap_sender is not None:
             self.tap_sender.close()
-
-    def _open_tap_room(self, *, num_pages: int) -> FrankyRoomSender:
-        return FrankyRoomSender(
-            manager=self.kv_mgr.tap_relay,
-            franky_room=self._relay_room(),
-            num_pages=num_pages,
-        )
 
     def _relay_room(self) -> FrankyRoom:
         host = self.bootstrap_server_url.rsplit(":", 1)[0].strip("[]")

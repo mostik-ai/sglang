@@ -268,11 +268,7 @@ class TestDefaultConfigurator(CustomTestCase):
         _, plain_cfg, plain = self._run(available)
 
         mr = _make_model_runner(self)
-        mr.franky_kv_options = FrankyKvOptions(
-            tap_bytes_per_token=tap_bytes,
-            paged_allocator_cls=object,
-            swa_allocator_cls=object,
-        )
+        mr.franky_kv_options = FrankyKvOptions(tap_bytes_per_token=tap_bytes)
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,

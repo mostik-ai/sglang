@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -13,6 +15,7 @@ def _franky_reader_prefill_kernel(
     taps_to_read,
     row_blocks,
     out,
+    lse,
     query_row_stride,
     tap_page_stride,
     request_pages_stride,
@@ -21,6 +24,7 @@ def _franky_reader_prefill_kernel(
     PAGE_SIZE: tl.constexpr,
     TAP_SIZE: tl.constexpr,
     ROWS: tl.constexpr,
+    HAS_LSE: tl.constexpr,
 ):
     block = tl.program_id(0)
     first_row = tl.load(row_blocks + block * 3)
@@ -68,6 +72,11 @@ def _franky_reader_prefill_kernel(
         attended.to(out.dtype.element_ty),
         mask=in_block[:, None],
     )
+    if HAS_LSE:
+        row_lse = tl.where(
+            running_sum > 0, running_max + tl.log(running_sum), float("-inf")
+        )
+        tl.store(lse + rows, row_lse, mask=in_block)
 
 
 def franky_reader_prefill(
@@ -78,6 +87,7 @@ def franky_reader_prefill(
     row_blocks: torch.Tensor,
     *,
     out: torch.Tensor,
+    lse: Optional[torch.Tensor] = None,
 ) -> None:
     """Attention of every row over the first ``taps_to_read[row]`` taps of its
     request, the taps being both keys and values; a row with none gets zeros.
@@ -89,6 +99,8 @@ def franky_reader_prefill(
         taps_to_read: [rows] int32.
         row_blocks: ``franky_reader_row_blocks`` of the same rows.
         out: [rows, tap_size], written.
+        lse: [rows] float32, written with each row's log-sum-exp of its scaled
+            scores, natural log, or -inf for a row with no taps; None skips it.
     """
     if row_blocks.shape[0] == 0:
         return
@@ -100,6 +112,7 @@ def franky_reader_prefill(
         taps_to_read,
         row_blocks,
         out,
+        out if lse is None else lse,
         queries.stride(0),
         taps.stride(0),
         request_pages.stride(0),
@@ -108,6 +121,7 @@ def franky_reader_prefill(
         PAGE_SIZE=page_size,
         TAP_SIZE=tap_size,
         ROWS=ROWS_PER_BLOCK,
+        HAS_LSE=lse is not None,
         num_warps=8,
         num_stages=1,
     )

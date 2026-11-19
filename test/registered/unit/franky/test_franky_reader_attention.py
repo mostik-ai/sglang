@@ -1,13 +1,12 @@
-"""Ricky's reader attention runs on FlashAttention's paged KV cache. For any mix
-of requests it must read exactly the taps the reader rule allows: a prompt token
-reads up to its own tap, and a later token the taps before the block of the token
-it predicts, never past the request's last tap. That holds for tokens past the
-last tap, a chain's later blocks, requests without taps, padded tokens, and a
-decode CUDA graph replayed with other requests.
+"""Ricky's readers attend over taps that the attention-TP ranks split by stripe:
+each rank attends over the taps it keeps, and the ranks merge their results by
+log-sum-exp. A row must read exactly the taps the reader rule gives it, whatever
+the split, and a row that reads none must get exactly zero.
 """
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -15,205 +14,383 @@ from sglang.srt.franky.cache.generated_spans import (
     FrankyGeneratedSpans,
     GeneratedSpan,
 )
-from sglang.srt.franky.cache.tap_cache import TAP_DTYPE, FrankyTapCache
-from sglang.srt.franky.parts.reader.query.reader import (
-    _attend_taps,
-    attention_workspace,
-)
+from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE, TapBuffers
+from sglang.srt.franky.cache.tap_read_rows import TapReadRows
+from sglang.srt.franky.cache.tap_stripes import TapStripes
+from sglang.srt.franky.parts.reader import tap_attention
+from sglang.srt.franky.parts.reader.tap_attention import TapAttention, TapReadings
+from sglang.srt.franky.parts.reader.tap_reading import TapReading
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-_PAGE_SIZE = 16
-_NUM_QUERIES = 3
-_CONTEXT = 256
-_NUM_ROWS = 6
+_PAGE_SIZE = 4
+_TAP_SIZE = 8
+_NUM_QUERIES = 2
+_NUM_ROWS = 4
+_MAX_STRIPES = 4
+_FREE_SLOTS = {1: [3, 1, 4, 5], 2: [2, 6], 3: []}
+# Row 1's earlier answer, tokens 2 and 3, reads 5 taps; its new answer reads 13.
+# Row 2 reads 3 taps, all of them in rank 0's first page; row 3 reads none.
+_SPANS = {
+    1: FrankyGeneratedSpans(
+        spans=(
+            GeneratedSpan(start=2, sandy_start=5, end=4),
+            GeneratedSpan(start=6, sandy_start=13),
+        )
+    ),
+    2: FrankyGeneratedSpans(spans=(GeneratedSpan(start=3, sandy_start=3),)),
+    3: None,
+}
+_NUM_INPUT_TOKENS = {1: 6, 2: 3, 3: 4}
+_TAP_LENS = {1: 13, 2: 3, 3: 0}
 
 
-def _taps_to_read(token, *, generation_start, block_size):
-    if generation_start is None or token < generation_start:
-        return 0
-    if block_size is None:
-        return generation_start
-    blocks = (token - generation_start) // block_size
-    return generation_start + blocks * block_size
+def _flash_attention_on_cpu(
+    *,
+    q,
+    k_cache,
+    v_cache,
+    page_table,
+    cache_seqlens,
+    softmax_scale,
+    causal,
+    out,
+    return_softmax_lse=False,
+):
+    page_size = k_cache.shape[1]
+    keys_of_slots = k_cache.reshape(-1, k_cache.shape[-1])
+    lse = torch.full(q.shape[:1] + q.shape[2:3] + (1,), float("-inf"))
+    for row in range(q.shape[0]):
+        num_keys = int(cache_seqlens[row])
+        if num_keys == 0:
+            out[row] = 0
+            continue
+        slots = (
+            page_table[row].long()[:, None] * page_size + torch.arange(page_size)
+        ).flatten()[:num_keys]
+        keys = keys_of_slots[slots].float()
+        scores = q[row, 0].float() @ keys.T * softmax_scale
+        out[row, 0] = (torch.softmax(scores, dim=-1) @ keys).to(out.dtype)
+        lse[row, :, 0] = torch.logsumexp(scores, dim=-1)
+    return (out, lse) if return_softmax_lse else out
 
 
-def _spans(generation_start, block_size):
-    if generation_start is None:
-        return None
-    return FrankyGeneratedSpans(
-        spans=(GeneratedSpan(start=generation_start, sandy_start=generation_start),),
-        block_size=block_size,
+def _combine_on_cpu(recv_output, recv_lse, is_lse_base_on_e=True, return_lse=False):
+    lse = recv_lse if is_lse_base_on_e else recv_lse * torch.log(torch.tensor(2.0))
+    weights = torch.softmax(lse, dim=0).nan_to_num(0.0)
+    combined = (weights[..., None] * recv_output.float()).sum(dim=0)
+    return combined.to(recv_output.dtype), None
+
+
+class _Ranks:
+    """The attention-TP group of ranks that run one after the other here: a
+    gather hands each rank's place the last input that rank gave.
+    """
+
+    def __init__(self, world_size):
+        self.world_size = world_size
+        self.inputs = {}
+
+    def group(self, rank):
+        return SimpleNamespace(
+            world_size=self.world_size,
+            all_gather_into_tensor=lambda output, input: self._gather(
+                rank, output, input
+            ),
+        )
+
+    def _gather(self, rank, output, input):
+        self.inputs[rank] = input.clone()
+        places = output.view(self.world_size, *input.shape)
+        for other in range(self.world_size):
+            places[other] = self.inputs.get(other, torch.zeros_like(input))
+
+
+def _taps():
+    torch.manual_seed(0)
+    return {
+        row: torch.randn(tap_len, _TAP_SIZE, dtype=TAP_DTYPE)
+        for row, tap_len in _TAP_LENS.items()
+    }
+
+
+def _slots(row, *, num_ranks):
+    stripe_size = num_ranks * _PAGE_SIZE
+    num_stripes = -(-_TAP_LENS[row] // stripe_size)
+    return _FREE_SLOTS[row][:num_stripes] or None
+
+
+def _rank_pages(taps, stripes):
+    buffers = TapBuffers(
+        encoder_ids=(0,),
+        output_size=_TAP_SIZE,
+        page_size=_PAGE_SIZE,
+        num_pages=8,
+        device="cpu",
+    )
+    for row, row_taps in taps.items():
+        for tap in range(len(row_taps)):
+            page = tap // _PAGE_SIZE
+            if page % stripes.num_ranks != stripes.rank:
+                continue
+            slot = _slots(row, num_ranks=stripes.num_ranks)[page // stripes.num_ranks]
+            buffers.write(
+                encoder_id=0,
+                taps=row_taps[tap : tap + 1],
+                slots=torch.tensor([slot * _PAGE_SIZE + tap % _PAGE_SIZE]),
+            )
+    return buffers.pages(0)
+
+
+def _read_rows(*, num_ranks):
+    read_rows = TapReadRows(num_rows=_NUM_ROWS, max_stripes=_MAX_STRIPES, device="cpu")
+    rows = list(_SPANS)
+    slots = [_slots(row, num_ranks=num_ranks) for row in rows]
+    read_rows.bind(
+        req_pool_indices=rows,
+        slots=[
+            None if row_slots is None else torch.tensor(row_slots)
+            for row_slots in slots
+        ],
+        spans=[_SPANS[row] for row in rows],
+        num_input_tokens=[_NUM_INPUT_TOKENS[row] for row in rows],
+    )
+    return read_rows
+
+
+def _extend_batch():
+    rows, prefix_lens, extend_lens = [1, 2, 3], [0, 0, 1], [6, 3, 3]
+    return SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        req_pool_indices=torch.tensor(rows),
+        req_pool_indices_cpu=torch.tensor(rows),
+        extend_prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32),
+        extend_seq_lens_cpu=extend_lens,
     )
 
 
-def _reference_token_by_token(*, tap_cache, queries, rows, num_taps):
-    taps = tap_cache._buffers[0].float()
-    out = torch.zeros(queries.shape, dtype=torch.float32, device="cuda")
-    has_taps = torch.zeros(queries.shape[0], device="cuda")
+_EXTEND_ROWS = [1] * 6 + [2] * 3 + [3] * 3
+_EXTEND_TAPS = [0, 5, 5, 0, 0, 13, 0, 0, 3, 0, 0, 0]
+
+
+def _decode_batch():
+    return SimpleNamespace(
+        forward_mode=ForwardMode.DECODE, req_pool_indices=torch.tensor([2, 1, 3])
+    )
+
+
+_DECODE_ROWS = [2, 1, 3]
+_DECODE_TAPS = [3, 13, 0]
+
+
+def _reference(queries, taps, *, rows, num_taps):
+    expected = torch.zeros(queries.shape, dtype=torch.float32)
     for token, (row, num_read) in enumerate(zip(rows, num_taps)):
         if num_read == 0:
             continue
-        values = taps[tap_cache._req_to_token[row, :num_read].long()]
+        values = taps[row][:num_read].float()
         weights = torch.softmax(
-            queries[token].float() @ values.T * queries.shape[-1] ** -0.5, dim=-1
+            queries[token].float() @ values.T * _TAP_SIZE**-0.5, dim=-1
         )
-        out[token] = weights @ values
-        has_taps[token] = 1
-    return out, has_taps
+        expected[token] = weights @ values
+    return expected
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class TestReaderAttention(CustomTestCase):
-    def setUp(self):
-        torch.manual_seed(0)
-        # Each row's slots are whole pages, scattered over the pool.
-        num_pages = _NUM_ROWS * _CONTEXT // _PAGE_SIZE
-        pages = torch.randperm(num_pages, device="cuda") + 1
-        req_to_token = torch.zeros(
-            (_NUM_ROWS + 1, _CONTEXT), dtype=torch.int32, device="cuda"
-        )
-        req_to_token[1:] = (
-            pages.view(_NUM_ROWS, -1)[:, :, None] * _PAGE_SIZE
-            + torch.arange(_PAGE_SIZE, device="cuda")
-        ).view(_NUM_ROWS, _CONTEXT)
-        self.tap_cache = FrankyTapCache(
-            encoder_ids=(0,),
-            output_size=256,
+class TestTapReading(CustomTestCase):
+    def _reading(self, batch, *, rank=0, num_ranks=2):
+        return TapReading.of(
+            batch,
+            read_rows=_read_rows(num_ranks=num_ranks),
+            stripes=TapStripes(num_ranks=num_ranks, rank=rank),
             page_size=_PAGE_SIZE,
-            kv_page_size=_PAGE_SIZE,
-            num_tokens=num_pages * _PAGE_SIZE + _PAGE_SIZE,
-            req_to_token=req_to_token,
-            device="cuda",
-            attention_workspace=attention_workspace(device="cuda"),
+            mask_dtype=torch.float32,
         )
-        self.tap_cache._buffers[0].normal_()
 
-    def _run(self, *, batch, num_tokens):
-        queries = torch.randn(
-            num_tokens, _NUM_QUERIES, 256, dtype=TAP_DTYPE, device="cuda"
-        )
-        attended = torch.full_like(queries, float("nan"))
-        has_taps = torch.full((num_tokens, 1), float("nan"), device="cuda")
-        _attend_taps(
-            queries,
-            attended,
-            has_taps,
-            tap_cache=self.tap_cache,
-            encoder_id=0,
-            forward_batch=batch,
-            rows=None,
-        )
-        return queries, attended, has_taps
-
-    def _assert_matches(self, *, queries, attended, has_taps, rows, num_taps):
-        expected, expected_has_taps = _reference_token_by_token(
-            tap_cache=self.tap_cache, queries=queries, rows=rows, num_taps=num_taps
-        )
-        num_tokens = len(rows)
-        torch.testing.assert_close(
-            attended[:num_tokens].float(), expected[:num_tokens], atol=2e-2, rtol=2e-2
-        )
-        self.assertTrue(
-            torch.equal(has_taps[:num_tokens, 0], expected_has_taps[:num_tokens])
-        )
-        # Padded tokens get exactly zero, so the reader adds nothing to them.
-        self.assertTrue(torch.all(attended[num_tokens:] == 0))
-        self.assertTrue(torch.all(has_taps[num_tokens:] == 0))
-
-    def test_extend_reads_what_the_rule_allows(self):
-        # Row 1 runs its whole prompt; row 2 crosses its last tap; row 3 runs only
-        # past it, as a retracted request does; row 4 has no taps; row 5 runs a
-        # chunk inside its taps; row 6 is block 6 of a chain whose prompt is 40
-        # tokens, in blocks of 32, recomputed from inside its prompt.
-        answers = {1: (70, None), 2: (40, None), 3: (30, None), 4: (None, None)}
-        answers |= {5: (200, None), 6: (40, 32)}
-        num_input_tokens = [70, 40, 30, 0, 200, 200]
-        prefix_lens, extend_lens = [0, 30, 35, 0, 120, 30], [70, 50, 9, 5, 64, 175]
-        self.tap_cache.set_generated_spans(
-            req_pool_indices=list(answers),
-            generated_spans=[_spans(*answer) for answer in answers.values()],
-            num_input_tokens=num_input_tokens,
-        )
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            req_pool_indices=torch.tensor(list(answers), device="cuda"),
-            req_pool_indices_cpu=torch.tensor(list(answers)),
-            extend_prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32).cuda(),
-            extend_prefix_lens_cpu=prefix_lens,
-            extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32).cuda(),
-            extend_seq_lens_cpu=extend_lens,
-        )
-        rows, num_taps = [], []
-        for (row, (generation_start, block_size)), prefix_len, extend_len in zip(
-            answers.items(), prefix_lens, extend_lens
+    def test_an_extend_reading_gives_each_row_its_share_of_its_taps(self):
+        for rank, local_taps in (
+            (0, [0, 4, 4, 0, 0, 8, 0, 0, 3, 0, 0, 0]),
+            (1, [0, 1, 1, 0, 0, 5, 0, 0, 0, 0, 0, 0]),
         ):
-            rows += [row] * extend_len
-            num_taps += [
-                _taps_to_read(
-                    token, generation_start=generation_start, block_size=block_size
+            with self.subTest(rank=rank):
+                reading = self._reading(_extend_batch(), rank=rank)
+
+                self.assertEqual(reading.num_rows, 12)
+                self.assertEqual(reading.local_taps[:12].tolist(), local_taps)
+                self.assertEqual(
+                    reading.reads.tolist(),
+                    [taps > 0 for taps in _EXTEND_TAPS] + [False],
                 )
-                for token in range(prefix_len + 1, prefix_len + extend_len + 1)
-            ]
-        queries, attended, has_taps = self._run(batch=batch, num_tokens=len(rows) + 6)
-        self._assert_matches(
-            queries=queries,
-            attended=attended,
-            has_taps=has_taps,
-            rows=rows,
-            num_taps=num_taps,
+                self.assertEqual(
+                    reading.has_taps[:, 0].tolist(),
+                    [float(taps > 0) for taps in _EXTEND_TAPS] + [0.0],
+                )
+                self.assertEqual(reading.merged_rows.tolist(), [1, 2, 5, 8])
+                self.assertEqual(
+                    reading.slot_table[[0, 6, 9]].tolist(), [[3, 1], [2, 0], [0, 0]]
+                )
+                self.assertEqual(reading.row_blocks.shape, (3, 3))
+
+    def test_a_decode_reading_reads_each_rows_decoded_block(self):
+        for rank, local_taps in ((0, [3, 8, 0]), (1, [0, 5, 0])):
+            with self.subTest(rank=rank):
+                reading = self._reading(_decode_batch(), rank=rank)
+
+                self.assertEqual(reading.num_rows, 3)
+                self.assertEqual(reading.local_taps[:3].tolist(), local_taps)
+                self.assertEqual(reading.reads.tolist(), [True, True, False, False])
+                self.assertIsNone(reading.merged_rows)
+                self.assertIsNone(reading.row_blocks)
+                self.assertEqual(
+                    reading.slot_table[:, :2].tolist(), [[2, 0], [3, 1], [0, 0]]
+                )
+
+    def test_a_selection_reads_what_its_rows_read_in_the_forward(self):
+        reading = self._reading(_extend_batch(), rank=1)
+
+        some = reading.select(torch.tensor([5, 8, 12]))
+
+        self.assertEqual(some.num_rows, 3)
+        self.assertEqual(some.local_taps.tolist(), [5, 0, 0])
+        self.assertEqual(some.reads.tolist(), [True, True, False])
+        self.assertEqual(some.slot_table.tolist(), [[3, 1], [2, 0], [0, 0]])
+
+    def test_an_index_past_the_last_row_reads_nothing_without_padding(self):
+        reading = self._reading(_extend_batch(), rank=0)
+
+        some = reading.select(torch.tensor([5, 12]))
+
+        self.assertEqual(some.reads.tolist(), [True, False])
+        self.assertEqual(some.local_taps.tolist(), [8, 0])
+
+
+class TestTapAttention(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        for name, stand_in in (
+            ("flash_attn_with_kvcache", _flash_attention_on_cpu),
+            ("dcp_lse_combine_triton", _combine_on_cpu),
+        ):
+            stand_in_patch = patch.object(tap_attention, name, stand_in)
+            stand_in_patch.start()
+            self.addCleanup(stand_in_patch.stop)
+        self.taps = _taps()
+
+    def _attention(self, *, num_ranks, rank, group):
+        stripes = TapStripes(num_ranks=num_ranks, rank=rank)
+        return TapAttention(
+            pages=_rank_pages(self.taps, stripes),
+            readings=TapReadings(
+                read_rows=_read_rows(num_ranks=num_ranks),
+                stripes=stripes,
+                page_size=_PAGE_SIZE,
+            ),
+            starts_forward=True,
+            group=group,
+            workspace=None,
         )
 
-    def test_a_decode_cuda_graph_replays_with_other_requests(self):
-        self.tap_cache.set_generated_spans(
-            req_pool_indices=[1, 2, 3, 4],
-            generated_spans=[
-                _spans(70, None),
-                _spans(40, None),
-                None,
-                _spans(12, None),
-            ],
-            num_input_tokens=[70, 40, 0, 12],
+    def _attend(self, attention, queries, *, batch, padded_rows):
+        attended = torch.full(
+            (padded_rows, _NUM_QUERIES, _TAP_SIZE), float("nan"), dtype=TAP_DTYPE
         )
-        req_pool_indices = torch.tensor([1, 2, 3], device="cuda")
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE, req_pool_indices=req_pool_indices
+        has_taps = torch.full((padded_rows, 1), float("nan"))
+        attention.attend(queries, attended, has_taps, forward_batch=batch, rows=None)
+        return attended, has_taps
+
+    def _attend_on_every_rank(self, queries, *, num_ranks, batch, padded_rows):
+        ranks = _Ranks(num_ranks)
+        attentions = [
+            self._attention(num_ranks=num_ranks, rank=rank, group=ranks.group(rank))
+            for rank in range(num_ranks)
+        ]
+        for attention in attentions:
+            self._attend(attention, queries, batch=batch, padded_rows=padded_rows)
+        return [
+            self._attend(attention, queries, batch=batch, padded_rows=padded_rows)
+            for attention in attentions
+        ]
+
+    def _assert_reads(self, attended, has_taps, queries, *, rows, num_taps):
+        expected = _reference(
+            queries[: len(rows)], self.taps, rows=rows, num_taps=num_taps
         )
-        queries = torch.randn(3, _NUM_QUERIES, 256, dtype=TAP_DTYPE, device="cuda")
-        attended = torch.empty_like(queries)
-        has_taps = torch.empty((3, 1), device="cuda")
-
-        def step():
-            _attend_taps(
-                queries,
-                attended,
-                has_taps,
-                tap_cache=self.tap_cache,
-                encoder_id=0,
-                forward_batch=batch,
-                rows=None,
-            )
-
-        step()
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            step()
-        req_pool_indices.copy_(torch.tensor([4, 1, 3]))
-        queries.copy_(torch.randn_like(queries))
-        graph.replay()
-        torch.cuda.synchronize()
-
-        self._assert_matches(
-            queries=queries,
-            attended=attended,
-            has_taps=has_taps,
-            rows=[4, 1, 3],
-            num_taps=[12, 70, 0],
+        num_rows = len(rows)
+        torch.testing.assert_close(
+            attended[:num_rows].float(), expected, atol=2e-2, rtol=2e-2
         )
+        self.assertEqual(
+            has_taps[:num_rows, 0].tolist(), [float(taps > 0) for taps in num_taps]
+        )
+        self.assertTrue(torch.all(attended[num_rows:] == 0))
+        self.assertTrue(torch.all(has_taps[num_rows:] == 0))
+
+    def test_one_rank_reads_what_the_rule_allows(self):
+        for batch, rows, num_taps in (
+            (_extend_batch(), _EXTEND_ROWS, _EXTEND_TAPS),
+            (_decode_batch(), _DECODE_ROWS, _DECODE_TAPS),
+        ):
+            with self.subTest(mode=batch.forward_mode):
+                queries = torch.randn(
+                    len(rows) + 2, _NUM_QUERIES, _TAP_SIZE, dtype=TAP_DTYPE
+                )
+                attention = self._attention(num_ranks=1, rank=0, group=None)
+
+                attended, has_taps = self._attend(
+                    attention, queries, batch=batch, padded_rows=len(rows) + 2
+                )
+
+                self._assert_reads(
+                    attended, has_taps, queries, rows=rows, num_taps=num_taps
+                )
+
+    def test_every_rank_merges_to_what_one_rank_reads(self):
+        for batch, rows, num_taps in (
+            (_extend_batch(), _EXTEND_ROWS, _EXTEND_TAPS),
+            (_decode_batch(), _DECODE_ROWS, _DECODE_TAPS),
+        ):
+            for num_ranks in (2, 3):
+                with self.subTest(mode=batch.forward_mode, num_ranks=num_ranks):
+                    queries = torch.randn(
+                        len(rows) + 2, _NUM_QUERIES, _TAP_SIZE, dtype=TAP_DTYPE
+                    )
+
+                    results = self._attend_on_every_rank(
+                        queries,
+                        num_ranks=num_ranks,
+                        batch=batch,
+                        padded_rows=len(rows) + 2,
+                    )
+
+                    for attended, has_taps in results:
+                        self._assert_reads(
+                            attended, has_taps, queries, rows=rows, num_taps=num_taps
+                        )
+
+    def test_ranks_merge_rows_by_their_log_sum_exp(self):
+        queries = torch.randn(2, 1, _TAP_SIZE, dtype=TAP_DTYPE)
+        out = torch.randn(2, 1, _TAP_SIZE, dtype=TAP_DTYPE)
+        lse = torch.tensor([[0.5], [float("-inf")]])
+        ranks = _Ranks(2)
+        other_out = torch.randn(2, 1, _TAP_SIZE, dtype=TAP_DTYPE)
+        other_lse = torch.tensor([[1.5], [float("-inf")]])
+        tap_attention._merge_ranks(
+            other_out, other_lse, group=ranks.group(1), lse_is_base_e=True
+        )
+
+        merged = tap_attention._merge_ranks(
+            out, lse, group=ranks.group(0), lse_is_base_e=True
+        )
+
+        weights = torch.softmax(torch.tensor([0.5, 1.5]), dim=0)
+        expected = weights[0] * out[0].float() + weights[1] * other_out[0].float()
+        torch.testing.assert_close(merged[0].float(), expected, atol=1e-2, rtol=1e-2)
+        self.assertTrue(torch.all(merged[1] == 0))
+        self.assertEqual(queries.shape, merged.shape)
 
 
 if __name__ == "__main__":

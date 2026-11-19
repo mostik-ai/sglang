@@ -3,9 +3,8 @@ from types import SimpleNamespace
 
 import msgspec
 
-from sglang.srt.franky.cache.own_tap_pages import FrankyOwnTapPages
 from sglang.srt.franky.chains.chain import FrankyChain, put_continuations_first
-from sglang.srt.franky.chains.holds import FrankyChainHolds, FrankyHeldTaps
+from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,7 +40,9 @@ class TestFrankyChainHolds(CustomTestCase):
         self.tree = _Tree()
 
     def _holds(self, *, hold_seconds=60.0):
-        return FrankyChainHolds(tree_cache=self.tree, hold_seconds=hold_seconds)
+        return FrankyChainHolds(
+            tree_cache=self.tree, tap_cache=None, hold_seconds=hold_seconds
+        )
 
     def test_a_chains_next_hold_replaces_its_last(self):
         holds = self._holds()
@@ -173,53 +174,36 @@ class TestFrankyChainHolds(CustomTestCase):
         self.assertEqual(self.tree.locked, ["block-2"])
 
 
-class TestFrankyChainHoldsOfTapPages(CustomTestCase):
+class _TapCache:
+    def __init__(self):
+        self.released = []
+
+    def release(self, lock):
+        self.released.append(lock)
+
+
+class TestFrankyChainHoldsOfTaps(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.tree = _Tree()
-        self.own_pages = FrankyOwnTapPages(
-            first_page=1,
-            num_pages=9,
-            max_pages_per_request=8,
-            num_request_rows=2,
-            device="cpu",
-        )
+        self.tap_cache = _TapCache()
         self.holds = self._holds()
 
-    def _holds(self):
+    def _holds(self, *, tree_cache=None):
         return FrankyChainHolds(
-            tree_cache=self.tree, hold_seconds=60.0, own_pages=self.own_pages
+            tree_cache=self.tree if tree_cache is None else tree_cache,
+            tap_cache=self.tap_cache,
+            hold_seconds=60.0,
         )
 
-    def _taps(self, num_pages, *, num_taps):
-        return FrankyHeldTaps(
-            pages=self.own_pages.take(num_pages=num_pages), num_taps=num_taps
-        )
+    def test_a_hold_keeps_its_blocks_tap_lock_beside_its_kv_lock(self):
+        self.holds.hold_for_next_block(_block("c", node="c"), tap_lock="taps-c")
 
-    def test_a_hold_keeps_its_blocks_tap_pages_for_the_next_block_once(self):
-        taps = self._taps(3, num_taps=40)
+        self.assertTrue(self.holds.holds_chain_of(_block("c", node="c", block=2)))
+        self.assertEqual(self.tree.locked, ["c"])
+        self.assertEqual(self.tap_cache.released, [])
 
-        self.holds.hold_for_next_block(_block("c", node="c"), taps=taps)
-
-        self.assertIs(self.holds.take_taps(chain_id="c"), taps)
-        self.assertIsNone(self.holds.take_taps(chain_id="c"))
-        self.assertEqual(self.tree.locked, ["c"], "the KV hold stays")
-        self.assertEqual(self.own_pages.num_free(), 5)
-
-    def test_counts_the_tap_pages_its_holds_keep_until_a_next_block_takes_them(self):
-        self.holds.hold_for_next_block(
-            _block("a", node="a"), taps=self._taps(3, num_taps=40)
-        )
-        self.holds.hold_for_next_block(
-            _block("b", node="b"), taps=self._taps(2, num_taps=20)
-        )
-        self.assertEqual(self.holds.num_held_tap_pages(), 5)
-
-        self.holds.take_taps(chain_id="a")
-
-        self.assertEqual(self.holds.num_held_tap_pages(), 2)
-
-    def test_every_way_a_hold_ends_gives_its_tap_pages_back(self):
+    def test_every_way_a_hold_ends_releases_its_tap_lock(self):
         ends = {
             "release": lambda holds: holds.release(chain_id="c"),
             "least progress": lambda holds: holds.release_least_progress(
@@ -235,46 +219,52 @@ class TestFrankyChainHoldsOfTapPages(CustomTestCase):
         }
         for name, end in ends.items():
             with self.subTest(name):
+                self.tap_cache.released.clear()
                 holds = self._holds()
-                holds.hold_for_next_block(
-                    _block("c", node="c"), taps=self._taps(3, num_taps=40)
-                )
+                holds.hold_for_next_block(_block("c", node="c"), tap_lock="taps-c")
 
                 end(holds)
 
-                self.assertEqual(self.own_pages.num_free(), 8)
-                self.assertEqual(holds.num_held_tap_pages(), 0)
+                self.assertEqual(self.tap_cache.released, ["taps-c"])
                 holds.release_all()
 
-    def test_a_taps_only_hold_ranks_by_the_taps_it_keeps(self):
+    def test_a_last_block_or_one_outside_chains_releases_its_tap_lock_at_once(self):
+        plain = SimpleNamespace(franky_chain=None, last_node="n", origin_input_ids=[0])
+        last = _block("c", node="c-2", last_block=True)
+        self.holds.hold_for_next_block(_block("c", node="c-1"), tap_lock="taps-1")
+
+        self.holds.hold_for_next_block(plain, tap_lock="taps-plain")
+        self.holds.hold_for_next_block(last, tap_lock="taps-last")
+
+        self.assertEqual(
+            sorted(self.tap_cache.released), ["taps-1", "taps-last", "taps-plain"]
+        )
+        self.assertEqual(self.tree.locked, [])
+
+    def test_a_decode_hold_locks_no_prompt_and_ranks_by_its_prompt(self):
         holds = FrankyChainHolds(
-            tree_cache=None, hold_seconds=60.0, own_pages=self.own_pages
+            tree_cache=None, tap_cache=self.tap_cache, hold_seconds=60.0
         )
         holds.hold_for_next_block(
-            _block("few", node=None), taps=self._taps(2, num_taps=20)
+            _block("few", node=None, num_tokens=20), tap_lock="taps-few"
         )
         holds.hold_for_next_block(
-            _block("many", node=None), taps=self._taps(3, num_taps=40)
+            _block("many", node=None, num_tokens=40), tap_lock="taps-many"
         )
 
         holds.release_least_progress(sparing_chain_id=None)
 
-        self.assertEqual(self.own_pages.num_free(), 6)
-        self.assertIsNone(holds.take_taps(chain_id="many"))
-        self.assertIsNotNone(holds.take_taps(chain_id="few"))
-        self.assertEqual(self.tree.locked, [], "decode's holds lock no prompt")
+        self.assertEqual(self.tap_cache.released, ["taps-many"])
+        self.assertTrue(holds.holds_chain_of(_block("few", node=None, block=2)))
+        self.assertEqual(holds.locked_nodes(), set())
+        self.assertEqual(self.tree.locked, [])
 
-    def test_a_last_block_or_one_outside_chains_gives_its_tap_pages_back(self):
-        plain = SimpleNamespace(franky_chain=None, last_node="n", origin_input_ids=[0])
-        last = _block("c", node="c-2", last_block=True)
-        self.holds.hold_for_next_block(
-            _block("c", node="c-1"), taps=self._taps(2, num_taps=20)
-        )
+    def test_a_hold_without_taps_releases_no_tap_lock(self):
+        self.holds.hold_for_next_block(_block("c", node="c"))
 
-        self.holds.hold_for_next_block(plain, taps=self._taps(2, num_taps=20))
-        self.holds.hold_for_next_block(last, taps=self._taps(2, num_taps=30))
+        self.holds.release(chain_id="c")
 
-        self.assertEqual(self.own_pages.num_free(), 8)
+        self.assertEqual(self.tap_cache.released, [])
         self.assertEqual(self.tree.locked, [])
 
 
@@ -357,7 +347,7 @@ class TestFrankyChain(CustomTestCase):
         for starts, sandy_input_len, problem in (
             ([11], 25, "earlier blocks"),
             ([18, 11], 25, "in order"),
-            ([11, 18], None, "come with franky_sandy_input_len"),
+            ([11, 18], None, "come with franky_sandy_input_ids"),
             ([], 25, "needs Sandy's tokens before each earlier block"),
             ([11, 26], 25, "before its earlier blocks"),
         ):

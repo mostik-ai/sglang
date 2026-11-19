@@ -5,79 +5,53 @@ import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
-import torch
 
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.runtime_context import get_franky
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.cache.own_tap_pages import FrankyOwnTapPages
+    from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, TreeLock
 
 logger = logging.getLogger(__name__)
 
 
-class FrankyHeldTaps(msgspec.Struct, frozen=True, kw_only=True):
-    """The tap pages a block of a chain owned, kept for the chain's next block,
-    whose Sandy input extends this block's.
-
-    Attributes:
-        pages: int32 host tap pages of Sandy's tokens from token 0, in order.
-        num_taps: Sandy's tokens whose taps the pages hold: the block's Sandy input.
-    """
-
-    pages: torch.Tensor
-    num_taps: int
-
-    def num_reused_taps(self, *, num_pages: int, page_size: int) -> int:
-        """
-        Args:
-            num_pages: the tap pages of the next block's Sandy input.
-        Returns:
-            The taps of the whole pages the next block reads here instead of
-            receiving them again. Its last page lands again, since a transfer
-            room ends only once a page lands.
-        """
-        return min(self.num_taps // page_size, num_pages - 1) * page_size
-
-
 class _Hold(msgspec.Struct, kw_only=True):
-    lock: Optional[TreeLock]
+    kv_lock: Optional[TreeLock]
+    tap_lock: Optional[TreeLock]
     block: int
     num_tokens: int
     order: int
     expires_at: float
     announced: bool = False
-    taps: Optional[FrankyHeldTaps] = None
 
 
 class FrankyChainHolds:
-    """Each chain's tree lock on its cached prompt (KV and taps) between two of its
-    blocks, and on a Ricky whose Sandy tokenizes on its own, the tap pages its last
-    block owned. A chain between two of its blocks is in flight, as a decoding
-    request is: nothing caps what holds keep, and a new request waits for room
-    instead of taking a hold's. All ranks hold and release alike; only the leader
-    rank decides expiry.
+    """Each chain's locks on what its last block left in the prefix trees,
+    between two of its blocks: the KV prefix tree's lock on the block's prompt,
+    and on Ricky the tap prefix tree's lock on its taps. A chain between two of
+    its blocks is in flight, as a decoding request is: nothing caps what holds
+    keep, and a new request waits for room instead of taking a hold's. All ranks
+    hold and release alike; only the leader rank decides expiry.
     """
 
     def __init__(
         self,
         *,
         tree_cache: Optional[BasePrefixCache],
+        tap_cache: Optional[RickyTapCache],
         hold_seconds: float,
-        own_pages: Optional[FrankyOwnTapPages] = None,
     ) -> None:
         """
         Args:
             tree_cache: None on an engine that caches no prompts, such as PD
-                decode; its holds keep tap pages only.
-            own_pages: where held tap pages go back when their hold ends; None on
-                an engine whose requests own no tap pages.
+                decode.
+            tap_cache: None on Sandy, whose taps live with its KV.
         """
         self._tree_cache = tree_cache
+        self._tap_cache = tap_cache
         self._hold_seconds = hold_seconds
-        self._own_pages = own_pages
         self._holds: dict[str, _Hold] = {}
         self._next_order = 0
 
@@ -85,44 +59,32 @@ class FrankyChainHolds:
     def from_config(
         *,
         tree_cache: Optional[BasePrefixCache],
-        own_pages: Optional[FrankyOwnTapPages] = None,
+        tap_cache: Optional[RickyTapCache] = None,
     ) -> FrankyChainHolds:
         """The holds of an engine, as ``--franky-chain-hold-seconds`` says."""
         return FrankyChainHolds(
             tree_cache=tree_cache,
+            tap_cache=tap_cache,
             hold_seconds=get_franky().franky_chain_hold_seconds,
-            own_pages=own_pages,
         )
 
     def hold_for_next_block(
-        self, req: Req, *, taps: Optional[FrankyHeldTaps] = None
+        self, req: Req, *, tap_lock: Optional[TreeLock] = None
     ) -> None:
-        """Lock the cached prompt of ``req`` for its chain's next block, in place of
-        the chain's last hold. A last block releases the chain's hold instead.
+        """Lock what ``req`` left for its chain's next block, in place of the
+        chain's last hold; a last block releases the chain's hold instead.
 
         Args:
-            taps: the tap pages ``req`` owned, which the holds own from now on:
-                they keep them for the chain's next block or give them back.
+            tap_lock: the tap prefix tree's lock on the taps ``req`` left, which
+                the holds own from now on.
         """
         chain = req.franky_chain
         if chain is None or chain.last_block:
             self.release_chain_of(req)
-            self._give_back(taps)
+            self._release_tap_lock(tap_lock)
             return
         self.release(chain_id=chain.id)
-        self._holds[chain.id] = self._new_hold(req, taps=taps)
-
-    def take_taps(self, *, chain_id: str) -> Optional[FrankyHeldTaps]:
-        """
-        Returns:
-            The tap pages the chain's hold keeps, which the caller owns from now
-            on; None when it keeps none.
-        """
-        hold = self._holds.get(chain_id)
-        if hold is None or hold.taps is None:
-            return None
-        taps, hold.taps = hold.taps, None
-        return taps
+        self._holds[chain.id] = self._new_hold(req, tap_lock=tap_lock)
 
     def holds_chain_of(self, req: Req) -> bool:
         return req.franky_chain is not None and req.franky_chain.id in self._holds
@@ -139,9 +101,9 @@ class FrankyChainHolds:
         hold = self._holds.pop(chain_id, None)
         if hold is None:
             return
-        if hold.lock is not None:
-            self._tree_cache.unlock(hold.lock)
-        self._give_back(hold.taps)
+        if hold.kv_lock is not None:
+            self._tree_cache.unlock(hold.kv_lock)
+        self._release_tap_lock(hold.tap_lock)
 
     def release_all(self) -> None:
         for chain_id in list(self._holds):
@@ -190,43 +152,33 @@ class FrankyChainHolds:
         if hold is not None and hold.order == message.order:
             self.release(chain_id=message.chain_id)
 
-    def num_held_tap_pages(self) -> int:
-        return sum(
-            len(hold.taps.pages)
-            for hold in self._holds.values()
-            if hold.taps is not None
-        )
-
     def locked_nodes(self) -> set[Any]:
-        """The tree nodes the holds lock, each once."""
+        """The KV prefix tree nodes the holds lock, each once."""
         return {
-            hold.lock.node for hold in self._holds.values() if hold.lock is not None
+            hold.kv_lock.node
+            for hold in self._holds.values()
+            if hold.kv_lock is not None
         }
 
-    def _new_hold(self, req: Req, *, taps: Optional[FrankyHeldTaps]) -> _Hold:
+    def _new_hold(self, req: Req, *, tap_lock: Optional[TreeLock]) -> _Hold:
         hold = _Hold(
-            lock=(
+            kv_lock=(
                 None
                 if self._tree_cache is None
                 else self._tree_cache.lock(req.last_node)
             ),
+            tap_lock=tap_lock,
             block=req.franky_chain.block,
-            num_tokens=self._num_held_tokens(req, taps=taps),
+            num_tokens=len(req.origin_input_ids),
             order=self._next_order,
             expires_at=time.monotonic() + self._hold_seconds,
-            taps=taps,
         )
         self._next_order += 1
         return hold
 
-    def _num_held_tokens(self, req: Req, *, taps: Optional[FrankyHeldTaps]) -> int:
-        if self._tree_cache is not None:
-            return len(req.origin_input_ids)
-        return 0 if taps is None else taps.num_taps
+    def _release_tap_lock(self, tap_lock: Optional[TreeLock]) -> None:
+        if tap_lock is not None:
+            self._tap_cache.release(tap_lock)
 
     def _is_not_held(self, req: Req) -> bool:
         return not self.holds_chain_of(req)
-
-    def _give_back(self, taps: Optional[FrankyHeldTaps]) -> None:
-        if taps is not None:
-            self._own_pages.free(taps.pages)

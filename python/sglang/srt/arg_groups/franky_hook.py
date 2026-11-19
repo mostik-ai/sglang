@@ -37,7 +37,7 @@ def handle_franky(server_args: ServerArgs) -> None:
     side_checks = _sandy_checks if cfg.franky_side == "sandy" else _ricky_checks
     checks = {
         **_shared_checks(cfg=cfg, model_config=model_config),
-        **_kv_allocator_checks(cfg=cfg, config=config),
+        **_kv_pool_checks(cfg=cfg),
         **side_checks(cfg=cfg, config=config, model_config=model_config),
     }
     refusals = [reason for reason, is_refused in checks.items() if is_refused]
@@ -89,16 +89,9 @@ def _shared_checks(*, cfg: Any, model_config: ModelConfig) -> dict[str, bool]:
     }
 
 
-def _kv_allocator_checks(*, cfg: Any, config: FrankyConfig) -> dict[str, bool]:
-    """What leaves the paged and sliding-window branches of the KV allocator
-    choice, the only ones that build Franky's allocators; an allocator without a
-    full pool is refused when the tap cache starts.
-    """
+def _kv_pool_checks(*, cfg: Any) -> dict[str, bool]:
+    """KV pools that Franky has not run with."""
     return {
-        f"page size {cfg.page_size} after model and backend rules, it must be a "
-        f"multiple of tap_page_size {config.tap_page_size}": (
-            cfg.page_size % config.tap_page_size != 0
-        ),
         "--enable-unified-memory": cfg.enable_unified_memory,
         "--enable-hisparse": cfg.enable_hisparse,
         "--enable-kv-cache-sharding": cfg.enable_kv_cache_sharding,
@@ -121,6 +114,10 @@ def _sandy_checks(
         # Sandy's taps live at its KV slots.
         f"--franky-tap-pool-ratio {cfg.franky_tap_pool_ratio}": (
             cfg.franky_tap_pool_ratio != 1
+        ),
+        f"page size {cfg.page_size} after model and backend rules, it must be a "
+        f"multiple of tap_page_size {config.tap_page_size}": (
+            cfg.page_size % config.tap_page_size != 0
         ),
     }
 
@@ -167,9 +164,5 @@ def _ricky_checks(
         # replays the lengths it was captured with.
         "--cuda-graph-backend-prefill full": (
             cfg.cuda_graph_config.prefill.backend == Backend.FULL
-        ),
-        # With one tokenizer a token's taps live at its KV slot.
-        f"--franky-tap-pool-ratio {cfg.franky_tap_pool_ratio} with shared_tokenizer": (
-            config.shared_tokenizer and cfg.franky_tap_pool_ratio != 1
         ),
     }
