@@ -5,7 +5,8 @@ from unittest import mock
 import torch
 
 from sglang.srt.franky.cache import tap_pool_metrics as metrics_module
-from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
+from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache, TapReservation
+from sglang.srt.franky.cache.tap_buffers import TapBuffers
 from sglang.srt.franky.cache.tap_pool_metrics import FrankyTapPoolMetrics
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,13 +24,11 @@ class _Gauge:
 
 
 def _tap_cache() -> RickyTapCache:
-    return RickyTapCache.build(
-        encoder_ids=(0,),
-        output_size=8,
-        page_size=4,
-        num_taps=80,
+    return RickyTapCache(
+        buffers=TapBuffers(
+            encoder_ids=(0,), output_size=8, page_size=4, num_pages=11, device="cpu"
+        ),
         stripes=TapStripes(num_ranks=2, rank=1),
-        device="cpu",
     )
 
 
@@ -51,14 +50,16 @@ class TestTapPoolMetrics(CustomTestCase):
         ):
             self.metrics.maybe_publish()
 
-    def _keep(self, sandy_ids: list[int]) -> None:
+    def _cache(self, sandy_ids: list[int]) -> None:
         cached = self.tap_cache.match(sandy_ids)
-        slots = self.tap_cache.take(len(sandy_ids) // self.tap_cache.stripe_size)
+        pages = self.tap_cache.take(len(sandy_ids) // self.tap_cache.stripe_size)
         self.tap_cache.release(
-            self.tap_cache.keep(
-                sandy_ids=sandy_ids,
-                slots=torch.cat([cached.slots, slots]),
-                cached=cached,
+            self.tap_cache.cache(
+                TapReservation(
+                    sandy_ids=sandy_ids,
+                    pages=torch.cat([cached.pages, pages]),
+                    cached=cached,
+                )
             )
         )
 
@@ -72,7 +73,7 @@ class TestTapPoolMetrics(CustomTestCase):
         self.assertEqual(self.metrics.evictable_pages.value, 0)
 
     def test_publishes_what_only_the_prefix_tree_keeps_as_evictable(self):
-        self._keep(list(range(16)))
+        self._cache(list(range(16)))
 
         self._publish_at(10.0)
 
@@ -80,7 +81,7 @@ class TestTapPoolMetrics(CustomTestCase):
         self.assertEqual(self.metrics.evictable_pages.value, 4)
 
     def test_a_locked_prefix_is_neither_free_nor_evictable(self):
-        self._keep(list(range(16)))
+        self._cache(list(range(16)))
         cached = self.tap_cache.match(list(range(16)))
 
         self._publish_at(10.0)

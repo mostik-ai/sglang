@@ -6,6 +6,7 @@ import msgspec
 from sglang.srt.franky.chains.chain import FrankyChain, put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
+from sglang.srt.franky.request import FrankyRequest
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -26,12 +27,19 @@ class _Tree:
 
 def _block(chain_id, *, node, num_tokens=1, block=1, last_block=False):
     return SimpleNamespace(
-        franky_chain=FrankyChain(
-            id=chain_id, block=block, block_size=8, last_block=last_block
+        franky_request=FrankyRequest(
+            chain=FrankyChain(
+                id=chain_id, block=block, block_size=8, last_block=last_block
+            )
         ),
         last_node=node,
         origin_input_ids=[0] * num_tokens,
     )
+
+
+def _chain_id(req):
+    request = FrankyRequest.of(req)
+    return None if request.chain is None else request.chain.id
 
 
 class TestFrankyChainHolds(CustomTestCase):
@@ -62,7 +70,9 @@ class TestFrankyChainHolds(CustomTestCase):
 
     def test_a_request_outside_chains_holds_nothing(self):
         holds = self._holds()
-        plain = SimpleNamespace(franky_chain=None, last_node="n", origin_input_ids=[0])
+        plain = SimpleNamespace(
+            franky_request=None, last_node="n", origin_input_ids=[0]
+        )
 
         holds.hold_for_next_block(plain)
         holds.release_chain_of(plain)
@@ -110,15 +120,14 @@ class TestFrankyChainHolds(CustomTestCase):
         requests = [
             _block("new", node="n"),
             _block("held-2", node="h2", block=2),
-            SimpleNamespace(franky_chain=None),
+            SimpleNamespace(franky_request=None),
             _block("held-1", node="h1", block=2),
         ]
 
         holds.put_held_chains_first(requests)
 
         self.assertEqual(
-            [None if r.franky_chain is None else r.franky_chain.id for r in requests],
-            ["held-2", "held-1", "new", None],
+            [_chain_id(r) for r in requests], ["held-2", "held-1", "new", None]
         )
 
     def test_locked_nodes_name_each_held_node_once(self):
@@ -229,7 +238,9 @@ class TestFrankyChainHoldsOfTaps(CustomTestCase):
                 holds.release_all()
 
     def test_a_last_block_or_one_outside_chains_releases_its_tap_lock_at_once(self):
-        plain = SimpleNamespace(franky_chain=None, last_node="n", origin_input_ids=[0])
+        plain = SimpleNamespace(
+            franky_request=None, last_node="n", origin_input_ids=[0]
+        )
         last = _block("c", node="c-2", last_block=True)
         self.holds.hold_for_next_block(_block("c", node="c-1"), tap_lock="taps-1")
 
@@ -276,7 +287,10 @@ class TestFrankyChain(CustomTestCase):
                 if block is None
                 else FrankyChain(id=name, block=block, block_size=8)
             )
-            return SimpleNamespace(name=name, franky_chain=chain)
+            return SimpleNamespace(
+                name=name,
+                franky_request=None if chain is None else FrankyRequest(chain=chain),
+            )
 
         requests = [
             req("new", 1),

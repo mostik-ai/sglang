@@ -18,6 +18,7 @@ from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
+from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.franky.schedulers.sandy_batch_result_processor import (
     SandyBatchResultProcessor,
 )
@@ -101,7 +102,7 @@ def _sandy_cache(*, page_size=_PAGE_SIZE, num_ranks=1, rank=0) -> SandyTapCache:
 def _req(rid="r", prompt_len=10, chain=None):
     return SimpleNamespace(
         rid=rid,
-        franky_chain=chain,
+        franky_request=None if chain is None else FrankyRequest(chain=chain),
         last_node=f"node-{rid}",
         origin_input_ids=list(range(prompt_len)),
         extend_end=0,

@@ -92,7 +92,7 @@ class FrankyTapPoolMetrics:
         if now < self.last_publish_seconds + self.interval_seconds:
             return
         self.last_publish_seconds = now
-        free, evictable = self.tap_cache.num_free_pages()
-        self.pages.set(self.tap_cache.num_pages)
-        self.free_pages.set(free)
-        self.evictable_pages.set(evictable)
+        usage = self.tap_cache.usage()
+        self.pages.set(usage.pages)
+        self.free_pages.set(usage.free_pages)
+        self.evictable_pages.set(usage.evictable_pages)

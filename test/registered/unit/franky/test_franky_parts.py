@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts import ricky_parts
@@ -48,7 +49,7 @@ class _Parts(FrankyParts):
     def build(cls, **kwargs):
         raise NotImplementedError
 
-    def init_tap_cache(self, **kwargs):
+    def init_tap_pages(self, **kwargs):
         raise NotImplementedError
 
     def _tap_encoder_ids(self):
@@ -169,7 +170,7 @@ class TestFrankyParts(CustomTestCase):
 
         self.assertEqual(
             [
-                _Parts(num_ranks=num_ranks).kv_options().tap_bytes_per_token
+                _Parts(num_ranks=num_ranks).tap_bytes_per_kv_token()
                 for num_ranks in (1, 2, 3)
             ],
             [tap_bytes, tap_bytes // 2, -(-tap_bytes // 3)],
@@ -203,14 +204,15 @@ class TestRickyTapPool(CustomTestCase):
         )
 
     def _init(self, parts, *, context_len, kv_page_size=8):
-        parts.init_tap_cache(
+        """The pool the scheduler builds over the pages the parts own."""
+        parts.init_tap_pages(
             num_kv_tokens=64,
             kv_page_size=kv_page_size,
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.zeros((2, context_len), dtype=torch.int32)
             ),
         )
-        return parts.tap_cache
+        return RickyTapCache(buffers=parts.tap_buffers, stripes=parts.stripes)
 
     def test_the_budget_charges_the_ratio_of_the_taps_per_kv_token_on_this_rank(
         self,
@@ -219,9 +221,9 @@ class TestRickyTapPool(CustomTestCase):
 
         self.assertEqual(
             [
-                self._parts(tap_pool_ratio=0.25, num_ranks=num_ranks)
-                .kv_options()
-                .tap_bytes_per_token
+                self._parts(
+                    tap_pool_ratio=0.25, num_ranks=num_ranks
+                ).tap_bytes_per_kv_token()
                 for num_ranks in (1, 2)
             ],
             [tap_bytes // 4, tap_bytes // 8],
@@ -230,15 +232,15 @@ class TestRickyTapPool(CustomTestCase):
     def test_the_pool_holds_the_ratio_of_the_kv_tokens_in_whole_stripes(self):
         tap_cache = self._init(self._parts(tap_pool_ratio=0.25), context_len=16)
 
-        self.assertEqual(tap_cache.num_slots, 4)
-        self.assertEqual(tap_cache.num_pages, 4)
+        self.assertEqual(tap_cache.num_takeable_stripes(), 4)
+        self.assertEqual(tap_cache.usage().pages, 4)
         self.assertEqual(tap_cache.buffers.transfer_buffers()[0][1], 5 * 4 * 256 * 2)
 
     def test_each_rank_keeps_its_share_of_the_pool(self):
         one = self._init(self._parts(tap_pool_ratio=0.5), context_len=16)
         two = self._init(self._parts(tap_pool_ratio=0.5, num_ranks=2), context_len=16)
 
-        self.assertEqual((one.num_pages, two.num_pages), (8, 8))
+        self.assertEqual((one.usage().pages, two.usage().pages), (8, 8))
         self.assertEqual((one.buffers.num_pages, two.buffers.num_pages), (9, 5))
         self.assertEqual(two.stripes, TapStripes(num_ranks=2, rank=1))
 
@@ -251,7 +253,7 @@ class TestRickyTapPool(CustomTestCase):
             self._parts(tap_pool_ratio=1.0), context_len=16, kv_page_size=6
         )
 
-        self.assertEqual(tap_cache.num_slots, 16)
+        self.assertEqual(tap_cache.num_takeable_stripes(), 16)
 
 
 if __name__ == "__main__":

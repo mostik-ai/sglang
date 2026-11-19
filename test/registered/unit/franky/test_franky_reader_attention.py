@@ -16,10 +16,11 @@ from sglang.srt.franky.cache.generated_spans import (
     GeneratedSpan,
 )
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE, TapBuffers
-from sglang.srt.franky.cache.tap_read_rows import TapReadRows
+from sglang.srt.franky.cache.tap_row_table import TapRowTable
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts.reader import tap_attention
-from sglang.srt.franky.parts.reader.tap_attention import TapAttention, TapReadings
+from sglang.srt.franky.parts.reader.current_tap_reading import CurrentTapReading
+from sglang.srt.franky.parts.reader.tap_attention import TapAttention
 from sglang.srt.franky.parts.reader.tap_gather import TapGather
 from sglang.srt.franky.parts.reader.tap_reading import TapReading
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -33,7 +34,7 @@ _TAP_SIZE = 8
 _NUM_QUERIES = 2
 _NUM_ROWS = 4
 _MAX_STRIPES = 4
-_FREE_SLOTS = {1: [3, 1, 4, 5], 2: [2, 6], 3: []}
+_FREE_PAGES = {1: [3, 1, 4, 5], 2: [2, 6], 3: []}
 # Row 1's earlier answer, tokens 2 and 3, reads 5 taps; its new answer reads 13.
 # Row 2 reads 3 taps, all of them in rank 0's first page; row 3 reads none.
 _SPANS = {
@@ -129,10 +130,10 @@ def _taps():
     }
 
 
-def _slots(row, *, num_ranks):
+def _pages(row, *, num_ranks):
     stripe_size = num_ranks * _PAGE_SIZE
     num_stripes = -(-_TAP_LENS[row] // stripe_size)
-    return _FREE_SLOTS[row][:num_stripes] or None
+    return _FREE_PAGES[row][:num_stripes] or None
 
 
 def _rank_pages(taps, stripes):
@@ -148,29 +149,31 @@ def _rank_pages(taps, stripes):
             page = tap // _PAGE_SIZE
             if page % stripes.num_ranks != stripes.rank:
                 continue
-            slot = _slots(row, num_ranks=stripes.num_ranks)[page // stripes.num_ranks]
+            local_page = _pages(row, num_ranks=stripes.num_ranks)[
+                page // stripes.num_ranks
+            ]
             buffers.write(
                 encoder_id=0,
                 taps=row_taps[tap : tap + 1],
-                slots=torch.tensor([slot * _PAGE_SIZE + tap % _PAGE_SIZE]),
+                slots=torch.tensor([local_page * _PAGE_SIZE + tap % _PAGE_SIZE]),
             )
     return buffers.pages(0)
 
 
-def _read_rows(*, num_ranks):
-    read_rows = TapReadRows(num_rows=_NUM_ROWS, max_stripes=_MAX_STRIPES, device="cpu")
+def _row_table(*, num_ranks):
+    row_table = TapRowTable(num_rows=_NUM_ROWS, max_stripes=_MAX_STRIPES, device="cpu")
     rows = list(_SPANS)
-    slots = [_slots(row, num_ranks=num_ranks) for row in rows]
-    read_rows.bind(
+    pages = [_pages(row, num_ranks=num_ranks) for row in rows]
+    row_table.bind(
         req_pool_indices=rows,
-        slots=[
-            None if row_slots is None else torch.tensor(row_slots)
-            for row_slots in slots
+        pages=[
+            None if row_pages is None else torch.tensor(row_pages)
+            for row_pages in pages
         ],
         spans=[_SPANS[row] for row in rows],
         num_input_tokens=[_NUM_INPUT_TOKENS[row] for row in rows],
     )
-    return read_rows
+    return row_table
 
 
 def _extend_batch():
@@ -217,7 +220,7 @@ class TestTapReading(CustomTestCase):
     def _reading(self, batch, *, rank=0, num_ranks=2):
         return TapReading.of(
             batch,
-            read_rows=_read_rows(num_ranks=num_ranks),
+            row_table=_row_table(num_ranks=num_ranks),
             stripes=TapStripes(num_ranks=num_ranks, rank=rank),
             page_size=_PAGE_SIZE,
             mask_dtype=torch.float32,
@@ -234,7 +237,7 @@ class TestTapReading(CustomTestCase):
                 self.assertEqual(reading.num_rows, 12)
                 self.assertEqual(reading.local_taps[:12].tolist(), local_taps)
                 self.assertEqual(
-                    reading.reads.tolist(),
+                    (~reading.no_taps).tolist(),
                     [taps > 0 for taps in _EXTEND_TAPS] + [False],
                 )
                 self.assertEqual(
@@ -243,7 +246,7 @@ class TestTapReading(CustomTestCase):
                 )
                 self.assertEqual(reading.merged_rows.tolist(), [1, 2, 5, 8])
                 self.assertEqual(
-                    reading.slot_table[[0, 6, 9]].tolist(), [[3, 1], [2, 0], [0, 0]]
+                    reading.page_table[[0, 6, 9]].tolist(), [[3, 1], [2, 0], [0, 0]]
                 )
                 self.assertEqual(reading.row_blocks.shape, (3, 3))
 
@@ -254,11 +257,13 @@ class TestTapReading(CustomTestCase):
 
                 self.assertEqual(reading.num_rows, 3)
                 self.assertEqual(reading.local_taps[:3].tolist(), local_taps)
-                self.assertEqual(reading.reads.tolist(), [True, True, False, False])
+                self.assertEqual(
+                    (~reading.no_taps).tolist(), [True, True, False, False]
+                )
                 self.assertIsNone(reading.merged_rows)
                 self.assertIsNone(reading.row_blocks)
                 self.assertEqual(
-                    reading.slot_table[:, :2].tolist(), [[2, 0], [3, 1], [0, 0]]
+                    reading.page_table[:, :2].tolist(), [[2, 0], [3, 1], [0, 0]]
                 )
 
     def test_a_selection_reads_what_its_rows_read_in_the_forward(self):
@@ -268,15 +273,15 @@ class TestTapReading(CustomTestCase):
 
         self.assertEqual(some.num_rows, 3)
         self.assertEqual(some.local_taps.tolist(), [5, 0, 0])
-        self.assertEqual(some.reads.tolist(), [True, True, False])
-        self.assertEqual(some.slot_table.tolist(), [[3, 1], [2, 0], [0, 0]])
+        self.assertEqual((~some.no_taps).tolist(), [True, True, False])
+        self.assertEqual(some.page_table.tolist(), [[3, 1], [2, 0], [0, 0]])
 
     def test_an_index_past_the_last_row_reads_nothing_without_padding(self):
         reading = self._reading(_extend_batch(), rank=0)
 
         some = reading.select(torch.tensor([5, 12]))
 
-        self.assertEqual(some.reads.tolist(), [True, False])
+        self.assertEqual((~some.no_taps).tolist(), [True, False])
         self.assertEqual(some.local_taps.tolist(), [8, 0])
 
 
@@ -297,12 +302,12 @@ class TestTapAttention(CustomTestCase):
         stripes = TapStripes(num_ranks=num_ranks, rank=rank)
         return TapAttention(
             pages=_rank_pages(self.taps, stripes),
-            readings=TapReadings(
-                read_rows=_read_rows(num_ranks=num_ranks),
+            reading=CurrentTapReading(
+                row_table=_row_table(num_ranks=num_ranks),
                 stripes=stripes,
                 page_size=_PAGE_SIZE,
             ),
-            starts_forward=True,
+            builds_reading=True,
             gather=None if group is None else TapGather(group=group, multicast=None),
             workspace=None,
         )

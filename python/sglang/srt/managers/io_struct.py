@@ -52,9 +52,7 @@ from pydantic import PlainValidator
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
-from sglang.srt.franky.cache.generated_spans import GeneratedSpan
-from sglang.srt.franky.chains.chain import FrankyChain
-from sglang.srt.franky.transfer.messages import FrankyRoom
+from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
@@ -1208,10 +1206,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
-    franky_room: Optional[FrankyRoom] = None
-    franky_chain: Optional[FrankyChain] = None
-    franky_generated_spans: tuple[GeneratedSpan, ...] = ()
-    franky_sandy_input_ids: Optional[List[int]] = None
+    franky: Optional[FrankyRequest] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

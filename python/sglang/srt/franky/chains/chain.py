@@ -139,4 +139,5 @@ def put_continuations_first(requests: list[Req]) -> None:
 
 
 def _is_not_a_continuation(req: Req) -> bool:
-    return req.franky_chain is None or not req.franky_chain.continues
+    request = req.franky_request
+    return request is None or request.chain is None or not request.chain.continues

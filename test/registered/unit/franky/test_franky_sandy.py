@@ -136,7 +136,7 @@ class _Files(CustomTestCase):
                 dtype=TAP_DTYPE,
                 device="cpu",
             )
-        parts.init_tap_cache(
+        parts.init_tap_pages(
             num_kv_tokens=64,
             kv_page_size=_PAGE_SIZE,
             req_to_token_pool=SimpleNamespace(
@@ -322,28 +322,11 @@ class TestSandyParts(_Files):
                     config_path=config_path,
                     weights_path=weights_path,
                     stripes=TapStripes(num_ranks=num_ranks, rank=0),
-                )
-                .kv_options()
-                .tap_bytes_per_token
+                ).tap_bytes_per_kv_token()
                 for num_ranks in (1, 2)
             ],
             [tap_bytes, tap_bytes // 2],
         )
-
-    def test_sandys_kv_page_must_hold_whole_tap_pages(self):
-        config_path, weights_path, _ = self._write(encoder_type="singular", layers=[3])
-        parts = self._attach(
-            model=_Model(), config_path=config_path, weights_path=weights_path
-        )
-
-        with self.assertRaisesRegex(ValueError, "not whole tap pages"):
-            parts.init_tap_cache(
-                num_kv_tokens=64,
-                kv_page_size=_PAGE_SIZE + 2,
-                req_to_token_pool=SimpleNamespace(
-                    req_to_token=torch.zeros((2, 64), dtype=torch.int32)
-                ),
-            )
 
 
 class TestAttach(_Files):

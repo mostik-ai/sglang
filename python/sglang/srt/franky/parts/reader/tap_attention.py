@@ -10,7 +10,6 @@ from sglang.kernels.ops.attention.franky_reader_merge import (
     franky_reader_merge,
     franky_reader_pack,
 )
-from sglang.srt.franky.parts.reader.tap_reading import TapReading
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -20,9 +19,9 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.cache.tap_read_rows import TapReadRows
-    from sglang.srt.franky.cache.tap_stripes import TapStripes
+    from sglang.srt.franky.parts.reader.current_tap_reading import CurrentTapReading
     from sglang.srt.franky.parts.reader.tap_gather import TapGather
+    from sglang.srt.franky.parts.reader.tap_reading import TapReading
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 # Split-KV completion tickets, one int32 a query head of a row, for 2^18 rows of
@@ -65,35 +64,6 @@ class TrtllmWorkspace(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-class TapReadings:
-    """The ``TapReading`` of the forward that runs on this rank, which the
-    forward's first reader makes for the readers after it.
-    """
-
-    def __init__(
-        self, *, read_rows: TapReadRows, stripes: TapStripes, page_size: int
-    ) -> None:
-        self.read_rows = read_rows
-        self.stripes = stripes
-        self.page_size = page_size
-        self._current: Optional[TapReading] = None
-
-    def start(
-        self, forward_batch: ForwardBatch, *, mask_dtype: torch.dtype
-    ) -> TapReading:
-        self._current = TapReading.of(
-            forward_batch,
-            read_rows=self.read_rows,
-            stripes=self.stripes,
-            page_size=self.page_size,
-            mask_dtype=mask_dtype,
-        )
-        return self._current
-
-    def current(self) -> TapReading:
-        return self._current
-
-
 class TapAttention:
     """One reader's attention over the taps of its encoder on this rank. Each
     rank attends over the taps it keeps; with more than one rank, the ranks
@@ -104,8 +74,8 @@ class TapAttention:
         self,
         *,
         pages: torch.Tensor,
-        readings: TapReadings,
-        starts_forward: bool,
+        reading: CurrentTapReading,
+        builds_reading: bool,
         gather: Optional[TapGather],
         workspace: Optional[TrtllmWorkspace],
     ) -> None:
@@ -113,14 +83,15 @@ class TapAttention:
         Args:
             pages: [pages, page_size, 1, output_size], this rank's tap pages of
                 the encoder.
-            starts_forward: whether this reader runs first in each forward and
-                makes the forward's reading.
+            reading: the stage's reading of the forward that runs.
+            builds_reading: whether this reader runs first in each forward and
+                makes the forward's reading for the stage.
             gather: how the attention-TP ranks that split the taps gather their
                 results; None when this rank keeps them all.
         """
         self.pages = pages
-        self.readings = readings
-        self.starts_forward = starts_forward
+        self.reading = reading
+        self.builds_reading = builds_reading
         self.gather = gather
         self.workspace = workspace
 
@@ -150,7 +121,7 @@ class TapAttention:
             rows=rows,
         )
 
-    def run(
+    def _run(
         self,
         queries: torch.Tensor,
         attended: torch.Tensor,
@@ -160,9 +131,9 @@ class TapAttention:
         rows: Optional[torch.Tensor],
     ) -> None:
         reading = (
-            self.readings.start(forward_batch, mask_dtype=has_taps.dtype)
-            if self.starts_forward
-            else self.readings.current()
+            self.reading.start(forward_batch, mask_dtype=has_taps.dtype)
+            if self.builds_reading
+            else self.reading.get()
         )
         if rows is not None:
             reading = reading.select(rows)
@@ -249,7 +220,7 @@ def _attend_taps(
     # A prefill CUDA graph replays this break with the batch of the replay.
     if is_in_prefill_graph_scope():
         forward_batch = get_forward_batch()
-    attention.run(queries, attended, has_taps, forward_batch=forward_batch, rows=rows)
+    attention._run(queries, attended, has_taps, forward_batch=forward_batch, rows=rows)
 
 
 def _prefill_attend(
@@ -268,7 +239,7 @@ def _prefill_attend(
     franky_reader_prefill(
         queries.view(-1, tap_size),
         pages.view(num_pages, page_size, tap_size),
-        reading.request_slots,
+        reading.request_pages,
         reading.local_taps,
         reading.row_blocks,
         out=out.view(-1, tap_size),
@@ -288,7 +259,7 @@ def _fa3_attend(
         q=queries.unsqueeze(1),
         k_cache=pages,
         v_cache=pages,
-        page_table=reading.slot_table,
+        page_table=reading.page_table,
         cache_seqlens=reading.local_taps[: queries.shape[0]],
         softmax_scale=queries.shape[-1] ** -0.5,
         causal=False,
@@ -314,15 +285,15 @@ def _trtllm_attend(
     # With one head, [pages, page_size, 1, size] is also the HND layout.
     num_pages, page_size, _, tap_size = pages.shape
     taps = pages.view(num_pages, 1, page_size, tap_size)
-    slot_table = reading.slot_table
+    page_table = reading.page_table
     result = decode.trtllm_batch_decode_with_kv_cache(
         query=queries,
         kv_cache=(taps, taps),
         workspace_buffer=workspace.buffer,
         multi_ctas_kv_counter_buffer=workspace.counters,
-        block_tables=slot_table,
+        block_tables=page_table,
         seq_lens=reading.local_taps[: queries.shape[0]],
-        max_seq_len=slot_table.shape[1] * page_size,
+        max_seq_len=page_table.shape[1] * page_size,
         bmm1_scale=tap_size**-0.5,
         bmm2_scale=1.0,
         out=out,

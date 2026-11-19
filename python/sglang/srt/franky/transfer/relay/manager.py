@@ -8,7 +8,7 @@ from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 
 if TYPE_CHECKING:
     from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
-    from sglang.srt.franky.cache.tap_reservations import FrankyTapReservations
+    from sglang.srt.franky.cache.ricky_tap_requests import RickyTapRequests
     from sglang.srt.franky.transfer.manager import FrankyTapManager
     from sglang.srt.franky.transfer.receiver import FrankyReceiver
 
@@ -24,7 +24,7 @@ class FrankyRelayManager(NixlKVManager):
         self.tap_relay: Optional[FrankyTapManager] = None
         self.tap_cache: Optional[RickyTapCache] = None
         self.relay_bootstrap_port: Optional[int] = None
-        self.reservations: Optional[FrankyTapReservations] = None
+        self.tap_requests: Optional[RickyTapRequests] = None
         self.tap_receivers: dict[int, FrankyReceiver] = {}
 
     def attach_tap_relay(
@@ -33,18 +33,18 @@ class FrankyRelayManager(NixlKVManager):
         tap_relay: FrankyTapManager,
         tap_cache: RickyTapCache,
         relay_bootstrap_port: int,
-        reservations: Optional[FrankyTapReservations] = None,
+        tap_requests: Optional[RickyTapRequests] = None,
     ) -> None:
         """
         Args:
             relay_bootstrap_port: the port of Ricky prefill's relay bootstrap
                 server, on the host of its PD bootstrap server.
-            reservations: on Ricky decode, the requests' stripes by PD room.
+            tap_requests: on Ricky decode, the requests with their stripes.
         """
         self.tap_relay = tap_relay
         self.tap_cache = tap_cache
         self.relay_bootstrap_port = relay_bootstrap_port
-        self.reservations = reservations
+        self.tap_requests = tap_requests
 
     def track_tap_receiver(self, room: int, receiver: FrankyReceiver) -> None:
         self.tap_receivers[room] = receiver

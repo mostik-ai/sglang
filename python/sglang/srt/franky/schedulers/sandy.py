@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode, is_aborted
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
+from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.franky.schedulers.sandy_batch_result_processor import (
     SandyBatchResultProcessor,
 )
@@ -126,7 +127,11 @@ class SandyScheduler(Scheduler):
     ) -> None:
         # SGLang's server warmup sends requests without a room, which no Ricky reads.
         has_embeds = recv_req.mm_inputs is not None or recv_req.input_embeds is not None
-        if has_embeds and recv_req.franky_room is not None:
+        if (
+            has_embeds
+            and recv_req.franky is not None
+            and recv_req.franky.room is not None
+        ):
             mm_input_error = "--franky-side sandy takes token ids only in a room."
         # Sandy runs the prompt and answers no tokens, so sampling has no use.
         recv_req.sampling_params.max_new_tokens = 0
@@ -172,7 +177,7 @@ class SandyScheduler(Scheduler):
         )
         if new_batch is None and self._a_held_chain_waits_alone(running_batch):
             self.franky_chain_holds.release_least_progress(
-                sparing_chain_id=self.waiting_queue[0].franky_chain.id
+                sparing_chain_id=FrankyRequest.of(self.waiting_queue[0]).chain.id
             )
         return new_batch, running_batch
 
@@ -242,11 +247,12 @@ class SandyScheduler(Scheduler):
         )
 
     def _open_franky_room(self, req: Req) -> FrankyTapSender:
-        if req.franky_room is None:
+        room = FrankyRequest.of(req).room
+        if room is None:
             return FrankyNoRoomSender()
         return FrankyRoomSender(
             manager=self.franky_tap_manager,
-            franky_room=req.franky_room,
+            franky_room=room,
             num_pages=ceil_div(
                 len(req.origin_input_ids),
                 self.tp_worker.model_runner.franky_parts.tap_cache.buffers.page_size,

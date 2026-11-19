@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.franky.cache.kv_options import FrankyKvOptions
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
     make_page_shard_spec,
@@ -107,6 +106,7 @@ def _make_model_runner(
     mr.mambaish_config = mambaish_config
     mr.is_hybrid_swa = is_hybrid_swa
     mr.sliding_window_size = sliding_window_size
+    mr.extra_bytes_per_full_token = 0
 
     mc = SimpleNamespace()
     mc.head_dim = head_dim
@@ -268,7 +268,7 @@ class TestDefaultConfigurator(CustomTestCase):
         _, plain_cfg, plain = self._run(available)
 
         mr = _make_model_runner(self)
-        mr.franky_kv_options = FrankyKvOptions(tap_bytes_per_token=tap_bytes)
+        mr.extra_bytes_per_full_token = tap_bytes
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
@@ -1699,7 +1699,7 @@ class TestSWAPoolFloor(CustomTestCase):
             spec_aux_config=SimpleNamespace(
                 dflash_draft_num_layers=40, dspark_num_stages=3
             ),
-            franky_kv_options=None,
+            extra_bytes_per_full_token=0,
         )
         with patch(
             "sglang.srt.model_executor.pool_configurator.uses_draft_swa_ring",

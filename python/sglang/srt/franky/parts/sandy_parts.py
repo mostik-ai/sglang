@@ -107,18 +107,13 @@ class SandyParts(FrankyParts):
         )
 
     @override
-    def init_tap_cache(
+    def init_tap_pages(
         self,
         *,
         num_kv_tokens: int,
         kv_page_size: int,
         req_to_token_pool: ReqToTokenPool,
     ) -> None:
-        if kv_page_size % self.config.tap_page_size != 0:
-            raise ValueError(
-                f"Sandy's KV page of {kv_page_size} tokens is not whole tap pages of "
-                f"{self.config.tap_page_size} tokens, and its taps live at its KV slots."
-            )
         self.tap_cache = SandyTapCache.build(
             encoder_ids=self._tap_encoder_ids(),
             output_size=self.config.encoder.output_size,

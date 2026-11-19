@@ -21,7 +21,7 @@ class TapStripes(msgspec.Struct, frozen=True, kw_only=True):
     num_ranks: int
     rank: int
 
-    def keeps(self, pages: Pages) -> Pages:
+    def owns(self, pages: Pages) -> Pages:
         """Whether this rank keeps each page."""
         return pages % self.num_ranks == self.rank
 

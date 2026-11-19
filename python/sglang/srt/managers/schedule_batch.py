@@ -153,9 +153,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.franky.cache.generated_spans import GeneratedSpan
-    from sglang.srt.franky.chains.chain import FrankyChain
-    from sglang.srt.franky.transfer.messages import FrankyRoom
+    from sglang.srt.franky.request import FrankyRequest
     from sglang.srt.franky.transfer.req_state import FrankyReqState
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -1067,10 +1065,7 @@ class Req(ReqDllmMixin):
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
-        franky_room: Optional[FrankyRoom] = None,
-        franky_chain: Optional[FrankyChain] = None,
-        franky_generated_spans: tuple[GeneratedSpan, ...] = (),
-        franky_sandy_input_ids: Optional[list[int]] = None,
+        franky_request: Optional[FrankyRequest] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1417,12 +1412,9 @@ class Req(ReqDllmMixin):
         # that forward's output is dropped and the request finishes with it.
         self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+        # Franky: what the request asks of it, and on Ricky its taps' progress.
+        self.franky_request: Optional[FrankyRequest] = franky_request
         self.franky: Optional[FrankyReqState] = None
-        self.franky_room: Optional[FrankyRoom] = franky_room
-        self.franky_chain: Optional[FrankyChain] = franky_chain
-        self.franky_generated_spans = franky_generated_spans
-        # Sandy's tokens of the input when Sandy tokenizes on its own, else None.
-        self.franky_sandy_input_ids = franky_sandy_input_ids
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank

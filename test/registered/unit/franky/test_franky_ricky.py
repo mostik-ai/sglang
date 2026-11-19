@@ -20,6 +20,7 @@ from sglang.srt.franky.cache.generated_spans import (
     FrankyGeneratedSpans,
     GeneratedSpan,
 )
+from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
@@ -218,36 +219,37 @@ class _Files(CustomTestCase):
             dtype=torch.float32,
             device="cpu",
         )
-        parts.init_tap_cache(
+        parts.init_tap_pages(
             num_kv_tokens=8 * len(self.req_to_token) + _CONTEXT,
             kv_page_size=_PAGE_SIZE,
             req_to_token_pool=SimpleNamespace(req_to_token=self.req_to_token),
         )
+        # The scheduler's pool over the pages the parts own.
+        tap_cache = RickyTapCache(buffers=parts.tap_buffers, stripes=parts.stripes)
         self.taps = {}
         for row, tap_len in _TAP_LENS.items():
-            slots = self._land(parts, row=row, tap_len=tap_len)
+            pages = self._land(parts, tap_cache, row=row, tap_len=tap_len)
             self._bind(
-                parts, row=row, slots=slots, spans=_spans(tap_len), first=tap_len
+                parts, row=row, pages=pages, spans=_spans(tap_len), first=tap_len
             )
         return parts
 
-    def _land(self, parts, *, row, tap_len):
+    def _land(self, parts, tap_cache, *, row, tap_len):
         if tap_len == 0:
             return None
-        tap_cache = parts.tap_cache
-        slots = tap_cache.take(-(-tap_len // tap_cache.stripe_size))
+        pages = tap_cache.take(-(-tap_len // tap_cache.stripe_size))
         tokens = torch.arange(tap_len)
-        local = slots[tokens // _PAGE_SIZE] * _PAGE_SIZE + tokens % _PAGE_SIZE
+        local = pages[tokens // _PAGE_SIZE] * _PAGE_SIZE + tokens % _PAGE_SIZE
         for encoder_id in parts._tap_encoder_ids():
             taps = torch.randn(tap_len, _TAP_SIZE, dtype=TAP_DTYPE)
-            tap_cache.buffers.write(encoder_id=encoder_id, taps=taps, slots=local)
+            parts.tap_buffers.write(encoder_id=encoder_id, taps=taps, slots=local)
             self.taps[encoder_id, row] = taps
-        return slots
+        return pages
 
-    def _bind(self, parts, *, row, slots, spans, first):
-        parts.read_rows.bind(
+    def _bind(self, parts, *, row, pages, spans, first):
+        parts.row_table.bind(
             req_pool_indices=[row],
-            slots=[slots],
+            pages=[pages],
             spans=[spans],
             num_input_tokens=[first],
         )
@@ -336,9 +338,9 @@ class TestReaders(_Files):
         parts = self._attach(
             model=model, config_path=config_path, weights_path=weights_path
         )
-        parts.read_rows.bind(
+        parts.row_table.bind(
             req_pool_indices=[4],
-            slots=[None],
+            pages=[None],
             spans=[_spans(5, block_size=4)],
             num_input_tokens=[13],
         )
@@ -516,9 +518,10 @@ class TestRickyParts(_Files):
 
         self.assertEqual([tuple(stage._readers) for stage in stages], [(0,), (1,), ()])
         self.assertEqual([stage._tap_encoder_ids() for stage in stages], [(0, 1)] * 3)
-        self.assertEqual(stages[2].kv_options().tap_bytes_per_token, 2 * _TAP_SIZE * 2)
+        self.assertEqual(stages[2].tap_bytes_per_kv_token(), 2 * _TAP_SIZE * 2)
         self.assertEqual(
-            [stage.tap_cache.buffers.encoder_ids for stage in stages], [(0, 1)] * 3
+            [tuple(stage.tap_buffers.transfer_buffers()) for stage in stages],
+            [(0, 1)] * 3,
         )
 
     def test_the_first_reader_of_each_stage_makes_the_forwards_reading(self):
@@ -527,7 +530,7 @@ class TestRickyParts(_Files):
         self.assertEqual(
             [
                 {
-                    index: attention.starts_forward
+                    index: attention.builds_reading
                     for index, attention in stage._attentions.items()
                 }
                 for stage in stages
@@ -542,10 +545,10 @@ class TestRickyParts(_Files):
         )
 
         self.assertEqual(
-            [attention.starts_forward for attention in parts._attentions.values()],
+            [attention.builds_reading for attention in parts._attentions.values()],
             [True, False],
         )
-        self.assertIs(parts._attentions[0].readings, parts._attentions[1].readings)
+        self.assertIs(parts._attentions[0].reading, parts._attentions[1].reading)
         self.assertIsNone(parts._attentions[0].gather)
 
     def test_the_pool_holds_the_taps_of_the_kv_tokens_and_rows_fit_the_context(
@@ -556,11 +559,12 @@ class TestRickyParts(_Files):
             model=_Model(), config_path=config_path, weights_path=weights_path
         )
 
-        self.assertEqual(parts.tap_cache.num_slots, (8 * 5 + _CONTEXT) // _PAGE_SIZE)
+        num_stripes = parts.tap_buffers.num_pages - 1
+        self.assertEqual(num_stripes, (8 * 5 + _CONTEXT) // _PAGE_SIZE)
         self.assertEqual(
-            parts.read_rows.stripe_slots.shape, (5, _CONTEXT // _PAGE_SIZE)
+            parts.row_table.stripe_pages.shape, (5, _CONTEXT // _PAGE_SIZE)
         )
-        self.assertEqual(parts.max_taps, _CONTEXT)
+        self.assertEqual(parts.row_table.max_stripes * _PAGE_SIZE, _CONTEXT)
 
 
 if __name__ == "__main__":

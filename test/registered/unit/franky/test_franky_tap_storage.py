@@ -3,9 +3,13 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
+from sglang.srt.franky.cache.ricky_tap_cache import (
+    CachedTaps,
+    RickyTapCache,
+    TapReservation,
+)
 from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
-from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE
+from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE, TapBuffers
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,14 +32,26 @@ def _sandy_cache(*, num_ranks: int, rank: int) -> SandyTapCache:
     )
 
 
-def _ricky_cache(*, num_ranks: int = 2, rank: int = 0, num_taps: int = 64):
-    return RickyTapCache.build(
-        encoder_ids=(0,),
-        output_size=_OUTPUT_SIZE,
-        page_size=_PAGE_SIZE,
-        num_taps=num_taps,
+def _ricky_cache(*, num_ranks: int = 2, rank: int = 0, num_stripes: int = 8):
+    return RickyTapCache(
+        buffers=TapBuffers(
+            encoder_ids=(0,),
+            output_size=_OUTPUT_SIZE,
+            page_size=_PAGE_SIZE,
+            num_pages=num_stripes + 1,
+            device="cpu",
+        ),
         stripes=TapStripes(num_ranks=num_ranks, rank=rank),
-        device="cpu",
+    )
+
+
+def _reservation(*, pages: list[int], num_taps: int, num_cached: int):
+    """A request's stripes as ``RickyTapRequests`` takes them; the page lists
+    read no lock."""
+    return TapReservation(
+        sandy_ids=list(range(num_taps)),
+        pages=torch.tensor(pages),
+        cached=CachedTaps(lock=None, pages=torch.tensor([]), num_taps=num_cached),
     )
 
 
@@ -53,7 +69,7 @@ class TestTapStripes(CustomTestCase):
         stripes = TapStripes(num_ranks=1, rank=0)
         pages = torch.arange(6)
 
-        self.assertTrue(bool(stripes.keeps(pages).all()))
+        self.assertTrue(bool(stripes.owns(pages).all()))
         self.assertEqual(stripes.stripe(pages).tolist(), pages.tolist())
         self.assertEqual(
             stripes.local_taps(torch.tensor([0, 3, 17]), page_size=4).tolist(),
@@ -64,7 +80,7 @@ class TestTapStripes(CustomTestCase):
         pages = np.arange(10)
 
         kept = {
-            rank: pages[TapStripes(num_ranks=4, rank=rank).keeps(pages)].tolist()
+            rank: pages[TapStripes(num_ranks=4, rank=rank).owns(pages)].tolist()
             for rank in range(4)
         }
 
@@ -181,55 +197,67 @@ class TestRickyTapCache(CustomTestCase):
         super().setUp()
         self.cache = _ricky_cache()
 
-    def _hold_and_keep(self, cache: RickyTapCache, sandy_ids: list[int]):
+    def _reserve(self, cache: RickyTapCache, sandy_ids: list[int]) -> TapReservation:
         cached = cache.match(sandy_ids)
         num_stripes = -(-len(sandy_ids) // cache.stripe_size)
-        new_slots = cache.take(num_stripes - len(cached.slots))
-        slots = torch.cat([cached.slots, new_slots])
-        return slots, cache.keep(sandy_ids=sandy_ids, slots=slots, cached=cached)
-
-    def _keep(self, sandy_ids: list[int], cache=None) -> torch.Tensor:
-        cache = cache or self.cache
-        slots, lock = self._hold_and_keep(cache, sandy_ids)
-        cache.release(lock)
-        return slots
-
-    def test_build_counts_slots_of_whole_stripes_over_all_ranks(self):
-        self.assertEqual(self.cache.stripe_size, 8)
-        self.assertEqual(self.cache.num_slots, 8)
-        self.assertEqual(self.cache.num_pages, 16)
-        self.assertEqual(self.cache.buffers.num_pages, 9)
-
-    def test_take_gives_distinct_slots_past_the_padding_page(self):
-        slots = self.cache.take(5)
-
-        self.assertEqual(slots.dtype, torch.int64)
-        self.assertEqual(len(set(slots.tolist())), 5)
-        self.assertTrue(all(1 <= slot <= 8 for slot in slots.tolist()))
-        self.assertIsNone(self.cache.take(4))
-        self.assertEqual(self.cache.num_free_slots(), 3)
-
-    def test_freed_slots_can_be_taken_again(self):
-        slots = self.cache.take(8)
-
-        self.cache.free(slots[:3])
-
-        self.assertEqual(self.cache.num_free_slots(), 3)
-        self.assertEqual(
-            sorted(self.cache.take(3).tolist()), sorted(slots[:3].tolist())
+        new_pages = cache.take(num_stripes - len(cached.pages))
+        return TapReservation(
+            sandy_ids=sandy_ids,
+            pages=torch.cat([cached.pages, new_pages]),
+            cached=cached,
         )
 
-    def test_a_kept_request_is_found_by_a_later_one_with_the_same_first_tokens(self):
-        slots = self._keep(list(range(20)))
+    def _hold_and_cache(self, cache: RickyTapCache, sandy_ids: list[int]):
+        reservation = self._reserve(cache, sandy_ids)
+        return reservation.pages, cache.cache(reservation)
+
+    def _cache(self, sandy_ids: list[int], cache=None) -> torch.Tensor:
+        cache = cache or self.cache
+        pages, lock = self._hold_and_cache(cache, sandy_ids)
+        cache.release(lock)
+        return pages
+
+    def _free_and_evictable(self, cache=None) -> tuple[int, int]:
+        usage = (cache or self.cache).usage()
+        return usage.free_pages, usage.evictable_pages
+
+    def test_the_pool_is_the_buffers_whole_stripes_over_all_ranks(self):
+        self.assertEqual(self.cache.stripe_size, 8)
+        self.assertEqual(self.cache.num_takeable_stripes(), 8)
+        self.assertEqual(self.cache.usage().pages, 16)
+        self.assertEqual(self.cache.buffers.num_pages, 9)
+
+    def test_take_gives_distinct_pages_past_the_padding_page(self):
+        pages = self.cache.take(5)
+
+        self.assertEqual(pages.dtype, torch.int64)
+        self.assertEqual(len(set(pages.tolist())), 5)
+        self.assertTrue(all(1 <= page <= 8 for page in pages.tolist()))
+        self.assertEqual(self.cache.num_takeable_stripes(), 3)
+
+    def test_freed_pages_can_be_taken_again(self):
+        pages = self.cache.take(8)
+
+        self.cache.free(pages[:3])
+
+        self.assertEqual(self.cache.num_takeable_stripes(), 3)
+        self.assertEqual(
+            sorted(self.cache.take(3).tolist()), sorted(pages[:3].tolist())
+        )
+
+    def test_a_cached_request_is_found_by_a_later_one_with_the_same_first_tokens(
+        self,
+    ):
+        pages = self._cache(list(range(20)))
 
         cached = self.cache.match(list(range(20)) + [99, 98])
 
         self.assertEqual(cached.num_taps, 16)
-        self.assertEqual(cached.slots.tolist(), slots[:2].tolist())
+        self.assertEqual(cached.pages.tolist(), pages[:2].tolist())
         self.cache.release(cached.lock)
 
     def test_a_match_counts_whole_stripes_only(self):
-        self._keep(list(range(20)))
+        self._cache(list(range(20)))
 
         cached = self.cache.match(list(range(15)))
 
@@ -240,110 +268,123 @@ class TestRickyTapCache(CustomTestCase):
         cached = self.cache.match(list(range(20)))
 
         self.assertEqual(cached.num_taps, 0)
-        self.assertEqual(cached.slots.tolist(), [])
+        self.assertEqual(cached.pages.tolist(), [])
         self.cache.release(cached.lock)
 
-    def test_keep_gives_back_the_partial_last_stripe(self):
-        self._keep(list(range(20)))
+    def test_cache_gives_back_the_partial_last_stripe(self):
+        self._cache(list(range(20)))
 
-        self.assertEqual(self.cache.num_free_slots(), 8)
-        self.assertEqual(self.cache.num_free_pages(), (12, 4))
+        self.assertEqual(self.cache.num_takeable_stripes(), 8)
+        self.assertEqual(self._free_and_evictable(), (12, 4))
 
-    def test_keep_gives_back_stripes_another_request_kept_first(self):
-        first = self.cache.match(list(range(16)))
-        second = self.cache.match(list(range(16)))
-        first_slots = self.cache.take(2)
-        second_slots = self.cache.take(2)
+    def test_cache_gives_back_stripes_another_request_cached_first(self):
+        first = self._reserve(self.cache, list(range(16)))
+        second = self._reserve(self.cache, list(range(16)))
 
-        self.cache.release(
-            self.cache.keep(sandy_ids=list(range(16)), slots=first_slots, cached=first)
-        )
-        self.cache.release(
-            self.cache.keep(
-                sandy_ids=list(range(16)), slots=second_slots, cached=second
-            )
-        )
+        self.cache.release(self.cache.cache(first))
+        self.cache.release(self.cache.cache(second))
 
-        self.assertEqual(self.cache.num_free_pages(), (12, 4))
+        self.assertEqual(self._free_and_evictable(), (12, 4))
         cached = self.cache.match(list(range(16)))
-        self.assertEqual(cached.slots.tolist(), first_slots.tolist())
+        self.assertEqual(cached.pages.tolist(), first.pages.tolist())
         self.cache.release(cached.lock)
 
-    def test_a_request_that_started_from_a_cached_prefix_keeps_only_its_new_stripes(
+    def test_a_request_that_started_from_a_cached_prefix_caches_only_its_new_stripes(
         self,
     ):
-        prefix_slots = self._keep(list(range(16)))
+        prefix_pages = self._cache(list(range(16)))
 
-        slots = self._keep(list(range(32)))
+        pages = self._cache(list(range(32)))
 
-        self.assertEqual(slots[:2].tolist(), prefix_slots[:2].tolist())
-        self.assertEqual(self.cache.num_free_pages(), (8, 8))
+        self.assertEqual(pages[:2].tolist(), prefix_pages[:2].tolist())
+        self.assertEqual(self._free_and_evictable(), (8, 8))
         cached = self.cache.match(list(range(32)))
-        self.assertEqual(cached.slots.tolist(), slots.tolist())
+        self.assertEqual(cached.pages.tolist(), pages.tolist())
+        self.cache.release(cached.lock)
+
+    def test_drop_gives_back_the_new_stripes_and_leaves_the_cached_prefix(self):
+        self._cache(list(range(16)))
+        reservation = self._reserve(self.cache, list(range(40)))
+        self.assertEqual(self.cache.num_takeable_stripes(), 3)
+
+        self.cache.drop(reservation)
+
+        self.assertEqual(self.cache.num_takeable_stripes(), 8)
+        self.assertEqual(self._free_and_evictable(), (12, 4))
+        cached = self.cache.match(list(range(40)))
+        self.assertEqual(cached.num_taps, 16)
         self.cache.release(cached.lock)
 
     def test_a_locked_stripe_is_never_evicted(self):
-        _, lock = self._hold_and_keep(self.cache, list(range(16)))
+        _, lock = self._hold_and_cache(self.cache, list(range(16)))
 
-        self.assertEqual(self.cache.num_free_slots(), 6)
-        self.assertIsNone(self.cache.take(7))
+        self.assertEqual(self.cache.num_takeable_stripes(), 6)
+        self.assertEqual(self._free_and_evictable(), (12, 0))
         self.cache.release(lock)
         self.assertEqual(len(self.cache.take(8)), 8)
         self.assertEqual(self.cache.match(list(range(16))).num_taps, 0)
 
     def test_take_evicts_stripes_that_only_the_tree_keeps(self):
-        self._keep(list(range(32)))
-        self._keep(list(range(100, 132)))
+        self._cache(list(range(32)))
+        self._cache(list(range(100, 132)))
 
         taken = self.cache.take(6)
 
         self.assertEqual(len(taken), 6)
-        self.assertEqual(self.cache.num_free_slots(), 2)
+        self.assertEqual(self.cache.num_takeable_stripes(), 2)
 
     def test_a_match_holds_its_prefix_until_released(self):
-        self._keep(list(range(16)))
+        self._cache(list(range(16)))
         cached = self.cache.match(list(range(16)))
 
-        self.assertIsNone(self.cache.take(7))
+        self.assertEqual(self.cache.num_takeable_stripes(), 6)
         self.cache.release(cached.lock)
         self.assertEqual(len(self.cache.take(7)), 7)
 
-    def test_local_pages_mark_the_pages_other_ranks_keep(self):
-        cache = _ricky_cache(num_ranks=2, rank=1)
+    def test_pages_to_land_mark_the_pages_other_ranks_keep_past_the_prefix(self):
+        reservation = _reservation(pages=[5, 2, 7], num_taps=22, num_cached=8)
 
-        pages = cache.local_pages(
-            slots=torch.tensor([5, 2, 7]), first_page=1, num_pages=6
-        )
+        rank_pages = [
+            _ricky_cache(num_ranks=2, rank=rank).pages_to_land(reservation)
+            for rank in range(2)
+        ]
+
+        self.assertEqual(rank_pages[0].dtype, np.int32)
+        self.assertEqual(rank_pages[0].tolist(), [2, -1, 7, -1])
+        self.assertEqual(rank_pages[1].tolist(), [-1, 2, -1, 7])
+
+    def test_pages_to_relay_mark_every_page_from_the_first(self):
+        reservation = _reservation(pages=[5, 2, 7], num_taps=22, num_cached=8)
+
+        pages = _ricky_cache(num_ranks=2, rank=1).pages_to_relay(reservation)
 
         self.assertEqual(pages.dtype, np.int32)
-        self.assertEqual(pages.tolist(), [5, -1, 2, -1, 7])
+        self.assertEqual(pages.tolist(), [-1, 5, -1, 2, -1, 7])
 
-    def test_one_rank_lists_a_slot_for_every_page(self):
-        cache = _ricky_cache(num_ranks=1, rank=0, num_taps=32)
+    def test_one_rank_lists_a_page_for_every_request_page(self):
+        cache = _ricky_cache(num_ranks=1, rank=0)
+        reservation = _reservation(pages=[3, 1, 6], num_taps=12, num_cached=0)
 
-        pages = cache.local_pages(
-            slots=torch.tensor([3, 1, 6]), first_page=0, num_pages=3
-        )
+        self.assertEqual(cache.pages_to_land(reservation).tolist(), [3, 1, 6])
+        self.assertEqual(cache.pages_to_relay(reservation).tolist(), [3, 1, 6])
 
-        self.assertEqual(pages.tolist(), [3, 1, 6])
-
-    def test_every_rank_takes_the_same_slots_for_the_same_requests(self):
+    def test_every_rank_takes_the_same_pages_for_the_same_requests(self):
         caches = [_ricky_cache(num_ranks=2, rank=rank) for rank in range(2)]
 
-        slots = []
+        pages = []
         for cache in caches:
-            self._keep(list(range(24)), cache=cache)
-            slots.append(cache.take(3).tolist())
+            self._cache(list(range(24)), cache=cache)
+            pages.append(cache.take(3).tolist())
 
-        self.assertEqual(slots[0], slots[1])
+        self.assertEqual(pages[0], pages[1])
 
     def test_reset_drops_every_cached_stripe(self):
-        self._keep(list(range(32)))
+        self._cache(list(range(32)))
 
         self.cache.reset()
 
         self.assertEqual(self.cache.match(list(range(32))).num_taps, 0)
-        self.assertEqual(self.cache.num_free_pages(), (16, 0))
+        self.assertEqual(self._free_and_evictable(), (16, 0))
 
 
 if __name__ == "__main__":

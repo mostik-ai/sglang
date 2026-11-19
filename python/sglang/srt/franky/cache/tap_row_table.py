@@ -8,19 +8,19 @@ from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.utils.common import async_h2d, async_h2d_stack
 
 
-class TapReadRows:
-    """What each request row of Ricky's ``req_to_token`` pool reads: the stripe
-    slots of its taps, its generated spans, and, once it decodes, how many taps
-    the forward of its next token reads. A request's row is set when it joins a
-    batch.
+class TapRowTable:
+    """Per request row of Ricky's ``req_to_token`` pool, what its readers read:
+    the local pages of its stripes, its generated spans, and, once it decodes,
+    how many taps the forward of its next token reads. A request's row is set
+    when it joins a batch.
 
     Attributes:
-        stripe_slots: [rows, stripes] int32, each row's stripe slots in order.
+        stripe_pages: [rows, stripes] int32, each row's local stripe pages in order.
         decode_taps: [rows] int32, the taps a decoding row's forward reads.
     """
 
     def __init__(self, *, num_rows: int, max_stripes: int, device: str) -> None:
-        self.stripe_slots = torch.zeros(
+        self.stripe_pages = torch.zeros(
             (num_rows, max_stripes), dtype=torch.int32, device=device
         )
         self.decode_taps = torch.zeros(num_rows, dtype=torch.int32, device=device)
@@ -30,15 +30,15 @@ class TapReadRows:
         self,
         *,
         req_pool_indices: list[int],
-        slots: list[Optional[torch.Tensor]],
+        pages: list[Optional[torch.Tensor]],
         spans: list[Optional[FrankyGeneratedSpans]],
         num_input_tokens: list[int],
     ) -> None:
-        """Set the rows of requests that join a batch; a request without slots
+        """Set the rows of requests that join a batch; a request without pages
         reads no taps.
 
         Args:
-            slots: per request, int64 host stripe slots in order, or None.
+            pages: per request, int64 host local stripe pages in order, or None.
             num_input_tokens: per request, its input length, where its decoded
                 block starts.
         """
@@ -55,27 +55,31 @@ class TapReadRows:
         for row, row_spans in zip(req_pool_indices, spans):
             self._spans[row] = row_spans
         reading = [
-            (row, row_slots)
-            for row, row_slots in zip(req_pool_indices, slots)
-            if row_slots is not None
+            (row, row_pages)
+            for row, row_pages in zip(req_pool_indices, pages)
+            if row_pages is not None
         ]
         if reading:
-            self._bind_slots(reading)
+            self._bind_pages(reading)
 
     def spans_of(self, row: int) -> Optional[FrankyGeneratedSpans]:
         return self._spans[row]
 
-    def _bind_slots(self, reading: list[tuple[int, torch.Tensor]]) -> None:
-        width = max(len(row_slots) for _, row_slots in reading)
+    def _bind_pages(self, reading: list[tuple[int, torch.Tensor]]) -> None:
+        width = max(len(row_pages) for _, row_pages in reading)
         padded = [
             torch.nn.functional.pad(
-                row_slots.to(torch.int32), (0, width - len(row_slots))
+                row_pages.to(torch.int32), (0, width - len(row_pages))
             )
-            for _, row_slots in reading
+            for _, row_pages in reading
         ]
-        device = self.stripe_slots.device
+        device = self.stripe_pages.device
         rows = async_h2d([row for row, _ in reading], dtype=torch.int64, device=device)
-        self.stripe_slots[rows, :width] = async_h2d_stack(padded, device=device)
+        self.stripe_pages[rows, :width] = async_h2d_stack(padded, device=device)
+
+    @property
+    def max_stripes(self) -> int:
+        return self.stripe_pages.shape[1]
 
 
 def _decode_taps(spans: Optional[FrankyGeneratedSpans], first_decoded: int) -> int:

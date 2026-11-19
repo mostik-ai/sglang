@@ -48,7 +48,6 @@ from typing import (
 )
 
 import fastapi
-import msgspec
 import numpy as np
 import pybase64
 import torch
@@ -70,9 +69,7 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
-from sglang.srt.franky.cache.generated_spans import checked_earlier_answers
-from sglang.srt.franky.chains.chain import FrankyChain
-from sglang.srt.franky.transfer.messages import FrankyRoom
+from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
@@ -1588,32 +1585,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
-            sandy_input_len = (
-                None
-                if obj.franky_sandy_input_ids is None
-                else len(obj.franky_sandy_input_ids)
-            )
-            franky_chain = (
-                FrankyChain.from_request(
-                    franky_chain=obj.franky_chain,
-                    rid=obj.rid,
-                    prompt_len=len(input_ids_arr or ()),
-                    sandy_input_len=sandy_input_len,
-                    on_sandy=get_franky().franky_side == "sandy",
-                )
-                if obj.franky_chain is not None
-                else None
-            )
-            franky_generated_spans = checked_earlier_answers(
-                obj.franky_generated_spans or [],
-                generation_start=len(input_ids_arr or ())
-                - (franky_chain.num_generated_before if franky_chain else 0),
-                sandy_answers=obj.franky_sandy_spans,
-                sandy_generation_start=(
-                    franky_chain.sandy_answer_start(sandy_input_len=sandy_input_len)
-                    if franky_chain is not None and sandy_input_len is not None
-                    else sandy_input_len
-                ),
+            franky = FrankyRequest.of_input(
+                obj,
+                prompt_len=len(input_ids_arr or ()),
+                on_sandy=get_franky().franky_side == "sandy",
             )
 
             tokenized_obj = self.tokenized_generate_req_type(
@@ -1634,14 +1609,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
-                franky_room=(
-                    msgspec.convert(obj.franky_room, FrankyRoom)
-                    if obj.franky_room is not None
-                    else None
-                ),
-                franky_chain=franky_chain,
-                franky_generated_spans=franky_generated_spans,
-                franky_sandy_input_ids=obj.franky_sandy_input_ids,
+                franky=franky,
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,

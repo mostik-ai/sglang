@@ -53,7 +53,3 @@ class TapBuffers:
     def pages(self, encoder_id: int) -> torch.Tensor:
         """[num_pages, page_size, 1, output_size]."""
         return self._buffers[encoder_id]
-
-    @property
-    def encoder_ids(self) -> tuple[int, ...]:
-        return tuple(self._buffers)

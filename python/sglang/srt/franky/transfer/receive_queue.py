@@ -5,23 +5,16 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import msgspec
-import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
-from sglang.srt.franky.sandy_input import sandy_input_ids
+from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.franky.transfer.messages import FrankyRoomClosed, FrankyTapsReady
 from sglang.srt.franky.transfer.receiver import FrankyReceiver
-from sglang.srt.franky.transfer.req_state import FrankyReqState
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 
 if TYPE_CHECKING:
     from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
     from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
-    from sglang.srt.franky.cache.tap_reservations import (
-        FrankyTapReservations,
-        TapReservation,
-    )
+    from sglang.srt.franky.cache.ricky_tap_requests import RickyTapRequests
     from sglang.srt.franky.chains.holds import FrankyChainHolds
     from sglang.srt.franky.transfer.manager import FrankyTapManager
     from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
@@ -29,15 +22,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_NO_TAPS_NAMESPACE = "franky=no-taps"
-
 
 class _Reception(msgspec.Struct, kw_only=True):
     req: Any
     receiver: Optional[FrankyReceiver]
     landed: int
     ended: bool = False
-    hold: bool = False
     release_deadline: float = 0.0
     announced_taps: int = 0
     announced_failure: bool = False
@@ -45,11 +35,10 @@ class _Reception(msgspec.Struct, kw_only=True):
 
 
 class FrankyReceiveQueue:
-    """Ricky's requests from arrival until they end. A request that reads taps
-    takes their stripes at arrival in ``FrankyTapReservations``, and its taps
-    land from Sandy in the stripes past its cached prefix. Its rows run as soon
-    as the taps they read landed; its KV is SGLang's, as without Franky. Ranks
-    agree on what landed through ``FrankyRankReports``, and decisions reach
+    """The taps landing from Sandy on Ricky prefill and aggregated engines: one
+    reception per request from the reservation of its stripes until its taps
+    landed, or, for a request that ended first, until its room stopped writing.
+    Ranks agree on what landed through ``FrankyRankReports``, and decisions reach
     every rank and stage at one step as leader messages.
     """
 
@@ -57,27 +46,20 @@ class FrankyReceiveQueue:
         self,
         *,
         tap_cache: RickyTapCache,
-        reservations: FrankyTapReservations,
+        tap_requests: RickyTapRequests,
         tap_manager: FrankyTapManager,
         rank_reports: FrankyRankReports,
         chain_holds: FrankyChainHolds,
         mamba_room: Optional[FrankyMambaRoom],
-        shared_tokenizer: bool,
         release_timeout_seconds: float,
         fail_request: Callable[[Req, str], None],
     ) -> None:
-        """
-        Args:
-            shared_tokenizer: whether Sandy reads Ricky's tokens, as the Franky
-                config says; a request then sends no Sandy ids of its own.
-        """
         self.tap_cache = tap_cache
-        self.reservations = reservations
+        self.tap_requests = tap_requests
         self.tap_manager = tap_manager
         self.rank_reports = rank_reports
         self.chain_holds = chain_holds
         self.mamba_room = mamba_room
-        self.shared_tokenizer = shared_tokenizer
         self.release_timeout_seconds = release_timeout_seconds
         self.fail_request = fail_request
         self.receptions: dict[str, _Reception] = {}
@@ -86,56 +68,34 @@ class FrankyReceiveQueue:
 
     def add(self, *, req: Req) -> None:
         """A request entered the waiting queue: new, or back after a retraction
-        released its KV, keeping its taps. A request without a room reads no
-        taps, so its KV is cached apart from KV that read taps.
+        released its KV, keeping its taps. One that can never read its taps fails
+        at the next poll, once the waiting queue holds it.
         """
-        if req.franky is not None:
-            return
-        if req.franky_room is None:
-            req.extra_key = (
-                f"{req.extra_key}|{_NO_TAPS_NAMESPACE}"
-                if req.extra_key
-                else _NO_TAPS_NAMESPACE
-            )
-            req.franky = FrankyReqState(tap_len=0, taps_ready=0)
-            return
-        problem = self._tokenization_problem(req)
+        problem = self.tap_requests.arrive(req)
         if problem is not None:
             self._failing.append((req, problem))
-            return
-        sandy_ids = sandy_input_ids(req)
-        self.reservations.expect(req.rid, req=req, sandy_ids=sandy_ids)
-        if (refusal := self.reservations.refusal(req.rid)) is not None:
-            self.reservations.forget(req.rid)
-            self._failing.append((req, refusal))
-            return
-        req.franky = FrankyReqState(
-            tap_len=len(sandy_ids),
-            taps_ready=0,
-            generated_spans=FrankyGeneratedSpans.of_request(req),
-        )
 
     def forget(self, *, req: Req) -> None:
         """The scheduler aborted ``req``; its stripes wait for its room to close."""
-        self.reservations.forget(req.rid)
+        self.tap_requests.forget(req)
         self.chain_holds.release_chain_of(req)
         if req.rid in self.receptions:
-            self._end(self.receptions[req.rid], hold=False)
+            self._end(self.receptions[req.rid])
 
     def poll(self) -> None:
-        """Every rank, at each step: end the receptions of ended requests, take
-        stripes for arrivals in order, and agree on landings with
-        ``FrankyRankReports``.
+        """Every rank, at each step: fail what never fits, end the receptions of
+        ended requests, take stripes for arrivals in order, and agree on landings
+        with ``FrankyRankReports``.
         """
         failing, self._failing = self._failing, []
         for req, problem in failing:
             self.fail_request(req, problem)
         for reception in self._live_receptions():
             if reception.req.finished():
-                self._end(reception, hold=_ended_at_its_length(reception.req))
+                self._end(reception)
         self._release_holds_past_the_mamba_room()
-        for rid, req in self.reservations.poll():
-            self._open(rid, req)
+        for req in self.tap_requests.poll():
+            self._open(req)
         for reception in self._live_receptions():
             self._keep_kv_past_the_prompt_out_of_the_cache(reception.req)
         self.agreed = self.rank_reports.report(numbers=self._rank_numbers())
@@ -174,14 +134,6 @@ class FrankyReceiveQueue:
         if reception is not None and reception.ended:
             self._release(reception)
 
-    def on_started(self, *, reqs: list[Req]) -> None:
-        """The scheduler started ``reqs``; each now locks its cached KV prefix
-        itself, so its chain's hold on it may go.
-        """
-        for req in reqs:
-            if req.franky_chain is not None and req.franky_room is not None:
-                self.chain_holds.release_chain_of(req)
-
     def num_startable_requests(self) -> Optional[int]:
         """
         Returns:
@@ -196,20 +148,19 @@ class FrankyReceiveQueue:
 
     def is_empty(self) -> bool:
         return (
-            self.reservations.is_empty() and not self.receptions and not self._failing
+            self.tap_requests.is_empty() and not self.receptions and not self._failing
         )
 
-    def _open(self, rid: str, req: Req) -> None:
-        reservation = self.reservations.of(rid)
+    def _open(self, req: Req) -> None:
+        reservation = self.tap_requests.reservation(req.rid)
         num_cached = reservation.cached.num_taps
-        self.receptions[rid] = _Reception(
+        self.receptions[req.rid] = _Reception(
             req=req,
-            receiver=FrankyReceiver(
+            receiver=FrankyReceiver.of_reservation(
                 manager=self.tap_manager,
-                franky_room=req.franky_room,
-                tap_pages=self._local_pages(reservation),
-                num_tokens=reservation.num_taps,
-                prefix_len=num_cached,
+                franky_room=FrankyRequest.of(req).room,
+                tap_cache=self.tap_cache,
+                reservation=reservation,
             ),
             landed=num_cached,
             announced_taps=num_cached,
@@ -220,30 +171,9 @@ class FrankyReceiveQueue:
         )
         self._note_first_chunk_ready(req)
 
-    def _local_pages(self, reservation: TapReservation) -> np.ndarray:
-        page_size = self.tap_cache.buffers.page_size
-        return self.tap_cache.local_pages(
-            slots=reservation.slots,
-            first_page=reservation.cached.num_taps // page_size,
-            num_pages=-(-reservation.num_taps // page_size),
-        )
-
     def _note_first_chunk_ready(self, req: Req) -> None:
         if req.franky.rows_ready() > req.prefix_len:
             req.time_stats.set_franky_taps_ready_time()
-
-    def _tokenization_problem(self, req: Req) -> Optional[str]:
-        if self.shared_tokenizer and req.franky_sandy_input_ids is not None:
-            return (
-                f"Request {req.rid} sends franky_sandy_input_ids, but this Ricky's "
-                "Sandy reads its tokens."
-            )
-        if not self.shared_tokenizer and req.franky_sandy_input_ids is None:
-            return (
-                f"Request {req.rid} reads taps of a Sandy that tokenizes on its own, "
-                "so it needs franky_sandy_input_ids."
-            )
-        return None
 
     def _live_receptions(self) -> list[_Reception]:
         return [
@@ -317,9 +247,8 @@ class FrankyReceiveQueue:
             return None
         return self.rank_reports.lowest(key=key, agreed=self.agreed[key])
 
-    def _end(self, reception: _Reception, *, hold: bool) -> None:
+    def _end(self, reception: _Reception) -> None:
         reception.ended = True
-        reception.hold = hold
         if reception.req.franky.taps_complete():
             self._release(reception)
             return
@@ -343,13 +272,7 @@ class FrankyReceiveQueue:
 
     def _release(self, reception: _Reception) -> None:
         req = reception.req
-        landed = req.franky.taps_complete()
-        hold = reception.hold and landed
-        tap_lock = self.reservations.end(req.rid, landed=landed, keep_locked=hold)
-        if hold:
-            self.chain_holds.hold_for_next_block(req, tap_lock=tap_lock)
-        else:
-            self.chain_holds.release_chain_of(req)
+        self.tap_requests.end(req, landed=req.franky.taps_complete())
         if reception.receiver is not None:
             self.tap_manager.clear_deferred_abort_state(
                 reception.receiver.bootstrap_room
@@ -363,7 +286,3 @@ class FrankyReceiveQueue:
             key = f"{name}:{rid}"
             self.agreed.pop(key, None)
             self.rank_reports.forget(key=key)
-
-
-def _ended_at_its_length(req: Req) -> bool:
-    return isinstance(req.finished_reason, FINISH_LENGTH)

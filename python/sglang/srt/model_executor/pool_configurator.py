@@ -31,7 +31,6 @@ from sglang.srt.configs.model_config import (
     uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
-from sglang.srt.franky.cache.kv_options import FrankyKvOptions
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -338,8 +337,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
-        if isinstance(kvc.franky_kv_options, FrankyKvOptions):
-            self._cell_size += kvc.franky_kv_options.tap_bytes_per_token
+        self._cell_size += kvc.extra_bytes_per_full_token
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
@@ -1251,9 +1249,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if isinstance(kvc.franky_kv_options, FrankyKvOptions):
-            # A full-pool slot also holds the token's taps.
-            self.bytes_per_full_token += kvc.franky_kv_options.tap_bytes_per_token
+        self.bytes_per_full_token += kvc.extra_bytes_per_full_token
         if self.is_speculative and not self.encoder_replay:
             # Reserve the draft worker by inflating per-token bytes by
             # (target+draft)/target, as scale_kv_cell_size_per_token_for_dflash does.

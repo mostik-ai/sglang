@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 import torch
 from safetensors.torch import load_file
 
-from sglang.srt.franky.cache.kv_options import FrankyKvOptions
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.config import FrankyConfig
@@ -108,27 +107,25 @@ class FrankyParts(ABC):
         """Build this rank's parts from the config and the weights file."""
         raise NotImplementedError
 
-    def kv_options(self) -> FrankyKvOptions:
-        """What the taps add to the KV budget: this rank's tap bytes per KV token."""
+    def tap_bytes_per_kv_token(self) -> int:
+        """This rank's tap bytes per KV token, which the KV budget sets aside."""
         tap_bytes = (
             self._tap_pool_ratio
             * len(self._tap_encoder_ids())
             * self.config.encoder.output_size
             * TAP_DTYPE.itemsize
         )
-        return FrankyKvOptions(
-            tap_bytes_per_token=math.ceil(tap_bytes / self.stripes.num_ranks)
-        )
+        return math.ceil(tap_bytes / self.stripes.num_ranks)
 
     @abstractmethod
-    def init_tap_cache(
+    def init_tap_pages(
         self,
         *,
         num_kv_tokens: int,
         kv_page_size: int,
         req_to_token_pool: ReqToTokenPool,
     ) -> None:
-        """Build this side's tap cache, once the KV budget set ``num_kv_tokens``."""
+        """Build this rank's tap pages, once the KV budget set ``num_kv_tokens``."""
         raise NotImplementedError
 
     @staticmethod

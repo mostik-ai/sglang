@@ -64,7 +64,7 @@ class SandyTapCache:
         """
         page_size = self.buffers.page_size
         pages = kv_slots[::page_size] // page_size
-        local = torch.where(self.stripes.keeps(pages), self.stripes.stripe(pages), -1)
+        local = torch.where(self.stripes.owns(pages), self.stripes.stripe(pages), -1)
         return local.to(torch.int32)
 
     def _local_slots(self, kv_slots: torch.Tensor) -> torch.Tensor:
@@ -73,4 +73,4 @@ class SandyTapCache:
         offsets = kv_slots % page_size
         kept = self.stripes.stripe(pages) * page_size + offsets
         discarded = self._discarded_page * page_size + offsets
-        return torch.where(self.stripes.keeps(pages), kept, discarded)
+        return torch.where(self.stripes.owns(pages), kept, discarded)

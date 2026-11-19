@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
+from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.runtime_context import get_franky
 
 if TYPE_CHECKING:
@@ -78,7 +79,7 @@ class FrankyChainHolds:
             tap_lock: the tap prefix tree's lock on the taps ``req`` left, which
                 the holds own from now on.
         """
-        chain = req.franky_chain
+        chain = FrankyRequest.of(req).chain
         if chain is None or chain.last_block:
             self.release_chain_of(req)
             self._release_tap_lock(tap_lock)
@@ -87,15 +88,17 @@ class FrankyChainHolds:
         self._holds[chain.id] = self._new_hold(req, tap_lock=tap_lock)
 
     def holds_chain_of(self, req: Req) -> bool:
-        return req.franky_chain is not None and req.franky_chain.id in self._holds
+        chain = FrankyRequest.of(req).chain
+        return chain is not None and chain.id in self._holds
 
     def put_held_chains_first(self, requests: list[Req]) -> None:
         """Keeps the order within the blocks of held chains and within the others."""
         requests.sort(key=self._is_not_held)
 
     def release_chain_of(self, req: Req) -> None:
-        if req.franky_chain is not None:
-            self.release(chain_id=req.franky_chain.id)
+        chain = FrankyRequest.of(req).chain
+        if chain is not None:
+            self.release(chain_id=chain.id)
 
     def release(self, *, chain_id: str) -> None:
         hold = self._holds.pop(chain_id, None)
@@ -168,7 +171,7 @@ class FrankyChainHolds:
                 else self._tree_cache.lock(req.last_node)
             ),
             tap_lock=tap_lock,
-            block=req.franky_chain.block,
+            block=FrankyRequest.of(req).chain.block,
             num_tokens=len(req.origin_input_ids),
             order=self._next_order,
             expires_at=time.monotonic() + self._hold_seconds,
