@@ -563,10 +563,11 @@ router gets `--franky-sandy-tokenizer-path` (Sandy's model files) and
   run. Such a request without `franky_sandy_input_ids` gets `400`, as does
   `/v1/completions`.
 - With blocks, each block's Sandy ids extend the last block's: the router
-  decodes Ricky's ids of the finished blocks with Ricky's tokenizer (without
-  special tokens, as the engine returns text), encodes the text they added with
-  Sandy's, and appends those tokens; a character Ricky's ids end inside of
-  waits for the next block. Ricky's block gets Sandy's ids and, in
+  decodes Ricky's ids of the answer so far with Ricky's tokenizer, special
+  tokens kept as text (his end token too), drops one trailing U+FFFD (a
+  character his ids end inside of, which the next block finishes), and encodes
+  the text added since the last block with Sandy's tokenizer as plain text;
+  the answer's last block encodes the rest of its whole text. Ricky's block gets Sandy's ids and, in
   `franky_chain.sandy_block_starts`, her tokens before each earlier block of
   the answer. An answer ended at a boundary token joins the earlier answers in
   Sandy's tokens too.

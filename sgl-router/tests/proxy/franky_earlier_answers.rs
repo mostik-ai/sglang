@@ -480,7 +480,7 @@ async fn a_unary_answer_carries_sandys_tokens_of_it() {
     let response: Value = serde_json::from_str(&response).unwrap();
     // The mock engine answers [1, 2].
     let text =
-        sgl_router::tokenizer::adapter::decode_complete(&ricky_tokenizer, &[1, 2], true).unwrap();
+        sgl_router::tokenizer::adapter::decode_complete(&ricky_tokenizer, &[1, 2], false).unwrap();
     let sandy = FrankySandyTokens::load(
         &FrankySandyConfig {
             tokenizer_path: kimi.path().join("tiktoken.model").display().to_string(),

@@ -6,7 +6,7 @@ use super::chat_formatter::ChatFormatter;
 use super::chat_template_adapter::{self, ChatTemplateAdapter};
 use crate::config::{FrankySandyConfig, TokenizerConfig};
 use anyhow::{Context, Result};
-use dynamo_tokenizers::{traits::DecodeResult, EncodeSegment, Tokenizer};
+use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use serde_json::Value;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -108,75 +108,52 @@ impl FrankySandyTokens {
     }
 }
 
-/// Tokens before the first new one that each decode starts from, so that the
-/// new tokens decode as they do after the ones before them.
-const CONTEXT_TOKENS: usize = 6;
-/// The most tokens one character spans: a byte-level token holds at least one
-/// of its at most four bytes.
-const TOKENS_PER_CHARACTER: usize = 4;
+/// What a lossy decode of ids that end inside a character ends with.
+const INCOMPLETE_CHARACTER: char = '\u{FFFD}';
 
-/// Ricky's text of the tokens he generates, decoded as they arrive, without
-/// special tokens, as SGLang's engine returns it. Each call gives the text the
-/// new tokens add up to their last whole character; a character the tokens
-/// end inside of waits for the tokens that finish it.
-pub struct GeneratedText {
+/// Ricky's text of an answer as his ids of it arrive, decoded with special
+/// tokens kept, so that his end token becomes text too. Each call gives the
+/// text his ids of the answer so far add: up to a character they end inside
+/// of, which waits for the call that finishes it, or with `to_the_end` all of
+/// it.
+pub struct AnswerText {
     tokenizer: Arc<Tokenizer>,
-    /// The tokens whose text was given.
-    done: usize,
+    /// The text the calls so far gave.
+    done: String,
 }
 
-impl GeneratedText {
+impl AnswerText {
     /// `tokenizer`: Ricky's.
     pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        Self { tokenizer, done: 0 }
-    }
-
-    /// The text that `generated_ids`, every token generated so far, add since
-    /// the last call: up to their last whole character, or with `to_the_end`
-    /// all of it, an unfinished character as U+FFFD.
-    ///
-    /// Errors: the tokenizer fails, or the text of the earlier tokens changed.
-    pub fn new_text(&mut self, generated_ids: &[u32], to_the_end: bool) -> Result<String> {
-        let context = self.done.saturating_sub(CONTEXT_TOKENS);
-        let done_text = self.decode(&generated_ids[context..self.done])?;
-        let (end, text) = self.finished(generated_ids, context, to_the_end)?;
-        let new_text = text.strip_prefix(done_text.as_str()).with_context(|| {
-            format!(
-                "Ricky's text of his tokens {context}..{} changed when tokens followed them",
-                self.done
-            )
-        })?;
-        self.done = end;
-        Ok(new_text.to_owned())
-    }
-
-    /// The end of the last token from `done` on that ends a whole character, and
-    /// the text from `context` up to it.
-    fn finished(
-        &self,
-        generated_ids: &[u32],
-        context: usize,
-        to_the_end: bool,
-    ) -> Result<(usize, String)> {
-        let shortest = self
-            .done
-            .max(generated_ids.len().saturating_sub(TOKENS_PER_CHARACTER));
-        for end in (shortest..=generated_ids.len()).rev() {
-            let decoded = self
-                .tokenizer
-                .decode(&generated_ids[context..end], true)
-                .context("decode Ricky's tokens")?;
-            match decoded {
-                DecodeResult::Complete(text) => return Ok((end, text)),
-                DecodeResult::Partial(text) if to_the_end => return Ok((end, text)),
-                DecodeResult::Partial(_) => {}
-            }
+        Self {
+            tokenizer,
+            done: String::new(),
         }
-        Ok((self.done, self.decode(&generated_ids[context..self.done])?))
     }
 
-    fn decode(&self, ids: &[u32]) -> Result<String> {
-        adapter::decode_complete(&self.tokenizer, ids, true)
+    /// The text that `answer_ids`, Ricky's ids of the answer so far, add since
+    /// the last call: their whole text without one trailing U+FFFD, the
+    /// character they end inside of, or with `to_the_end` all of it.
+    ///
+    /// Errors: the tokenizer fails, or his text of more ids does not continue
+    /// his text of fewer.
+    pub fn new_text(&mut self, answer_ids: &[u32], to_the_end: bool) -> Result<String> {
+        let mut text = adapter::decode_complete(&self.tokenizer, answer_ids, false)?;
+        if !to_the_end && text.ends_with(INCOMPLETE_CHARACTER) {
+            text.pop();
+        }
+        let new_text = text
+            .strip_prefix(self.done.as_str())
+            .with_context(|| {
+                format!(
+                    "Ricky's text of more tokens, {text:?}, does not continue his text of \
+                     fewer, {:?}",
+                    self.done
+                )
+            })?
+            .to_owned();
+        self.done = text;
+        Ok(new_text)
     }
 }
 
@@ -205,7 +182,7 @@ mod tests {
         let ids = adapter::encode(&tokenizer, "a\u{1F600}b").unwrap();
         // The fixture has no merges: one token per byte.
         assert_eq!(ids.len(), 6);
-        let mut text = GeneratedText::new(tokenizer);
+        let mut text = AnswerText::new(tokenizer);
 
         assert_eq!(text.new_text(&ids[..3], false).unwrap(), "a");
         assert_eq!(text.new_text(&ids[..4], false).unwrap(), "");
@@ -215,12 +192,23 @@ mod tests {
     }
 
     #[test]
-    fn the_end_of_the_text_gives_an_unfinished_character_too() {
+    fn the_end_of_the_answer_gives_an_unfinished_character_too() {
         let tokenizer = tiny_tokenizer();
         let ids = adapter::encode(&tokenizer, "a\u{1F600}").unwrap();
-        let mut text = GeneratedText::new(tokenizer);
+        let mut text = AnswerText::new(tokenizer);
 
         assert_eq!(text.new_text(&ids[..3], true).unwrap(), "a\u{FFFD}");
+    }
+
+    #[test]
+    fn special_tokens_stay_in_the_text() {
+        let tokenizer = tiny_tokenizer();
+        let mut ids = adapter::encode(&tokenizer, "ab").unwrap();
+        // The fixture's one special token.
+        ids.push(256);
+        let mut text = AnswerText::new(tokenizer);
+
+        assert_eq!(text.new_text(&ids, true).unwrap(), "ab<|endoftext|>");
     }
 
     #[test]
@@ -228,7 +216,7 @@ mod tests {
         let tokenizer = tiny_tokenizer();
         let whole = "Hello, w\u{00F6}rld \u{1F600}! ".repeat(20);
         let ids = adapter::encode(&tokenizer, &whole).unwrap();
-        let mut text = GeneratedText::new(tokenizer);
+        let mut text = AnswerText::new(tokenizer);
 
         let mut joined = String::new();
         for end in (0..ids.len()).step_by(7) {

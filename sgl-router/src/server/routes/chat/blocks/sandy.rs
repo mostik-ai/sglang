@@ -3,20 +3,26 @@
 
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::tokenizer::franky_sandy::{FrankySandyTokens, GeneratedText};
+use crate::tokenizer::franky_sandy::{AnswerText, FrankySandyTokens};
 use axum::body::Body;
 use axum::http::{header, Response};
+use dynamo_tokenizers::Tokenizer;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 /// Sandy's ids of a request whose Sandy tokenizes on its own: her ids of its
-/// prompt, then her tokens of the text Ricky generates, made block by block from
-/// Ricky's ids: decoded with his tokenizer, encoded with hers. A block's Sandy
+/// prompt, then her tokens of each answer Ricky generates, made block by block
+/// from his ids of the answer: decoded with his tokenizer, special tokens kept,
+/// and encoded with hers as plain text. A block's Sandy
 /// prompt extends the last one's, so Sandy's cache keeps it, and her tokens of
 /// the whole answer extend them all, so a later turn's ids can extend those.
 pub(in crate::server::routes::chat) struct SandyChain {
     tokens: Arc<FrankySandyTokens>,
-    text: GeneratedText,
+    ricky: Arc<Tokenizer>,
+    /// Ricky's text of the current answer.
+    text: AnswerText,
+    /// Ricky's tokens before the current answer.
+    answer_start: usize,
     ids: SandyIds,
 }
 
@@ -42,14 +48,16 @@ impl SandyChain {
         })?;
         Ok(Some(Self {
             tokens,
-            text: GeneratedText::new(ricky),
+            text: AnswerText::new(Arc::clone(&ricky)),
+            ricky,
+            answer_start: 0,
             ids: SandyIds::of_prompt(prompt_ids),
         }))
     }
 
     /// The ids Sandy reads for the next block, after her tokens of the text
-    /// that `generated_ids`, every token Ricky generated so far, add up to their
-    /// last whole character.
+    /// that `generated_ids`, every token Ricky generated so far, add to the
+    /// current answer, up to a character they end inside of.
     ///
     /// Errors: `ApiError::Internal` when a tokenizer fails.
     pub(super) fn next_block(&mut self, generated_ids: &[u32]) -> Result<SandyBlock, ApiError> {
@@ -60,16 +68,19 @@ impl SandyChain {
             .map_err(sandy_tokens_failed)
     }
 
-    /// Ends the current answer after Sandy's tokens of the text so far, at a
+    /// Ends the current answer after Sandy's tokens of all of its text, at a
     /// boundary token; the next block starts a new answer.
     ///
     /// Errors: `ApiError::Internal` when a tokenizer fails.
     pub(super) fn end_answer(&mut self, generated_ids: &[u32]) -> Result<(), ApiError> {
-        let new_text = self.new_text(generated_ids, false)?;
+        let new_text = self.new_text(generated_ids, true)?;
         let tokens = &self.tokens;
         self.ids
             .end_answer(&new_text, |text| tokens.encode_answer_text(text))
-            .map_err(sandy_tokens_failed)
+            .map_err(sandy_tokens_failed)?;
+        self.text = AnswerText::new(Arc::clone(&self.ricky));
+        self.answer_start = generated_ids.len();
+        Ok(())
     }
 
     /// The answers of the request that ended at a boundary token, in order.
@@ -142,7 +153,7 @@ impl SandyChain {
 
     fn new_text(&mut self, generated_ids: &[u32], to_the_end: bool) -> Result<String, ApiError> {
         self.text
-            .new_text(generated_ids, to_the_end)
+            .new_text(&generated_ids[self.answer_start..], to_the_end)
             .map_err(sandy_tokens_failed)
     }
 }
