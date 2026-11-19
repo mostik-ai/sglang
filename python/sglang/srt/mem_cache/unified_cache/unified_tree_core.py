@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from array import array
 from collections import defaultdict
 from enum import Enum, auto
@@ -125,6 +126,9 @@ class UnifiedTreeNode:
         ]
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
+        # Wall-clock seconds (time.monotonic) since the node's Full KV entered
+        # device memory; its age at eviction feeds a metric. Not an LRU time.
+        self.device_cached_since = time.monotonic()
         self.hash_value = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
@@ -469,6 +473,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             dynamo_format=params.dynamo_kv_event_format,
             lora_names=params.kv_event_lora_names,
         )
+        # (age seconds, tokens) of each device eviction until the Controller
+        # takes them; None when metrics are off, so nothing accumulates.
+        self.device_eviction_ages: Optional[list[tuple[float, int]]] = (
+            [] if params.enable_metrics else None
+        )
 
         self.reset()
 
@@ -712,6 +721,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 start = end
             paths.append(tuple(path))
         return tuple(paths)
+
+    def mark_device_cached(self, node: UnifiedTreeNode) -> None:
+        """The node's Full KV entered device memory again (a host load-back)."""
+        node.device_cached_since = time.monotonic()
+
+    def record_device_eviction(self, node: UnifiedTreeNode, num_tokens: int) -> None:
+        """The node's Full KV left device memory: keep its age for the metric."""
+        if self.device_eviction_ages is not None and num_tokens > 0:
+            self.device_eviction_ages.append(
+                (time.monotonic() - node.device_cached_since, num_tokens)
+            )
+
+    def take_device_eviction_ages(self) -> list[tuple[float, int]]:
+        ages = self.device_eviction_ages or []
+        if self.device_eviction_ages is not None:
+            self.device_eviction_ages = []
+        return ages
 
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""
@@ -1474,6 +1500,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hit_count = child.hit_count
         new_node.external_cache_stored = child.external_cache_stored
         new_node.creation_time = child.creation_time
+        new_node.device_cached_since = child.device_cached_since
         if self.tlru_bookkeeping:
             # A split adds no depth to the branch: the new parent sits at
             # split_len tokens and inherits the branch's high-water mark, while

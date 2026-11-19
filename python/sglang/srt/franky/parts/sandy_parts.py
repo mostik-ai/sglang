@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from typing_extensions import override
 
+from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
+from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts.franky_parts import FrankyParts, load_part
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
@@ -13,10 +15,10 @@ if TYPE_CHECKING:
     from sglang.srt.franky.config import FrankyConfig
     from sglang.srt.franky.parts.encoder.encoder import Encoder
     from sglang.srt.franky.parts.franky_mixin import FrankyMixin
-    from sglang.srt.model_executor.forward_batch_info import (
-        ForwardBatch,
-        PPProxyTensors,
-    )
+    from sglang.srt.franky.parts.injector.injector import Injector
+    from sglang.srt.franky.parts.injector.layer_output import LayerOutput
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 
 class SandyParts(FrankyParts):
@@ -31,10 +33,12 @@ class SandyParts(FrankyParts):
         self,
         *,
         config: FrankyConfig,
+        injector: Injector,
         encoders: dict[int, Encoder],
         start_layer: int,
         end_layer: int,
         device: str,
+        stripes: TapStripes,
     ) -> None:
         self._encoders = encoders
         self._start_layer = start_layer
@@ -53,10 +57,13 @@ class SandyParts(FrankyParts):
         self._open_at_start = _open_at(all_inputs, edge=start_layer)
         self._open_at_end = _open_at(all_inputs, edge=end_layer)
         self._states: dict[int, torch.Tensor] = {}
+        self.tap_cache: Optional[SandyTapCache] = None
         super().__init__(
             config=config,
+            injector=injector,
             layer_indices=frozenset(layer - 1 for layer in self._encoders_of_layer),
             device=device,
+            stripes=stripes,
         )
 
     @classmethod
@@ -67,6 +74,7 @@ class SandyParts(FrankyParts):
         model: nn.Module,
         language_model: FrankyMixin,
         config: FrankyConfig,
+        injector: Injector,
         weights: Optional[dict[str, torch.Tensor]],
         dtype: torch.dtype,
         device: str,
@@ -90,10 +98,29 @@ class SandyParts(FrankyParts):
         _drop_head(model=model, language_model=language_model)
         return cls(
             config=config,
+            injector=injector,
             encoders=encoders,
             start_layer=start_layer,
             end_layer=end_layer,
             device=device,
+            stripes=TapStripes.of_attention_tp(),
+        )
+
+    @override
+    def init_taps(
+        self,
+        *,
+        num_kv_tokens: int,
+        kv_page_size: int,
+        req_to_token_pool: ReqToTokenPool,
+    ) -> None:
+        self.tap_cache = SandyTapCache.build(
+            encoder_ids=self._tap_encoder_ids(),
+            output_size=self.config.encoder.output_size,
+            page_size=self.config.tap_page_size,
+            num_kv_slots=num_kv_tokens + kv_page_size,
+            stripes=self.stripes,
+            device=self.device,
         )
 
     @override
@@ -127,9 +154,8 @@ class SandyParts(FrankyParts):
             pp_proxy_tensors[_state_key(index)] = self._states.pop(index)
 
     @override
-    def _after_layer(
-        self, *, layer_idx: int, residual: torch.Tensor, forward_batch: ForwardBatch
-    ) -> Optional[torch.Tensor]:
+    def _after_layer(self, *, layer_idx: int, output: LayerOutput) -> LayerOutput:
+        residual = self.injector.read(output=output)
         layer = layer_idx + 1
         for index in self._encoders_of_layer[layer]:
             encoder = self._encoders[index]
@@ -144,11 +170,11 @@ class SandyParts(FrankyParts):
                 self.tap_cache.write(
                     encoder_id=index,
                     taps=encoder.finish(state=state),
-                    kv_slots=forward_batch.out_cache_loc,
+                    kv_slots=output.forward_batch.out_cache_loc,
                 )
             else:
                 self._states[index] = state
-        return None
+        return output
 
 
 class _NoLogits(nn.Module):
@@ -166,10 +192,28 @@ class _NoLogits(nn.Module):
 
 
 def _drop_head(*, model: nn.Module, language_model: FrankyMixin) -> None:
-    model.logits_processor = _NoLogits()
+    owner = _head_owner(model=model, language_model=language_model)
+    owner.logits_processor = _NoLogits()
     # A tied head is the language model's own embedding, so only a separate one goes.
-    if all(module is not model.lm_head for module in language_model.modules()):
-        model.lm_head = None
+    if all(module is not owner.lm_head for module in language_model.modules()):
+        owner.lm_head = None
+
+
+def _head_owner(*, model: nn.Module, language_model: FrankyMixin) -> nn.Module:
+    """The innermost module around the language model with the head; a vision
+    model can wrap the causal LM that holds it."""
+    owners = [
+        module
+        for module in model.modules()
+        if any(name == "logits_processor" for name, _ in module.named_children())
+        and any(inner is language_model for inner in module.modules())
+    ]
+    if not owners:
+        raise ValueError(
+            f"{type(model).__name__} has no logits_processor around "
+            f"{type(language_model).__name__} for Sandy to drop."
+        )
+    return owners[-1]
 
 
 def _open_at(all_inputs: list[tuple[int, ...]], *, edge: int) -> tuple[int, ...]:

@@ -56,6 +56,8 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "external_trace_header",
         "franky_chain",
         "franky_room",
+        "franky_sandy_input_ids",
+        "franky_sandy_spans",
         "http_worker_ipc",
         "image_max_dynamic_patch",
         "input_embeds",

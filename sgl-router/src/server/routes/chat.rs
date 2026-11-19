@@ -227,6 +227,9 @@ async fn prepare<'a>(
             } else {
                 COMPLETIONS_PATH
             };
+            if path != CHAT_PATH {
+                refuse_franky_prompts_rendered_by_the_engine(ctx, &model, path)?;
+            }
             let request = if grpc && matches!(endpoint, Endpoint::Completions) {
                 PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
             } else if grpc {
@@ -241,6 +244,7 @@ async fn prepare<'a>(
         Endpoint::Generate => {
             let model = served_model();
             let routing = ModelRouting::lookup(ctx, &model)?;
+            refuse_franky_prompts_rendered_by_the_engine(ctx, &model, GENERATE_PATH)?;
             (routing, PreparedRequest::generate(ctx, model, body)?)
         }
         Endpoint::Embeddings | Endpoint::Classify => {
@@ -272,6 +276,22 @@ fn require_plain_workers(ctx: &AppContext, model: &ModelId, path: &str) -> Resul
     if registered.iter().any(|w| w.mode() != WorkerMode::Plain) {
         return Err(ApiError::BadRequest(format!(
             "{path} is not served by prefill-decode workers"
+        )));
+    }
+    Ok(())
+}
+
+/// A Franky Sandy that tokenizes on its own reads ids the router rendered for
+/// it, and the router renders chats only.
+fn refuse_franky_prompts_rendered_by_the_engine(
+    ctx: &AppContext,
+    model: &ModelId,
+    path: &str,
+) -> Result<(), ApiError> {
+    if ctx.franky_sandy.is_some() && serves_franky(ctx, model) {
+        return Err(ApiError::BadRequest(format!(
+            "model {model} is served by Franky workers whose Sandy tokenizes on its own, \
+             and the router renders only chats for it; {path} is not served"
         )));
     }
     Ok(())

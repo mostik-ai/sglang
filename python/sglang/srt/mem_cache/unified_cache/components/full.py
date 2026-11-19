@@ -188,6 +188,7 @@ class FullComponent(TreeComponent):
             # both in allocator units (see reclaimable_value_len).
             freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
+            self.tree_core.record_device_eviction(node, freed)
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
             # because SWA's free_swa still needs to read Full.value.
             # cd.value = None
@@ -459,6 +460,7 @@ class FullComponent(TreeComponent):
                 n_len = len(cd.host_value)
                 cd.value = device_indices[offset : offset + n_len].clone()
                 offset += n_len
+                self.tree_core.mark_device_cached(n)
                 # Full uses leaf sets, not LRU. A value materialized under
                 # lock is protected; the last release moves it to evictable.
                 ledger = self.reclaimable_value_len(n)

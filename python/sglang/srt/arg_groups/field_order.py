@@ -574,6 +574,6 @@ POSITIONAL_FIELD_ORDER = (
     "franky_weights",
     "franky_bootstrap_port",
     "franky_chain_hold_seconds",
-    "franky_chain_hold_ratio",
+    "franky_tap_pool_ratio",
 )
 # fmt: on

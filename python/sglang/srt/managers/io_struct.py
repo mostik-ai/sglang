@@ -52,9 +52,7 @@ from pydantic import PlainValidator
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
-from sglang.srt.franky.cache.generated_spans import GeneratedSpan
-from sglang.srt.franky.chains.chain import FrankyChain
-from sglang.srt.franky.transfer.messages import FrankyRoom
+from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
@@ -313,6 +311,10 @@ class GenerateReqInput:
     # Franky: the [start, end) runs of the prompt where Sandy's view differs from
     # it, which an aligned reader writes at.
     franky_write_ranges: Optional[List[List[int]]] = None
+    # Franky with a Sandy that tokenizes on its own: Sandy's token ids of the
+    # input, and the runs of franky_generated_spans' answers in Sandy's tokens.
+    franky_sandy_input_ids: Optional[List[int]] = None
+    franky_sandy_spans: Optional[List[List[int]]] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -1022,6 +1024,8 @@ class GenerateReqInput:
             raise ValueError("franky_generated_spans takes a single request with n=1.")
         if self.franky_write_ranges is not None:
             raise ValueError("franky_write_ranges takes a single request with n=1.")
+        if self.franky_sandy_input_ids is not None:
+            raise ValueError("franky_sandy_input_ids takes a single request with n=1.")
 
     def _get_positional_embed_overrides_item(
         self, i: int
@@ -1257,10 +1261,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
-    franky_room: Optional[FrankyRoom] = None
-    franky_chain: Optional[FrankyChain] = None
-    franky_generated_spans: tuple[GeneratedSpan, ...] = ()
-    franky_write_ranges: tuple[tuple[int, int], ...] = ()
+    franky: Optional[FrankyRequest] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

@@ -2,13 +2,14 @@
 """Symmetric-memory ``multimem.st`` all-gather along the hidden (last) dim.
 
 Each rank stores its ``[T, H/TP]`` shard into a multicast buffer in one NVLink
-pass instead of an NCCL ring; ``create_state`` rendezvous once so launches are
-CUDA-graph capturable.
+pass instead of an NCCL ring; where the GPUs have no NVLink multicast, it stores
+the shard into every rank's buffer over NVLink P2P instead. ``create_state``
+rendezvous once so launches are CUDA-graph capturable.
 """
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -52,6 +53,26 @@ def _multimem_st_128(multicast_ptrs, x, y, z, w, mask):
         """,
         "=r,l,r,r,r,r,r",
         args=[multicast_ptrs, x, y, z, w, mask.to(tl.int32)],
+        dtype=(tl.uint32),
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _st_128(ptr, x, y, z, w, mask):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $6, 1;
+            @!%p0 bra end;
+            st.relaxed.sys.global.v4.b32 [$1], {$2, $3, $4, $5};
+            end:
+        }
+        """,
+        "=r,l,r,r,r,r,r",
+        args=[ptr, x, y, z, w, mask.to(tl.int32)],
         dtype=(tl.uint32),
         is_pure=False,
         pack=1,
@@ -251,6 +272,7 @@ def _blockwise_barrier(
 def _all_gather_kernel_inner(
     input_ptr,
     multicast_ptr,
+    buffer_ptrs,
     signal_pad_ptr,
     total_tokens,
     hidden_offset,
@@ -261,6 +283,7 @@ def _all_gather_kernel_inner(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     SKIP_ENTRY_SYNC: tl.constexpr,
+    MULTICAST: tl.constexpr,
 ) -> None:
     if SKIP_ENTRY_SYNC == 0:
         _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="relaxed")
@@ -283,11 +306,20 @@ def _all_gather_kernel_inner(
 
         in_ptr = input_ptr.to(tl.pointer_type(tl.uint64)) + chunk * 2
         out_chunk = row * total_hidden_chunks + hidden_offset_chunks + col_chunk
-        out_ptr = (
-            multicast_ptr.to(tl.int64).to(tl.pointer_type(tl.uint64)) + out_chunk * 2
-        )
         x, y, z, w = _local_ld_128(in_ptr, mask)
-        _multimem_st_128(out_ptr, x, y, z, w, mask)
+        if MULTICAST:
+            out_ptr = (
+                multicast_ptr.to(tl.int64).to(tl.pointer_type(tl.uint64))
+                + out_chunk * 2
+            )
+            _multimem_st_128(out_ptr, x, y, z, w, mask)
+        else:
+            # No multicast: store the chunk into every rank's buffer over P2P.
+            for peer in tl.static_range(WORLD_SIZE):
+                peer_buffer = tl.load(
+                    buffer_ptrs.to(tl.pointer_type(tl.uint64)) + peer
+                ).to(tl.pointer_type(tl.uint64))
+                _st_128(peer_buffer + out_chunk * 2, x, y, z, w, mask)
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
 
     _sync_threads()
@@ -364,7 +396,9 @@ def all_gather_inner(
     skip_entry_sync: bool = False,
     safe: bool = True,
 ) -> torch.Tensor:
-    """Gather ``[T, H/TP]`` shards into ``[T, H]`` along the hidden dim.
+    """Gather ``[T, H/TP]`` shards into ``[T, H]`` along the hidden dim, with
+    one NVLink multicast store per chunk where the buffer has a multicast
+    address, else one P2P store per rank.
 
     ``tp_hidden_dim`` is the gathered width ``H``. Returns a clone when ``safe``,
     else a view into the symmetric buffer (valid until the next collective)."""
@@ -401,9 +435,11 @@ def all_gather_inner(
         total_tokens * local_hidden
     )
     grid = (num_blocks, 1, 1)
+    multicast = symm_mem_hdl.multicast_ptr != 0
     _all_gather_kernel_inner[grid](
         input_ptr=hidden_states,
         multicast_ptr=symm_mem_hdl.multicast_ptr,
+        buffer_ptrs=symm_mem_hdl.buffer_ptrs_dev,
         signal_pad_ptr=symm_mem_hdl.signal_pad_ptrs_dev,
         total_tokens=total_tokens,
         hidden_offset=hidden_offset,
@@ -414,6 +450,7 @@ def all_gather_inner(
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
         SKIP_ENTRY_SYNC=1 if skip_entry_sync else 0,
+        MULTICAST=multicast,
         num_warps=num_warps,
     )
     output = state.comm_buff[:total_tokens, :tp_hidden_dim]
@@ -450,10 +487,14 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
 class MultimemAllGatherer:
     """Guarded multimem all-gather (last dim) with NCCL fallback; the single
     entry point for every caller. Owns one symmetric buffer built lazily on the
-    first eager call, and uses the kernel only when the input fits its
-    dtype/shape/alignment contract. Guards use TP-replicated quantities so all
-    ranks pick the same path. ``skip_entry_sync=True`` drops the entry barrier;
-    only safe when a cross-rank sync sits between consecutive calls."""
+    first eager call, or by ``build`` outside graph capture, and uses the kernel
+    only when the input fits its dtype/shape/alignment contract. Guards use
+    TP-replicated quantities so all ranks pick the same path.
+    ``skip_entry_sync=True`` drops the entry barrier; only safe when a cross-rank
+    sync sits between consecutive calls. ``p2p=True`` keeps the buffer where the
+    GPUs have no NVLink multicast and stores into every rank's buffer over P2P;
+    otherwise such GPUs fall back to NCCL. ``group`` gathers over another group
+    than TP."""
 
     _UNINIT = object()
 
@@ -463,13 +504,24 @@ class MultimemAllGatherer:
         *,
         enabled: bool = True,
         skip_entry_sync: bool = False,
+        group: Any = None,
+        p2p: bool = False,
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
+        self._given_group = group
+        self._p2p = p2p
         if envs.SGLANG_DISABLE_MULTIMEM_AG.get():
             enabled = False
         # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
+
+    def build(self, hidden_size: int) -> None:
+        """Build the symmetric buffer now, for a gathered width of
+        ``hidden_size``. Collective: every rank of the group calls it at the same
+        point, outside CUDA graph capture."""
+        if self._state is self._UNINIT:
+            self._state = self._create(hidden_size=hidden_size)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         state = self._state
@@ -494,19 +546,29 @@ class MultimemAllGatherer:
                 skip_entry_sync=self._skip_entry_sync,
                 safe=False,
             )
+        if self._given_group is not None:
+            return self._given_group.all_gather(x, dim=-1)
         # Lazy import avoids a module-load dependency on the distributed facade.
         from sglang.srt.distributed import tensor_model_parallel_all_gather
 
         return tensor_model_parallel_all_gather(x, dim=-1)
 
+    def _group(self):
+        if self._given_group is not None:
+            return self._given_group
+        # Lazy import avoids a module-load dependency on the distributed facade.
+        from sglang.srt.distributed.parallel_state import get_tp_group
+
+        return get_tp_group()
+
     @staticmethod
-    def _tp_group_spans_nodes(tp_group) -> bool:
+    def _group_spans_nodes(group) -> bool:
         # Not at construction: building the model must run no collectives.
         # Multi-node only: this all-reduce can segfault under some EP/mooncake setups.
         from sglang.srt.distributed.parallel_state import in_the_same_node_as
 
         return get_parallel().nnodes > 1 and not all(
-            in_the_same_node_as(tp_group.cpu_group, source_rank=0)
+            in_the_same_node_as(group.cpu_group, source_rank=0)
         )
 
     def _build(self, x: torch.Tensor):
@@ -517,29 +579,43 @@ class MultimemAllGatherer:
             return self._UNINIT
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
             return None
-        from sglang.srt.distributed.parallel_state import get_tp_group
+        return self._create(local_width=x.shape[-1])
 
-        tp_group = get_tp_group()
-        if tp_group.world_size <= 1:
+    def _create(
+        self, *, hidden_size: Optional[int] = None, local_width: Optional[int] = None
+    ):
+        group = self._group()
+        if group.world_size <= 1:
             return None
-        if self._tp_group_spans_nodes(tp_group):
+        if self._group_spans_nodes(group):
             logger.warning(
-                "multimem all-gather disabled because the TP group spans across nodes."
+                "multimem all-gather disabled because the group spans across nodes."
             )
             return None
         try:
             state = create_state(
-                group=tp_group.device_group,
-                rank_in_group=tp_group.rank_in_group,
+                group=group.device_group,
+                rank_in_group=group.rank_in_group,
                 max_tokens=self._max_tokens,
-                hidden_size=x.shape[-1] * tp_group.world_size,
+                hidden_size=(
+                    hidden_size
+                    if hidden_size is not None
+                    else local_width * group.world_size
+                ),
             )
             if state.symm_mem_hdl.multicast_ptr == 0:
+                if self._p2p:
+                    logger.info(
+                        "multimem all-gather stores over P2P (no multicast for "
+                        "world_size=%d)",
+                        group.world_size,
+                    )
+                    return state
                 # No multicast for this world size / arch; multimem.st would
                 # write nowhere. Fall back to NCCL.
                 logger.warning(
                     "multimem all-gather disabled (no multicast for world_size=%d)",
-                    tp_group.world_size,
+                    group.world_size,
                 )
                 return None
             return state

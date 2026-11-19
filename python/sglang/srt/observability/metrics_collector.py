@@ -21,7 +21,17 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import msgspec
 
@@ -54,6 +64,9 @@ if TYPE_CHECKING:
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
 logger = logging.getLogger(__name__)
+
+# Bounds of the evicted-KV age histogram: 0.1 s times 1.25**i, up to about 4 h.
+EVICTED_KV_AGE_BUCKETS = 54
 
 
 @dataclass
@@ -2531,6 +2544,25 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_eviction_duration,
         )
 
+        bucket_evicted_kv_age = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_EVICTED_KV_AGE"
+        )
+        if bucket_evicted_kv_age is None:
+            # From 0.1 s to about 4 h, each bound 1.25x the last: a percentile
+            # read from these buckets is off by at most a quarter.
+            bucket_evicted_kv_age = [
+                round(0.1 * 1.25**index, 4) for index in range(EVICTED_KV_AGE_BUCKETS)
+            ]
+        self.evicted_kv_age_seconds = Histogram(
+            name="sglang:evicted_kv_age_seconds",
+            documentation="How long evicted Full KV had been in device memory, "
+            "from the insert (or host load-back) that put it there to its "
+            "eviction, in seconds; one count per evicted token. Kept by the "
+            "Python TreeCore only.",
+            labelnames=labels.keys(),
+            buckets=bucket_evicted_kv_age,
+        )
+
         self.eviction_num_tokens = Counter(
             name="sglang:evicted_tokens_total",
             documentation="The number of device KV token slots freed by "
@@ -2612,6 +2644,24 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             "eager write-through did not complete before eviction.",
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
+
+    def observe_evicted_kv_ages(self, ages: List[Tuple[float, int]]) -> None:
+        """
+        Args:
+            ages: (seconds in device memory, evicted tokens) per evicted node.
+        """
+        histogram = self.evicted_kv_age_seconds.labels(**self.labels)
+        for age_seconds, num_tokens in ages:
+            if self._histogram_cls is not None:
+                # Injected backend (e.g. Ray): no bucket internals, one count per node.
+                histogram.observe(age_seconds)
+                continue
+            # Histogram.observe with a count of num_tokens, as observe_inter_token_latency does.
+            histogram._sum.inc(age_seconds * num_tokens)
+            for index, bound in enumerate(histogram._upper_bounds):
+                if age_seconds <= bound:
+                    histogram._buckets[index].inc(num_tokens)
+                    break
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)

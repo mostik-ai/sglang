@@ -303,7 +303,9 @@ A Ricky engine's requests also go to a Sandy engine, which sends Ricky the
 prompt's taps; Sandy is picked by `--policy`, cache-aware by its own prefix.
 `--franky-block-size` runs each request as blocks, so generated tokens read
 their own taps in the next block. `--franky-chat-adapter` marks the earlier
-answers in the chats the router renders. See [Franky pairs](REFERENCE.md#franky-pairs).
+answers in the chats the router renders; `--franky-sandy-tokenizer-path` and
+`--franky-sandy-chat-adapter` render them for a Sandy with its own tokenizer.
+See [Franky pairs](REFERENCE.md#franky-pairs).
 
 ### Bucket file
 

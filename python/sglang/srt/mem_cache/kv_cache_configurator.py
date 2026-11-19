@@ -252,7 +252,6 @@ def _pp_local_per_request_bytes(
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.franky.cache.kv_options import FrankyKvOptions
     from sglang.srt.mem_cache.unified_memory_pool import (
         UnifiedKVPool,
         UnifiedPoolBundle,
@@ -349,7 +348,9 @@ class KVCacheConfigurator:
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
-    franky_kv_options: Optional[FrankyKvOptions] = None
+    # Bytes another pool keeps per full-attention KV token, such as Franky's taps;
+    # the KV budget sets them aside.
+    extra_bytes_per_full_token: int = 0
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     hybrid_kda_config: Optional[Any] = field(init=False)
@@ -2928,10 +2929,6 @@ class KVCacheConfigurator:
                             current_platform.get_paged_allocator_cls()
                             or PagedTokenToKVPoolAllocator
                         )
-                        if self.franky_kv_options is not None:
-                            paged_allocator_cls = (
-                                self.franky_kv_options.paged_allocator_cls
-                            )
                         token_to_kv_pool_allocator = paged_allocator_cls(
                             sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size

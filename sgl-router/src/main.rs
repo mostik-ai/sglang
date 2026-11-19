@@ -26,6 +26,7 @@ use sgl_router::{
     },
     tokenizer::{
         chat_template_adapter::{self, ChatTemplateAdapter},
+        franky_sandy::FrankySandyTokens,
         TokenizerRegistry,
     },
     workers::{introspect::worker_client, manager, WorkerRegistry},
@@ -371,6 +372,12 @@ fn build_app_context(
         local_inflight_requests,
     );
     app_context.franky_chat_adapter = franky_chat_adapter(config, &app_context.tokenizers)?;
+    app_context.franky_sandy = config
+        .proxy
+        .franky_sandy
+        .as_ref()
+        .map(|sandy| FrankySandyTokens::load(sandy, config.model.tokenizer).map(Arc::new))
+        .transpose()?;
     // An external indexer leaves the local tree empty.
     app_context.dp_rank_prefix_provider = (config.model.dp_aware
         && external_kv_indexer_client.is_none())

@@ -6,13 +6,15 @@ use crate::discovery::ModelId;
 use crate::policies::has_caller_input_ids;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
+use crate::tokenizer::franky_sandy::FrankySandyTokens;
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::Value;
 
 /// A chat for Franky workers, prepared as any chat. When it has earlier answers
 /// but no `input_ids`, the engines get the ids the router rendered, with the
-/// runs of those answers as `franky_generated_spans`.
+/// runs of those answers as `franky_generated_spans`. A Sandy that tokenizes on
+/// its own gets its own rendering, see [`prepare_chat_for_both_tokenizers`].
 ///
 /// Errors: `ApiError::BadRequest` for `franky_generated_spans` without
 /// `input_ids`, and for earlier answers the router cannot mark: without
@@ -26,6 +28,18 @@ pub(super) fn prepare_franky_chat(
     policy_needs_request_tokens: bool,
 ) -> Result<PreparedRequest, ApiError> {
     let chat: Value = serde_json::from_slice(&body).map_err(|_| invalid_request())?;
+    if let Some(sandy) = ctx.franky_sandy.as_deref() {
+        return prepare_chat_for_both_tokenizers(
+            ctx,
+            sandy,
+            &chat,
+            model,
+            fields,
+            headers,
+            body,
+            policy_needs_request_tokens,
+        );
+    }
     if !router_marks_earlier_answers(&chat)? {
         return PreparedRequest::openai(
             ctx,
@@ -59,6 +73,69 @@ pub(super) fn prepare_franky_chat(
     if !spans.is_empty() {
         request.add_franky_generated_spans(&spans)?;
     }
+    Ok(request)
+}
+
+/// A chat for Franky workers whose Sandy tokenizes on its own. The router
+/// renders it for both models: Sandy gets its own ids, and Ricky gets Sandy's
+/// input length and, for each earlier answer, its runs in both renderings.
+///
+/// Errors: `ApiError::BadRequest` for a chat with `input_ids`, one the router
+/// leaves to the engine or Sandy's template does not render, and one whose two
+/// renderings hold different numbers of answers.
+#[allow(clippy::too_many_arguments)]
+fn prepare_chat_for_both_tokenizers(
+    ctx: &AppContext,
+    sandy: &FrankySandyTokens,
+    chat: &Value,
+    model: ModelId,
+    fields: RoutingFields,
+    headers: &HeaderMap,
+    body: Bytes,
+    policy_needs_request_tokens: bool,
+) -> Result<PreparedRequest, ApiError> {
+    if has_caller_input_ids(chat) {
+        return Err(ApiError::BadRequest(format!(
+            "model {model} is served by Franky workers whose Sandy tokenizes on its own, \
+             so the router renders each chat for both models; send messages without input_ids"
+        )));
+    }
+    let Some(adapter) = ctx.franky_chat_adapter.as_deref() else {
+        return Err(cannot_mark_answers(&model, "with --franky-chat-adapter"));
+    };
+    let mut request = PreparedRequest::openai(
+        ctx,
+        CHAT_PATH,
+        model,
+        fields,
+        headers,
+        body,
+        policy_needs_request_tokens,
+    )?;
+    let Some(rendered_ids) = request.rendered_chat_ids() else {
+        return Err(ApiError::BadRequest(format!(
+            "model {} is served by Franky workers whose Sandy tokenizes on its own, and \
+             the router leaves this chat to the engine to render, so it cannot render it \
+             for Sandy too",
+            request.model
+        )));
+    };
+    let generated_spans = adapter.generated_spans(rendered_ids);
+    let sandy_chat = sandy.render(chat).map_err(|error| {
+        ApiError::BadRequest(format!(
+            "Sandy's chat template does not render this chat: {error:#}"
+        ))
+    })?;
+    if sandy_chat.generated_spans.len() != generated_spans.len() {
+        return Err(ApiError::BadRequest(format!(
+            "the router found {} earlier answers in this chat as model {} renders it, \
+             and {} as Sandy renders it",
+            generated_spans.len(),
+            request.model,
+            sandy_chat.generated_spans.len()
+        )));
+    }
+    request.add_franky_sandy_chat(&generated_spans, sandy_chat)?;
     Ok(request)
 }
 

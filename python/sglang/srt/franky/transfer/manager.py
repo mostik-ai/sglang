@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
+import numpy.typing as npt
 import torch
 from typing_extensions import override
 
@@ -15,15 +17,18 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.conn import PrefillServerInfo
     from sglang.srt.disaggregation.common.utils import TransferKVChunk
     from sglang.srt.disaggregation.nixl.conn import TransferInfo
-    from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+    from sglang.srt.franky.cache.tap_buffers import TapBuffers
     from sglang.srt.server_args import ServerArgs
 
 _AUX_BYTES = 8
 
 
 class FrankyTapManager(NixlKVManager):
-    """PD's NIXL transfer, moving one rank's tap buffers instead of its KV. Taps
-    are whole on every TP rank, as MLA KV is, and pair by encoder id.
+    """PD's NIXL transfer, moving one rank's tap pages instead of its KV. Each
+    attention-TP rank keeps its own stripe pages of every request, so every
+    receiving rank pairs with every sending rank of every stage; page lists are
+    whole requests with -1 where a rank keeps no page, and only the pages both
+    ends keep move. Encoders pair by id.
     """
 
     def __init__(
@@ -41,9 +46,9 @@ class FrankyTapManager(NixlKVManager):
         super().__init__(kv_args, side, server_args, is_mla_backend=True)
 
     @staticmethod
-    def from_tap_cache(
+    def from_buffers(
         *,
-        tap_cache: FrankyTapCache,
+        buffers: TapBuffers,
         side: DisaggregationMode,
         server_args: ServerArgs,
         bootstrap_port: Optional[int],
@@ -61,7 +66,7 @@ class FrankyTapManager(NixlKVManager):
         aux_buffer = torch.zeros(_AUX_BYTES, dtype=torch.uint8)
         return FrankyTapManager(
             kv_args=_tap_kv_args(
-                tap_cache=tap_cache,
+                buffers=buffers,
                 aux_buffer=aux_buffer,
                 engine_rank=engine_rank,
                 pp_rank=pp_rank,
@@ -117,8 +122,36 @@ class FrankyTapManager(NixlKVManager):
         return True
 
     @override
-    def _pair_pp_stages(self, info: PrefillServerInfo) -> tuple[list[int], int]:
-        return list(range(info.pp_size)), self.pp_size
+    def send_kvcache(
+        self,
+        peer_name: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_gpu_id: int,
+        dst_mem_kind: str = "VRAM",
+    ):
+        kept = (prefill_kv_indices >= 0) & (dst_kv_indices >= 0)
+        if not kept.any():
+            return None
+        return super().send_kvcache(
+            peer_name,
+            prefill_kv_indices[kept],
+            dst_kv_ptrs,
+            dst_kv_indices[kept],
+            dst_gpu_id,
+            dst_mem_kind=dst_mem_kind,
+        )
+
+    @override
+    def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
+        # handle_franky refuses attention context parallelism at start.
+        info.target_tp_rank = None
+        info.target_tp_ranks = list(range(info.attn_tp_size))
+        info.target_cp_ranks = [0]
+        info.target_pp_ranks = list(range(info.pp_size))
+        info.required_dst_info_num = self.attn_tp_size * self.pp_size
+        info.required_prefill_response_num = info.attn_tp_size * info.pp_size
 
     @override
     def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
@@ -127,28 +160,32 @@ class FrankyTapManager(NixlKVManager):
 
 def _tap_kv_args(
     *,
-    tap_cache: FrankyTapCache,
+    buffers: TapBuffers,
     aux_buffer: torch.Tensor,
     engine_rank: int,
     pp_rank: int,
     gpu_id: int,
 ) -> KVArgs:
-    buffers = tap_cache.transfer_buffers()
-    encoder_ids = sorted(buffers)
+    transfer_buffers = buffers.transfer_buffers()
+    encoder_ids = sorted(transfer_buffers)
     kv_args = KVArgs()
     kv_args.engine_rank = engine_rank
     kv_args.pp_rank = pp_rank
     kv_args.system_dp_rank = get_parallel().dp_rank
     kv_args.rust_http_port = None
-    kv_args.kv_cache_dtype_str = f"franky taps, {tap_cache.page_bytes} bytes a page"
+    kv_args.kv_cache_dtype_str = f"franky taps, {buffers.page_bytes} bytes a page"
     kv_args.kv_layout = None
     kv_args.prefill_start_layer = 0
     kv_args.prefill_end_layer = None
-    kv_args.kv_data_ptrs = [buffers[encoder_id][0] for encoder_id in encoder_ids]
-    kv_args.kv_data_lens = [buffers[encoder_id][1] for encoder_id in encoder_ids]
-    kv_args.kv_item_lens = [tap_cache.page_bytes for _ in encoder_ids]
+    kv_args.kv_data_ptrs = [
+        transfer_buffers[encoder_id][0] for encoder_id in encoder_ids
+    ]
+    kv_args.kv_data_lens = [
+        transfer_buffers[encoder_id][1] for encoder_id in encoder_ids
+    ]
+    kv_args.kv_item_lens = [buffers.page_bytes for _ in encoder_ids]
     kv_args.kv_layer_ids = encoder_ids
-    kv_args.page_size = tap_cache.page_size
+    kv_args.page_size = buffers.page_size
     kv_args.aux_data_ptrs = [aux_buffer.data_ptr()]
     kv_args.aux_data_lens = [aux_buffer.nbytes]
     kv_args.aux_item_lens = [aux_buffer.nbytes]

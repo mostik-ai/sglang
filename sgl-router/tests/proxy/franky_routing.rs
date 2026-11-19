@@ -7,7 +7,7 @@
 use crate::common::mock_worker::MockWorker;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Json;
@@ -165,6 +165,15 @@ fn chat() -> Request<Body> {
         .unwrap()
 }
 
+fn with_request_id(mut request: Request<Body>, request_id: Option<&str>) -> Request<Body> {
+    if let Some(request_id) = request_id {
+        request
+            .headers_mut()
+            .insert("x-request-id", request_id.parse().unwrap());
+    }
+    request
+}
+
 fn without(mut body: Value, fields: &[&str]) -> Value {
     for field in fields {
         body.as_object_mut().unwrap().remove(*field);
@@ -247,6 +256,43 @@ async fn pd_legs_and_their_sandy_share_one_room() {
             without(prefill_body, &pd_fields),
             "reorg={reorg}"
         );
+    }
+}
+
+/// The client's `x-request-id` reaches the Sandy and both PD legs, so each
+/// engine's record names the client's request; without one, none is sent.
+#[tokio::test]
+async fn every_leg_carries_the_clients_request_id() {
+    for request_id in [Some("client-7"), None] {
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let sandy = MockWorker::start(vec![]).await;
+        let ctx = franky_ctx(
+            &[
+                ("p", &prefill.url, WorkerMode::Prefill),
+                ("d", &decode.url, WorkerMode::Decode),
+            ],
+            &[("s", &sandy.url)],
+            1,
+            true,
+        );
+
+        let res = build_router(ctx)
+            .oneshot(with_request_id(chat(), request_id))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        for worker in [&prefill, &decode, &sandy] {
+            worker.captured_json().await;
+            let captured = worker.captured.lock().unwrap();
+            assert_eq!(
+                captured.headers.get("x-request-id").map(String::as_str),
+                request_id,
+                "{}",
+                worker.url
+            );
+        }
     }
 }
 
@@ -384,6 +430,8 @@ struct BlockEngine {
     stop_at: usize,
     prompt_len: Arc<Mutex<Option<usize>>>,
     requests: Arc<Mutex<Vec<Value>>>,
+    request_ids: Arc<Mutex<Vec<Option<String>>>>,
+    request_came: Arc<tokio::sync::Notify>,
     chain_ends: Arc<Mutex<Vec<Value>>>,
     chain_ended: Arc<tokio::sync::Notify>,
 }
@@ -412,8 +460,17 @@ impl BlockEngine {
         (engine, url, shutdown)
     }
 
-    async fn generate(State(engine): State<Self>, Json(request): Json<Value>) -> Response {
+    async fn generate(
+        State(engine): State<Self>,
+        headers: HeaderMap,
+        Json(request): Json<Value>,
+    ) -> Response {
         engine.requests.lock().unwrap().push(request.clone());
+        let request_id = headers
+            .get("x-request-id")
+            .map(|id| id.to_str().unwrap().to_owned());
+        engine.request_ids.lock().unwrap().push(request_id);
+        engine.request_came.notify_one();
         let input = request["input_ids"].as_array().unwrap().len();
         let prompt = *engine.prompt_len.lock().unwrap().get_or_insert(input);
         let generated = input - prompt;
@@ -474,6 +531,20 @@ impl BlockEngine {
 
     fn chain_ends(&self) -> Vec<Value> {
         self.chain_ends.lock().unwrap().clone()
+    }
+
+    /// The `x-request-id` of each request, once `count` requests came: a
+    /// Sandy's leg may still be on its way when the chain answers.
+    async fn wait_for_request_ids(&self, count: usize) -> Vec<Option<String>> {
+        let came = async {
+            while self.request_ids.lock().unwrap().len() < count {
+                self.request_came.notified().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), came)
+            .await
+            .expect("the engine got too few requests within 5 seconds");
+        self.request_ids.lock().unwrap().clone()
     }
 
     async fn wait_for_chain_end(&self) -> Vec<Value> {
@@ -578,6 +649,24 @@ async fn blocks_run_until_ricky_stops_and_answer_once() {
             engine.wait_for_chain_end().await,
             [json!({"chain_id": chain})]
         );
+    }
+}
+
+#[tokio::test]
+async fn every_block_carries_the_clients_request_id() {
+    for request_id in [Some("client-7"), None] {
+        let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+        let body = json!({"input_ids": [1, 2, 3], "sampling_params": {"max_new_tokens": 100}});
+
+        let res = build_router(ctx)
+            .oneshot(with_request_id(generate(body), request_id))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let expected = vec![request_id.map(str::to_owned); 3];
+        assert_eq!(ricky.wait_for_request_ids(3).await, expected);
+        assert_eq!(sandy.wait_for_request_ids(3).await, expected);
     }
 }
 

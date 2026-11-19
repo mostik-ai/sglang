@@ -5,8 +5,7 @@ use serde_json::{json, Value};
 use sgl_router::tokenizer::{adapter, chat_formatter::ChatFormatter};
 use sha2::{Digest, Sha256};
 
-#[path = "../../fixtures/kimi_k3.rs"]
-mod fixture;
+use super::kimi_k3_fixture as fixture;
 
 #[test]
 fn kimi_tokens_match_sglang() {

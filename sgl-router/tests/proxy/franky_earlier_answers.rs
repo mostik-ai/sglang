@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::common::cache_aware_fixture::{self, MODEL as DEEPSEEK_V4};
+use crate::common::kimi_k3_fixture;
 use crate::common::mock_worker::MockWorker;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
-use sgl_router::config::{ChatTemplateAdapterKind, Config, PolicyKind};
+use sgl_router::config::{ChatTemplateAdapterKind, Config, FrankySandyConfig, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::policies_reorg::factory::build_sandy_group;
@@ -16,8 +17,10 @@ use sgl_router::server::app_context::AppContext;
 use sgl_router::state::kv_events::KvEventIndex;
 use sgl_router::tokenizer::adapter::encode;
 use sgl_router::tokenizer::chat_template_adapter::{self, ChatTemplateAdapter};
+use sgl_router::tokenizer::franky_sandy::FrankySandyTokens;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -323,5 +326,88 @@ async fn chats_for_solo_workers_are_forwarded_as_before() {
             body.get("franky_generated_spans"),
             chat.get("franky_generated_spans")
         );
+    }
+}
+
+/// A Franky pair whose Sandy is a Kimi K3 that tokenizes on its own, serving
+/// the lowered DeepSeek V4 model; Ricky's adapter marks the prompt's last
+/// token as its one earlier answer.
+async fn pair_with_kimi_sandy() -> (FrankyPair, tempfile::TempDir) {
+    let mut pair =
+        FrankyPair::start(config(DEEPSEEK_V4, "tests/fixtures/tiny_tokenizer.json")).await;
+    pair.ctx.franky_chat_adapter = Some(Arc::new(FinalTokenAdapter));
+    let kimi = kimi_k3_fixture::tokenizer();
+    let sandy = FrankySandyConfig {
+        tokenizer_path: kimi.path().join("tiktoken.model").display().to_string(),
+        chat_adapter: ChatTemplateAdapterKind::KimiK3,
+        keep_every: NonZeroUsize::MIN,
+    };
+    pair.ctx.franky_sandy = Some(Arc::new(
+        FrankySandyTokens::load(&sandy, Default::default()).unwrap(),
+    ));
+    (pair, kimi)
+}
+
+#[tokio::test]
+async fn a_sandy_with_its_own_tokenizer_reads_its_rendering_and_ricky_its_spans() {
+    let (FrankyPair { ricky, sandy, ctx }, _kimi) = pair_with_kimi_sandy().await;
+
+    let (status, _) = post(Arc::new(ctx), CHAT_PATH, &chat_with_an_answer(DEEPSEEK_V4)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let ricky_body = ricky.captured_json().await;
+    let sandy_body = sandy.captured_json().await;
+    let ricky_ids = ricky_body["input_ids"].as_array().unwrap();
+    let sandy_ids = sandy_body["input_ids"].as_array().unwrap();
+    assert_ne!(sandy_ids, ricky_ids);
+    assert_eq!(ricky_body["franky_sandy_input_ids"], json!(sandy_ids));
+    assert_eq!(
+        ricky_body["franky_generated_spans"],
+        json!([[ricky_ids.len() - 1, ricky_ids.len()]])
+    );
+    let [sandy_span] = ricky_body["franky_sandy_spans"]
+        .as_array()
+        .unwrap()
+        .as_slice()
+    else {
+        panic!("{ricky_body}");
+    };
+    assert!(
+        sandy_span[1].as_u64().unwrap() < sandy_ids.len() as u64,
+        "{ricky_body}"
+    );
+    for ricky_field in [
+        "franky_generated_spans",
+        "franky_sandy_spans",
+        "franky_sandy_input_ids",
+    ] {
+        assert!(sandy_body.get(ricky_field).is_none(), "{sandy_body}");
+    }
+    assert_eq!(sandy_body["franky_room"], ricky_body["franky_room"]);
+}
+
+#[tokio::test]
+async fn a_sandy_with_its_own_tokenizer_refuses_what_the_router_cannot_render_for_it() {
+    let mut with_input_ids = chat_with_an_answer(DEEPSEEK_V4);
+    with_input_ids["input_ids"] = json!([1, 2, 3]);
+    // Ricky's adapter finds an answer in every chat, Sandy's only in chats with one.
+    let without_answers =
+        json!({"model": DEEPSEEK_V4, "messages": [{"role": "user", "content": "Hi"}]});
+    let completion = json!({"model": DEEPSEEK_V4, "prompt": "Hi", "max_tokens": 8});
+    let generate = json!({"input_ids": [1, 2, 3]});
+    for (path, body, names) in [
+        (CHAT_PATH, with_input_ids, "without input_ids"),
+        (CHAT_PATH, without_answers, "earlier answers"),
+        ("/v1/completions", completion, "renders only chats"),
+        ("/generate", generate, "renders only chats"),
+    ] {
+        let (FrankyPair { ricky, sandy, ctx }, _kimi) = pair_with_kimi_sandy().await;
+
+        let (status, error) = post(Arc::new(ctx), path, &body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(error.contains(names), "{error}");
+        assert!(ricky.captured.lock().unwrap().last_body.is_none());
+        assert!(sandy.captured.lock().unwrap().last_body.is_none());
     }
 }

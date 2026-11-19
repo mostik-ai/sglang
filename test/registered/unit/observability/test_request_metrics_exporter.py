@@ -15,6 +15,7 @@ import shutil
 import tempfile
 import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -58,6 +59,7 @@ FileRequestMetricsExporter = None
 RequestMetricsExporter = None
 RequestMetricsExporterManager = None
 create_request_metrics_exporters = None
+client_request_id = None
 _ConcreteExporter = None
 
 
@@ -65,7 +67,7 @@ def setUpModule():
     global _patcher
     global FileRequestMetricsExporter, RequestMetricsExporter
     global RequestMetricsExporterManager, create_request_metrics_exporters
-    global _ConcreteExporter
+    global client_request_id, _ConcreteExporter
 
     stub_modules = {}
     for name in (
@@ -96,6 +98,7 @@ def setUpModule():
     RequestMetricsExporter = _mod.RequestMetricsExporter
     RequestMetricsExporterManager = _mod.RequestMetricsExporterManager
     create_request_metrics_exporters = _mod.create_request_metrics_exporters
+    client_request_id = _mod.client_request_id
 
     class ConcreteExporter(RequestMetricsExporter):
         """Minimal concrete subclass for testing base class methods."""
@@ -137,7 +140,8 @@ class TestFormatOutputData(unittest.TestCase):
 
         params = json.loads(result["request_parameters"])
         self.assertEqual(params["rid"], "req-1")
-        self.assertEqual(params["text"], "hello")
+        self.assertNotIn("text", params)
+        self.assertEqual(params["sampling_params"], {"temp": 0.5})
         self.assertIn("latency", result)
         self.assertIn("tokens", result)
 
@@ -267,7 +271,12 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         obj = _GenerateReqInput(rid="req-1", text="hello")
         out_dict = {"meta_info": {"latency": 1.5}}
 
-        asyncio.run(exporter.write_record(obj, out_dict))
+        async def write_and_flush():
+            await exporter.write_record(obj, out_dict)
+            self.assertEqual(os.listdir(self.tmp_dir), [], "records wait for a flush")
+            await exporter.flush()
+
+        asyncio.run(write_and_flush())
 
         # Find the written file
         files = os.listdir(self.tmp_dir)
@@ -291,10 +300,14 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         exporter = self._make_exporter()
         obj = _GenerateReqInput(rid="req-1")
 
+        async def write_and_flush():
+            await exporter.write_record(obj, {})
+            await exporter.flush()
+
         with patch.object(
             exporter, "_ensure_file_handler", side_effect=RuntimeError("boom")
         ):
-            asyncio.run(exporter.write_record(obj, {}))
+            asyncio.run(write_and_flush())
         # Should not raise
 
 
@@ -315,6 +328,30 @@ class TestCreateExporters(unittest.TestCase):
         exporters = create_request_metrics_exporters(server_args)
         self.assertEqual(len(exporters), 1)
         self.assertIsInstance(exporters[0], FileRequestMetricsExporter)
+
+
+class TestClientRequestId(unittest.TestCase):
+    def test_reads_the_header_a_router_passes_on(self):
+        request = SimpleNamespace(headers={"x-request-id": "client-7"})
+        self.assertEqual(client_request_id(request), "client-7")
+
+    def test_an_internal_request_has_none(self):
+        self.assertIsNone(client_request_id(None))
+        self.assertIsNone(client_request_id(SimpleNamespace(headers={})))
+
+
+class TestPromptLeftOut(unittest.TestCase):
+    def test_token_ids_stay_out_of_every_record(self):
+        server_args = _make_server_args("/tmp/unused")
+        exporter = _ConcreteExporter(
+            server_args, obj_skip_names=None, out_skip_names=None
+        )
+        obj = _EmbeddingReqInput(rid="req-1", input_ids=list(range(8192)))
+        result = exporter._format_output_data(obj, {"meta_info": {"stage_times": {}}})
+
+        params = json.loads(result["request_parameters"])
+        self.assertNotIn("input_ids", params)
+        self.assertEqual(result["stage_times"], {})
 
 
 if __name__ == "__main__":

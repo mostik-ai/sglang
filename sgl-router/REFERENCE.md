@@ -487,25 +487,33 @@ recomputes those tokens with the taps their decode read.
 - `/generate` and `/v1/completions` clients, and chat clients that send
   `input_ids` (Miles' session server), send their own spans; the router passes
   them on unchanged, also in the `/generate` body it lowers a request to.
-- For a chat that sends only messages, `--franky-chat-adapter qwen3.5` names
-  the served model's chat template. The router renders the chat as usual, the
-  adapter finds the earlier answers in the rendered ids, and both engines get
-  those ids with the spans: in the `/generate` body when the router lowers the
-  chat, otherwise in the chat body. A Qwen3.5 answer starts after
-  `<|im_start|>assistant\n` and then `<think>\n\n</think>\n\n` or `<think>\n`
-  when one follows, and ends with its `<|im_end|>`.
+- For a chat that sends only messages, `--franky-chat-adapter` names the
+  served model's chat template (`qwen3.5`, `deepseek-v4`, `kimi-k3`). The router
+  renders the chat as usual, the adapter finds the earlier answers in the
+  rendered ids, and both engines get those ids with the spans: in the
+  `/generate` body when the router lowers the chat, otherwise in the chat body.
+  An answer starts after its header and the opening a generation prompt ends
+  with, and ends with its closing token, included:
+
+  | Template | Header | Openings | Closing |
+  | --- | --- | --- | --- |
+  | `qwen3.5` | `<\|im_start\|>assistant\n` | `<think>\n\n</think>\n\n`, `<think>\n` | `<\|im_end\|>` |
+  | `deepseek-v4` | `<｜Assistant｜>` | `<think>`, `</think>` | `<｜end▁of▁sentence｜>` |
+  | `kimi-k3` | `<\|open\|>message role="assistant"<\|sep\|>` | `<\|open\|>think<\|sep\|>`, `<\|open\|>response<\|sep\|>` | `<\|end_of_msg\|>` |
+
 - A Franky chat gets `400` for `franky_generated_spans` without `input_ids`,
   and for assistant messages without `--franky-chat-adapter` or in a chat the
   router leaves to the engine to render (see [Chat rendering](#chat-rendering)).
 
 ### Sandy's own view
 
-A Franky `/generate` request may give Sandy her own view of the prompt as
-`franky_sandy_input_ids`: token ids, as many as its `input_ids`. Sandy's leg
-reads them in place of Ricky's prompt, and in a chain every block gives her
-that view and the tokens Ricky generated so far, as it gives Ricky his. The
-views must be one length so that every tap keeps its position: a part only
-Sandy may read is replaced one for one by filler in Ricky's view.
+A Franky `/generate` request to a pair whose Sandy reads Ricky's tokens may
+give Sandy her own view of the prompt as `franky_sandy_input_ids`: token ids,
+as many as its `input_ids`. Sandy's leg reads them in place of Ricky's prompt,
+and in a chain every block gives her that view and the tokens Ricky generated
+so far, as it gives Ricky his. The views must be one length so that every tap
+keeps its position: a part only Sandy may read is replaced one for one by
+filler in Ricky's view.
 
 - The router answers `400` for a view of another length, a prompt sent as
   `text`, or a view that is not one prompt's token ids.
@@ -514,6 +522,31 @@ Sandy may read is replaced one for one by filler in Ricky's view.
   client sent, because Ricky's cached KV holds what his readers added from
   her taps: requests with one Ricky prompt under different views share no
   cache, and requests under one view still share it.
+
+### A Sandy with its own tokenizer
+
+When Sandy is another model family than Ricky (Kimi K3 for DeepSeek V4.1), its
+engines run with `"shared_tokenizer": false` in the Franky config, and the
+router gets `--franky-sandy-tokenizer-path` (Sandy's model files) and
+`--franky-sandy-chat-adapter`, with `--franky-chat-adapter` for Ricky.
+
+- The router renders each Franky chat twice, with each model's template and
+  tokenizer, and finds the earlier answers in both renderings.
+- Sandy gets its own ids as `input_ids`, without the fields below.
+- Ricky gets its own ids, `franky_sandy_input_ids` (Sandy's ids, which key
+  Ricky's cached taps), and for the earlier answers `franky_generated_spans` and `franky_sandy_spans`, the same
+  answers' runs in Sandy's ids, one to one. A Ricky token of an answer reads
+  Sandy's taps before that answer's run.
+- `--franky-sandy-keep-every K` (default 1) shortens Sandy's ids: they keep the
+  earlier answers whole and, outside them, only every Kth token of Sandy's
+  rendering, counted from its start, so a chat's earlier turns keep the same
+  tokens in Sandy's cache. Ricky's `franky_sandy_input_ids` and
+  `franky_sandy_spans` hold the kept tokens.
+- A chat gets `400` when it sends `input_ids`, when the router leaves it to the
+  engine or Sandy's template does not render it, and when the two renderings
+  hold different numbers of answers. `/v1/completions` and `/generate` get
+  `400`: the router renders only chats for Sandy. `--franky-block-size` is
+  refused with these flags, since blocks count Ricky's tokens.
 
 ## Chat rendering
 

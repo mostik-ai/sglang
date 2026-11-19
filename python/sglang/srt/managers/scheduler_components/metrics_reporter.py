@@ -72,6 +72,9 @@ CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
 # be re-exported indefinitely. 30s is far above any healthy decode-stats gap,
 # so past it the true recent decode throughput is ~0.
 GEN_THROUGHPUT_STALENESS_SECONDS = 30.0
+# While requests wait without a batch, publish queues and pools this often, so
+# a scrape sees their true values at a small cost.
+STALL_METRICS_INTERVAL_S = 0.25
 # Update scheduler time counters every 1 second.
 _SCHEDULER_TIME_ACCOUNTING_INTERVAL_NS = 1_000_000_000
 
@@ -1497,7 +1500,22 @@ class SchedulerMetricsReporter:
             and time.perf_counter() <= self.metrics_collector.last_log_time + 30
         ):
             return
+        self._log_snapshot_stats()
 
+    def maybe_log_stall_metrics(self):
+        """Publish the queue and pool gauges while requests wait but no batch
+        runs (PD bootstrap and transfers, Franky taps and sends): otherwise only a
+        batch report or full idleness publishes them, and they hold old values."""
+        if not self.current_scheduler_metrics_enabled:
+            return
+        if (
+            time.perf_counter()
+            < self.metrics_collector.last_log_time + STALL_METRICS_INTERVAL_S
+        ):
+            return
+        self._log_snapshot_stats()
+
+    def _log_snapshot_stats(self):
         self.scheduler.pool_stats_observer.get_pool_stats().update_scheduler_stats(
             self.stats
         )

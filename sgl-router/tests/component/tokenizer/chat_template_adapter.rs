@@ -6,15 +6,16 @@ use sgl_router::config::ChatTemplateAdapterKind;
 use sgl_router::tokenizer::adapter;
 use sgl_router::tokenizer::chat_formatter::ChatFormatter;
 use sgl_router::tokenizer::chat_template_adapter::{self, ChatTemplateAdapter};
-use std::path::Path;
 use std::slice;
 use std::sync::Arc;
 
+use super::kimi_k3_fixture;
+
 struct TemplateSamples {
     kind: ChatTemplateAdapterKind,
-    model_id: &'static str,
-    tokenizer_dir_variable: &'static str,
     answer_end: &'static str,
+    /// Follows an answer without tool calls; one with them is followed by its
+    /// tool results, which templates require.
     turn_after_answer: Value,
     chats: Vec<Value>,
 }
@@ -27,13 +28,11 @@ struct SampleRenderer {
 }
 
 impl SampleRenderer {
-    fn load(samples: &TemplateSamples, tokenizer_dir: &Path) -> Self {
-        let tokenizer_path = tokenizer_dir.join("tokenizer.json");
-        let tokenizer_path = tokenizer_path.to_str().unwrap();
-        let tokenizer = adapter::load(tokenizer_path).unwrap();
-        let formatter = ChatFormatter::load(samples.model_id, tokenizer_path)
-            .unwrap()
-            .expect("the model ships a chat template");
+    fn new(
+        samples: &TemplateSamples,
+        formatter: ChatFormatter,
+        tokenizer: Arc<dynamo_tokenizers::Tokenizer>,
+    ) -> Self {
         let chat_adapter = chat_template_adapter::build(samples.kind, &tokenizer).unwrap();
         let answer_end = match adapter::encode(&tokenizer, samples.answer_end)
             .unwrap()
@@ -57,8 +56,8 @@ impl SampleRenderer {
     }
 }
 
-fn qwen35() -> TemplateSamples {
-    let weather_tool = json!({"type": "function", "function": {
+fn weather_tool() -> Value {
+    json!({"type": "function", "function": {
         "name": "get_weather",
         "description": "The current weather of a city",
         "parameters": {
@@ -66,17 +65,19 @@ fn qwen35() -> TemplateSamples {
             "properties": {"city": {"type": "string"}},
             "required": ["city"],
         },
-    }});
-    let weather_call = |city: &str| {
-        json!([{"id": "call_1", "type": "function", "function": {
-            "name": "get_weather",
-            "arguments": {"city": city},
-        }}])
-    };
+    }})
+}
+
+fn weather_call(city: &str) -> Value {
+    json!([{"id": "call_1", "type": "function", "function": {
+        "name": "get_weather",
+        "arguments": {"city": city},
+    }}])
+}
+
+fn qwen35() -> TemplateSamples {
     TemplateSamples {
         kind: ChatTemplateAdapterKind::Qwen35,
-        model_id: "Qwen/Qwen3.5-35B-A3B",
-        tokenizer_dir_variable: "QWEN35_TOKENIZER_DIR",
         answer_end: "<|im_end|>",
         // chat_template.jinja keeps an answer's reasoning before a tool turn, not a user turn.
         turn_after_answer: json!({"role": "tool", "content": "ok"}),
@@ -91,7 +92,7 @@ fn qwen35() -> TemplateSamples {
                 {"role": "user", "content": "Name a prime number."},
                 {"role": "assistant", "content": "7"},
             ]}),
-            json!({"tools": [weather_tool], "messages": [
+            json!({"tools": [weather_tool()], "messages": [
                 {"role": "user", "content": "What is the weather in Paris?"},
                 {"role": "assistant", "reasoning_content": "I need the weather tool.",
                  "content": "", "tool_calls": weather_call("Paris")},
@@ -108,7 +109,7 @@ fn qwen35() -> TemplateSamples {
                 {"role": "user", "content": "Now backwards."},
                 {"role": "assistant", "reasoning_content": "Reverse it.", "content": "3, 2, 1."},
             ]}),
-            json!({"chat_template_kwargs": {"enable_thinking": false}, "tools": [weather_tool],
+            json!({"chat_template_kwargs": {"enable_thinking": false}, "tools": [weather_tool()],
                    "messages": [
                 {"role": "user", "content": "Weather in Oslo?"},
                 {"role": "assistant", "content": "Let me check.",
@@ -122,46 +123,147 @@ fn qwen35() -> TemplateSamples {
     }
 }
 
-#[test]
-fn every_answer_of_the_sample_chats_is_the_span_the_model_wrote() {
-    for samples in [qwen35()] {
-        let Ok(tokenizer_dir) = std::env::var(samples.tokenizer_dir_variable) else {
-            eprintln!(
-                "skip {:?}: set {} to the model's tokenizer directory",
-                samples.kind, samples.tokenizer_dir_variable
+/// DeepSeek V4.1 keeps an answer's reasoning only when the chat has tools, so
+/// chats with reasoning carry tools and the others turn thinking off.
+fn deepseek_v41() -> TemplateSamples {
+    TemplateSamples {
+        kind: ChatTemplateAdapterKind::DeepseekV4,
+        answer_end: "<｜end▁of▁sentence｜>",
+        turn_after_answer: json!({"role": "user", "content": "ok"}),
+        chats: vec![
+            json!({"chat_template_kwargs": {"thinking": false}, "messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "user", "content": "Name a prime number."},
+                {"role": "assistant", "content": "7"},
+                {"role": "user", "content": "Another one."},
+                {"role": "assistant", "content": "11"},
+            ]}),
+            json!({"chat_template_kwargs": {"thinking": true}, "tools": [weather_tool()],
+                   "messages": [
+                {"role": "user", "content": "What is the weather in Paris?"},
+                {"role": "assistant", "reasoning_content": "I need the weather tool.",
+                 "content": "", "tool_calls": weather_call("Paris")},
+                {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 21 C"},
+                {"role": "assistant", "reasoning_content": "The tool says it is sunny.",
+                 "content": "It is sunny and 21 C in Paris."},
+            ]}),
+            json!({"chat_template_kwargs": {"thinking": false}, "tools": [weather_tool()],
+                   "messages": [
+                {"role": "user", "content": "Weather in Oslo?"},
+                {"role": "assistant", "content": "Let me check.",
+                 "tool_calls": weather_call("Oslo")},
+                {"role": "tool", "tool_call_id": "call_1", "content": "Snow, -3 C"},
+                {"role": "assistant", "content": "It is snowing and -3 C in Oslo."},
+            ]}),
+        ],
+    }
+}
+
+fn kimi_k3() -> TemplateSamples {
+    TemplateSamples {
+        kind: ChatTemplateAdapterKind::KimiK3,
+        answer_end: "<|end_of_msg|>",
+        // The template takes a tool message only after an answer that called a tool.
+        turn_after_answer: json!({"role": "user", "content": "ok"}),
+        chats: vec![
+            json!({"messages": [
+                {"role": "user", "content": "What is 17 * 23?"},
+                {"role": "assistant", "reasoning_content": "17 * 20 + 17 * 3 = 340 + 51.",
+                 "content": "17 * 23 = 391."},
+            ]}),
+            json!({"chat_template_kwargs": {"thinking": false}, "messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "user", "content": "Name a prime number."},
+                {"role": "assistant", "content": "7"},
+                {"role": "user", "content": "Another one."},
+                {"role": "assistant", "content": "11"},
+            ]}),
+            json!({"tools": [weather_tool()], "messages": [
+                {"role": "user", "content": "What is the weather in Paris?"},
+                {"role": "assistant", "reasoning_content": "I need the weather tool.",
+                 "content": "", "tool_calls": weather_call("Paris")},
+                {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 21 C"},
+                {"role": "assistant", "reasoning_content": "The tool says it is sunny.",
+                 "content": "It is sunny and 21 C in Paris."},
+            ]}),
+        ],
+    }
+}
+
+/// Each answer of each sample chat, rendered after the prompt that asked for
+/// it, is the last span the adapter finds.
+fn assert_every_answer_is_the_span_the_model_wrote(
+    samples: &TemplateSamples,
+    renderer: &SampleRenderer,
+) {
+    for chat in &samples.chats {
+        let messages = chat["messages"].as_array().unwrap();
+        let answer_indices = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message["role"] == "assistant")
+            .map(|(index, _)| index);
+        for (answer_count, index) in (1..).zip(answer_indices) {
+            let prompt = renderer.render(chat, &messages[..index]);
+            let turn_after = match messages[index].get("tool_calls") {
+                Some(_) => &messages[index + 1],
+                None => &samples.turn_after_answer,
+            };
+            let through_answer = [&messages[..=index], slice::from_ref(turn_after)];
+            let rendered = renderer.render(chat, &through_answer.concat());
+            assert!(
+                rendered.starts_with(&prompt),
+                "{chat}, answer {answer_count}"
             );
-            continue;
-        };
-        let renderer = SampleRenderer::load(&samples, Path::new(&tokenizer_dir));
-        for chat in &samples.chats {
-            let messages = chat["messages"].as_array().unwrap();
-            let answer_indices = messages
+            let answer_length = rendered[prompt.len()..]
                 .iter()
-                .enumerate()
-                .filter(|(_, message)| message["role"] == "assistant")
-                .map(|(index, _)| index);
-            for (answer_count, index) in (1..).zip(answer_indices) {
-                let prompt = renderer.render(chat, &messages[..index]);
-                let through_answer = [
-                    &messages[..=index],
-                    slice::from_ref(&samples.turn_after_answer),
-                ];
-                let rendered = renderer.render(chat, &through_answer.concat());
-                assert!(
-                    rendered.starts_with(&prompt),
-                    "{chat}, answer {answer_count}"
-                );
-                let answer_length = rendered[prompt.len()..]
-                    .iter()
-                    .position(|&id| id == renderer.answer_end)
-                    .unwrap();
-                let span = prompt.len()..prompt.len() + answer_length + 1;
+                .position(|&id| id == renderer.answer_end)
+                .unwrap();
+            let span = prompt.len()..prompt.len() + answer_length + 1;
 
-                let spans = renderer.adapter.generated_spans(&rendered);
+            let spans = renderer.adapter.generated_spans(&rendered);
 
-                assert_eq!(spans.len(), answer_count, "{chat}");
-                assert_eq!(spans.last(), Some(&span), "{chat}, answer {answer_count}");
-            }
+            assert_eq!(spans.len(), answer_count, "{chat}");
+            assert_eq!(spans.last(), Some(&span), "{chat}, answer {answer_count}");
         }
     }
+}
+
+#[test]
+fn every_qwen35_answer_is_the_span_the_model_wrote() {
+    let Ok(tokenizer_dir) = std::env::var("QWEN35_TOKENIZER_DIR") else {
+        eprintln!("skip: set QWEN35_TOKENIZER_DIR to the model's tokenizer directory");
+        return;
+    };
+    let tokenizer_path = format!("{tokenizer_dir}/tokenizer.json");
+    let samples = qwen35();
+    let formatter = ChatFormatter::load("Qwen/Qwen3.5-35B-A3B", &tokenizer_path)
+        .unwrap()
+        .expect("the model ships a chat template");
+    let renderer =
+        SampleRenderer::new(&samples, formatter, adapter::load(&tokenizer_path).unwrap());
+
+    assert_every_answer_is_the_span_the_model_wrote(&samples, &renderer);
+}
+
+#[test]
+fn every_kimi_k3_answer_is_the_span_the_model_wrote() {
+    let fixture = kimi_k3_fixture::tokenizer();
+    let path = fixture.path().join("tiktoken.model");
+    let path = path.to_str().unwrap();
+    let samples = kimi_k3();
+    let formatter = ChatFormatter::load("served-alias", path).unwrap().unwrap();
+    let renderer = SampleRenderer::new(&samples, formatter, adapter::load(path).unwrap());
+
+    assert_every_answer_is_the_span_the_model_wrote(&samples, &renderer);
+}
+
+#[test]
+fn every_deepseek_v41_answer_is_the_span_the_model_wrote() {
+    let path = "tests/fixtures/tiny_deepseek_v4/tokenizer.json";
+    let samples = deepseek_v41();
+    let formatter = ChatFormatter::load("served-alias", path).unwrap().unwrap();
+    let renderer = SampleRenderer::new(&samples, formatter, adapter::load(path).unwrap());
+
+    assert_every_answer_is_the_span_the_model_wrote(&samples, &renderer);
 }

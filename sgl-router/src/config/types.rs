@@ -1,7 +1,7 @@
 use crate::config::sampling::SamplingOverrides;
 use reqwest::header::HeaderValue;
 use serde::Deserialize;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 /// Single-model configuration built and validated by [`crate::config::Cli::into_config`].
 #[derive(Debug, Clone)]
@@ -16,7 +16,7 @@ pub struct Config {
 }
 
 /// Outbound request timeout and retry settings.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ProxyConfig {
     /// Timeout for upstream response headers, and for a non-streaming body.
     /// SGLang's chat endpoint sends streaming headers with the first token.
@@ -49,6 +49,23 @@ pub struct ProxyConfig {
     /// the Ricky engine that answers it, for engines whose taps cannot cross
     /// hosts. With no Sandy there, the request gets `no_sandy_workers_available`.
     pub franky_same_host_sandy: bool,
+    /// Franky with a Sandy that tokenizes on its own; `None` when Sandy reads
+    /// the served model's tokens.
+    pub franky_sandy: Option<FrankySandyConfig>,
+}
+
+/// A Franky Sandy that tokenizes on its own. The router renders each Franky
+/// chat for it too, sends it its own `input_ids`, and gives Ricky its input
+/// length and the runs of the earlier answers in its tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrankySandyConfig {
+    /// Sandy's model files or HuggingFace repo id: its tokenizer and chat template.
+    pub tokenizer_path: String,
+    /// Sandy's chat template, whose earlier answers the router marks.
+    pub chat_adapter: ChatTemplateAdapterKind,
+    /// Sandy reads its earlier answers whole and, outside them, every
+    /// `keep_every`-th token of its rendering; 1 reads every token.
+    pub keep_every: NonZeroUsize,
 }
 
 impl ProxyConfig {
@@ -86,6 +103,7 @@ impl Default for ProxyConfig {
             franky_boundary_token_id: None,
             franky_chat_adapter: None,
             franky_same_host_sandy: false,
+            franky_sandy: None,
         }
     }
 }
@@ -133,6 +151,11 @@ pub enum TokenizerBackend {
 pub enum ChatTemplateAdapterKind {
     #[value(name = "qwen3.5")]
     Qwen35,
+    /// DeepSeek V4 and V4.1.
+    #[value(name = "deepseek-v4")]
+    DeepseekV4,
+    #[value(name = "kimi-k3")]
+    KimiK3,
 }
 
 /// Router tokenizer encode settings.
