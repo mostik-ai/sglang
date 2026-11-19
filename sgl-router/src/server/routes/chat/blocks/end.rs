@@ -46,10 +46,16 @@ impl ChainEnd {
     pub(super) fn ended_with_last_block(&mut self) {
         self.must_end = false;
     }
-}
 
-impl Drop for ChainEnd {
-    fn drop(&mut self) {
+    /// Ends the chain on the engines it reached now, and goes on as `chain_id`
+    /// on the same engines.
+    pub(super) fn restart(&mut self, chain_id: String) {
+        self.end_on_engines();
+        self.chain_id = chain_id;
+        self.must_end = true;
+    }
+
+    fn end_on_engines(&self) {
         if !self.must_end || self.engine_urls.is_empty() {
             return;
         }
@@ -60,7 +66,7 @@ impl Drop for ChainEnd {
             );
             return;
         };
-        for url in self.engine_urls.drain(..) {
+        for url in &self.engine_urls {
             let mut request = self
                 .client
                 .post(format!("{}{END_CHAIN_PATH}", url.trim_end_matches('/')))
@@ -69,11 +75,18 @@ impl Drop for ChainEnd {
             if let Some(authorization) = &self.authorization {
                 request = request.header(AUTHORIZATION, authorization);
             }
+            let url = url.clone();
             runtime.spawn(async move {
                 if let Err(error) = request.send().await.and_then(|r| r.error_for_status()) {
                     tracing::warn!(%url, %error, "ending a Franky chain on an engine failed");
                 }
             });
         }
+    }
+}
+
+impl Drop for ChainEnd {
+    fn drop(&mut self) {
+        self.end_on_engines();
     }
 }
