@@ -121,6 +121,18 @@ impl FrankyPair {
     }
 }
 
+/// What a Sandy leg gets of a Ricky body: everything but Ricky's own fields,
+/// marked as a leg that writes nothing.
+fn sandy_leg_of(ricky_body: &Value) -> Value {
+    let mut sandy_body = ricky_body.clone();
+    let fields = sandy_body.as_object_mut().unwrap();
+    for ricky_field in ["franky_tap_runs", "franky_sandy_input_ids"] {
+        fields.remove(ricky_field);
+    }
+    fields.insert("franky_taps_only".into(), json!(true));
+    sandy_body
+}
+
 async fn post(ctx: Arc<AppContext>, path: &str, body: &Value) -> (StatusCode, String) {
     let request = Request::post(path)
         .header("content-type", "application/json")
@@ -135,7 +147,7 @@ async fn post(ctx: Arc<AppContext>, path: &str, body: &Value) -> (StatusCode, St
 }
 
 #[tokio::test]
-async fn a_franky_chat_carries_its_rendered_ids_and_the_spans_of_its_answers() {
+async fn a_franky_chat_carries_its_rendered_ids_and_the_tap_runs_of_its_answers() {
     let FrankyPair {
         ricky,
         sandy,
@@ -157,20 +169,25 @@ async fn a_franky_chat_carries_its_rendered_ids_and_the_spans_of_its_answers() {
     assert_eq!(status, StatusCode::OK);
     let ricky_body = ricky.captured_json().await;
     let rendered_ids = [before.clone(), answer.clone(), after].concat();
+    let input_len = rendered_ids.len();
     assert_eq!(ricky_body["input_ids"], json!(rendered_ids));
     assert_eq!(
-        ricky_body["franky_generated_spans"],
-        json!([[before.len(), before.len() + answer.len()]])
+        ricky_body["franky_tap_runs"],
+        json!([
+            [before.len(), before.len()],
+            [before.len() + answer.len(), 0],
+            [input_len, input_len]
+        ])
     );
     assert_eq!(
         ricky_body["messages"],
         chat_with_an_answer(QWEN)["messages"]
     );
-    assert_eq!(sandy.captured_json().await, ricky_body);
+    assert_eq!(sandy.captured_json().await, sandy_leg_of(&ricky_body));
 }
 
 #[tokio::test]
-async fn a_lowered_franky_chat_carries_the_spans_in_its_generate_body() {
+async fn a_lowered_franky_chat_carries_the_tap_runs_in_its_generate_body() {
     let FrankyPair {
         ricky,
         sandy,
@@ -184,15 +201,18 @@ async fn a_lowered_franky_chat_carries_the_spans_in_its_generate_body() {
     let ricky_body = ricky.captured_json().await;
     let prompt_length = ricky_body["input_ids"].as_array().unwrap().len();
     assert_eq!(
-        ricky_body["franky_generated_spans"],
-        json!([[prompt_length - 1, prompt_length]])
+        ricky_body["franky_tap_runs"],
+        json!([
+            [prompt_length - 1, prompt_length - 1],
+            [prompt_length, prompt_length]
+        ])
     );
     assert!(ricky_body.get("messages").is_none(), "{ricky_body}");
-    assert_eq!(sandy.captured_json().await, ricky_body);
+    assert_eq!(sandy.captured_json().await, sandy_leg_of(&ricky_body));
 }
 
 #[tokio::test]
-async fn a_franky_chat_without_earlier_answers_carries_no_spans() {
+async fn a_franky_chat_without_earlier_answers_carries_no_tap_runs() {
     let FrankyPair {
         ricky,
         sandy: _sandy,
@@ -206,14 +226,11 @@ async fn a_franky_chat_without_earlier_answers_carries_no_spans() {
     assert_eq!(status, StatusCode::OK);
     let ricky_body = ricky.captured_json().await;
     assert!(ricky_body["input_ids"].is_array(), "{ricky_body}");
-    assert!(
-        ricky_body.get("franky_generated_spans").is_none(),
-        "{ricky_body}"
-    );
+    assert!(ricky_body.get("franky_tap_runs").is_none(), "{ricky_body}");
 }
 
 #[tokio::test]
-async fn the_spans_a_chat_sends_with_its_input_ids_pass_through() {
+async fn the_spans_a_chat_sends_with_its_input_ids_become_tap_runs() {
     let FrankyPair {
         ricky,
         sandy,
@@ -230,14 +247,15 @@ async fn the_spans_a_chat_sends_with_its_input_ids_pass_through() {
     let ricky_body = ricky.captured_json().await;
     assert_eq!(ricky_body["input_ids"], chat["input_ids"]);
     assert_eq!(
-        ricky_body["franky_generated_spans"],
-        chat["franky_generated_spans"]
+        ricky_body["franky_tap_runs"],
+        json!([[2, 2], [4, 0], [6, 6]])
     );
-    assert_eq!(sandy.captured_json().await, ricky_body);
+    assert!(ricky_body.get("franky_generated_spans").is_none());
+    assert_eq!(sandy.captured_json().await, sandy_leg_of(&ricky_body));
 }
 
 #[tokio::test]
-async fn the_spans_a_generate_request_sends_pass_through() {
+async fn the_spans_a_generate_request_sends_become_tap_runs() {
     let FrankyPair { ricky, sandy, ctx } =
         FrankyPair::start(config(QWEN, TINY_QWEN_TOKENIZER)).await;
     let generate = json!({"input_ids": [1, 2, 3, 4, 5, 6], "franky_generated_spans": [[2, 4]]});
@@ -248,14 +266,14 @@ async fn the_spans_a_generate_request_sends_pass_through() {
     let ricky_body = ricky.captured_json().await;
     assert_eq!(ricky_body["input_ids"], generate["input_ids"]);
     assert_eq!(
-        ricky_body["franky_generated_spans"],
-        generate["franky_generated_spans"]
+        ricky_body["franky_tap_runs"],
+        json!([[2, 2], [4, 0], [6, 6]])
     );
-    assert_eq!(sandy.captured_json().await, ricky_body);
+    assert_eq!(sandy.captured_json().await, sandy_leg_of(&ricky_body));
 }
 
 #[tokio::test]
-async fn the_spans_a_completion_sends_reach_its_generate_body() {
+async fn the_spans_a_completion_sends_reach_its_generate_body_as_tap_runs() {
     let FrankyPair { ricky, sandy, ctx } =
         FrankyPair::start(config(QWEN, TINY_QWEN_TOKENIZER)).await;
     let completion = json!({
@@ -271,11 +289,11 @@ async fn the_spans_a_completion_sends_reach_its_generate_body() {
     let ricky_body = ricky.captured_json().await;
     assert_eq!(ricky_body["input_ids"], completion["prompt"]);
     assert_eq!(
-        ricky_body["franky_generated_spans"],
-        completion["franky_generated_spans"]
+        ricky_body["franky_tap_runs"],
+        json!([[2, 2], [4, 0], [6, 6]])
     );
     assert!(ricky_body["sampling_params"].is_object(), "{ricky_body}");
-    assert_eq!(sandy.captured_json().await, ricky_body);
+    assert_eq!(sandy.captured_json().await, sandy_leg_of(&ricky_body));
 }
 
 #[tokio::test]
@@ -349,7 +367,7 @@ async fn pair_with_kimi_sandy() -> (FrankyPair, tempfile::TempDir) {
 }
 
 #[tokio::test]
-async fn a_sandy_with_its_own_tokenizer_reads_its_rendering_and_ricky_its_spans() {
+async fn a_sandy_with_its_own_tokenizer_reads_its_rendering_and_ricky_runs_in_it() {
     let (FrankyPair { ricky, sandy, ctx }, _kimi) = pair_with_kimi_sandy().await;
 
     let (status, _) = post(Arc::new(ctx), CHAT_PATH, &chat_with_an_answer(DEEPSEEK_V4)).await;
@@ -361,28 +379,19 @@ async fn a_sandy_with_its_own_tokenizer_reads_its_rendering_and_ricky_its_spans(
     let sandy_ids = sandy_body["input_ids"].as_array().unwrap();
     assert_ne!(sandy_ids, ricky_ids);
     assert_eq!(ricky_body["franky_sandy_input_ids"], json!(sandy_ids));
-    assert_eq!(
-        ricky_body["franky_generated_spans"],
-        json!([[ricky_ids.len() - 1, ricky_ids.len()]])
-    );
-    let [sandy_span] = ricky_body["franky_sandy_spans"]
-        .as_array()
-        .unwrap()
-        .as_slice()
-    else {
+    let [answer, after] = ricky_body["franky_tap_runs"].as_array().unwrap().as_slice() else {
         panic!("{ricky_body}");
     };
+    assert_eq!(answer[0], json!(ricky_ids.len() - 1), "{ricky_body}");
     assert!(
-        sandy_span[1].as_u64().unwrap() < sandy_ids.len() as u64,
+        answer[1].as_u64().unwrap() < sandy_ids.len() as u64,
         "{ricky_body}"
     );
-    for ricky_field in [
-        "franky_generated_spans",
-        "franky_sandy_spans",
-        "franky_sandy_input_ids",
-    ] {
+    assert_eq!(after, &json!([ricky_ids.len(), sandy_ids.len()]));
+    for ricky_field in ["franky_tap_runs", "franky_sandy_input_ids"] {
         assert!(sandy_body.get(ricky_field).is_none(), "{sandy_body}");
     }
+    assert_eq!(sandy_body["franky_taps_only"], json!(true));
     assert_eq!(sandy_body["franky_room"], ricky_body["franky_room"]);
 }
 

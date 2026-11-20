@@ -16,9 +16,9 @@ use crate::config::{
     default_stale_request_timeout_secs, resolve_mode, AffinityConfig, AffinityMode, BalancedBy,
     CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, ChatTemplateAdapterKind,
     CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, DpRankPolicy,
-    EligibilityConfig, FilterKind, FrankySandyConfig, FusedTerm, InflightLoadConfig,
-    K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    EligibilityConfig, FilterKind, FrankyChainConfig, FrankySandyConfig, FusedTerm,
+    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
     DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
@@ -173,13 +173,16 @@ pub struct ServerArgs {
     /// PD: return decode's stream only once prefill completes, as sgl-model-gateway does.
     #[arg(long)]
     pub pd_stream_after_prefill: bool,
-    /// Franky: run each request as blocks of at most N generated tokens on one
-    /// Sandy and one Ricky. Every block sends the prompt and all tokens generated
-    /// so far, so a block's tokens read their own taps in the next block. Needs
-    /// token ids (`input_ids`, or text the router tokenizes) and a single
-    /// sequence; unset runs each request in one block.
-    #[arg(long)]
-    pub franky_block_size: Option<NonZeroU32>,
+    /// Franky: JSON of how requests to Franky workers run, e.g.
+    /// '{"sandy_call_tokens": 64, "taps": true, "blocks": {"block_size": 256,
+    /// "call_token_id": 151669, "decider": {"type": "call_token_or_every_blocks",
+    /// "every_blocks": 4}}}'. Each Sandy call writes sandy_call_tokens of the
+    /// answer; with taps Sandy sends the taps of what it ran and Ricky reads
+    /// them; Ricky's engine ends its blocks and decides after each whether Sandy
+    /// writes next. A chain needs token ids (`input_ids`, or text the router
+    /// tokenizes) and a single sequence. Unset: one Ricky request with taps.
+    #[arg(long, value_name = "JSON")]
+    pub franky_chain: Option<String>,
     /// Franky: the served model's chat template, so the router marks the answers
     /// Ricky generated in a chat's earlier turns (franky_generated_spans) in the
     /// chats it renders. Without it, a Franky chat with earlier assistant
@@ -677,6 +680,10 @@ impl Cli {
             })
             .transpose()?
             .unwrap_or_default();
+        let franky_chain = parse_franky_chain(
+            self.server.franky_chain.as_deref(),
+            self.server.franky_sandy_keep_every,
+        )?;
         let default_chat_template_kwargs = self
             .model
             .default_chat_template_kwargs
@@ -742,7 +749,7 @@ impl Cli {
                 max_backoff_ms: self.server.retry_max_backoff_ms,
                 decode_dispatch_limit: self.server.decode_dispatch_limit,
                 stream_after_prefill: self.server.pd_stream_after_prefill,
-                franky_block_size: self.server.franky_block_size,
+                franky_chain,
                 franky_chat_adapter: self.server.franky_chat_adapter,
                 franky_sandy: self
                     .server
@@ -1261,6 +1268,36 @@ impl AffinityArgs {
             eviction_interval_secs,
         }))
     }
+}
+
+/// `--franky-chain`, checked for what the router reads; Ricky's engine checks
+/// the blocks it forwards.
+fn parse_franky_chain(
+    raw: Option<&str>,
+    sandy_keep_every: NonZeroUsize,
+) -> Result<FrankyChainConfig> {
+    let Some(raw) = raw else {
+        return Ok(FrankyChainConfig::default());
+    };
+    let chain: FrankyChainConfig =
+        serde_json::from_str(raw).context("--franky-chain must be a chain config")?;
+    ensure!(
+        chain.taps || chain.sandy_call_tokens > 0 || chain.blocks.is_none(),
+        "--franky-chain: Ricky's blocks call a Sandy that writes nothing and sends \
+         no taps; set sandy_call_tokens or taps"
+    );
+    ensure!(
+        chain.sandy_call_tokens == 0 || sandy_keep_every.get() == 1,
+        "--franky-chain: Sandy writes from the whole chat, so its calls need \
+         --franky-sandy-keep-every 1"
+    );
+    if let Some(blocks) = &chain.blocks {
+        ensure!(
+            blocks.get("block_size").and_then(serde_json::Value::as_u64) > Some(0),
+            "--franky-chain: blocks need a positive block_size"
+        );
+    }
+    Ok(chain)
 }
 
 fn load_bucket_config<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {

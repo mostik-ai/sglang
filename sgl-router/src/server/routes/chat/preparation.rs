@@ -5,6 +5,8 @@
 //! chat completions, completions, the native `/generate` endpoint, embeddings,
 //! classify and rerank.
 
+use super::serves_franky;
+use super::tap_runs::{earlier_answer_runs, joined, wire, TapRun};
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
@@ -117,6 +119,10 @@ pub(super) struct PreparedRequest {
     pub(super) responder: Option<Responder>,
     /// The ids of a Franky Sandy that tokenizes on its own, for its leg.
     franky_sandy_ids: Option<Vec<u32>>,
+    /// Franky: the tap runs of the request's earlier answers.
+    franky_earlier_runs: Vec<TapRun>,
+    /// Franky: where a Ricky request's taps come from.
+    pub(super) tap_source: TapSource,
 }
 
 impl PreparedRequest {
@@ -236,7 +242,7 @@ impl PreparedRequest {
             .map(|scope| input_ids_forwarding(scope, parsed_body.as_ref(), tokens.as_ref()));
         let input_tokens = input_token_count(tokens.as_ref(), &body);
         let output_tokens = fields.requested_max_output_tokens();
-        Ok(Self {
+        let mut request = Self {
             path,
             model,
             streaming: fields.stream.unwrap_or(false),
@@ -260,7 +266,13 @@ impl PreparedRequest {
             sampling_defaults,
             responder: None,
             franky_sandy_ids: None,
-        })
+            franky_earlier_runs: Vec::new(),
+            tap_source: TapSource::None,
+        };
+        if fields.franky_generated_spans.is_some() && serves_franky(ctx, &request.model) {
+            request.convert_client_spans()?;
+        }
+        Ok(request)
     }
 
     /// OpenAI completions: chat's sampling contract, with prompts counted as
@@ -322,6 +334,8 @@ impl PreparedRequest {
             parsed_body: Some(value),
             sampling_defaults,
             franky_sandy_ids: None,
+            franky_earlier_runs: Vec::new(),
+            tap_source: TapSource::None,
         })
     }
 
@@ -363,6 +377,11 @@ impl PreparedRequest {
             fields.insert("input_ids".into(), input_ids);
             rewrite = true;
         }
+        let franky_earlier_runs = match serves_franky(ctx, &model) {
+            true => client_spans_to_tap_runs(&mut value)?,
+            false => Vec::new(),
+        };
+        rewrite |= !franky_earlier_runs.is_empty();
         let body = match body {
             Some(body) if !rewrite => body,
             _ => serde_json::to_vec(&value)
@@ -416,6 +435,8 @@ impl PreparedRequest {
             sampling_defaults: Vec::new(),
             responder: None,
             franky_sandy_ids: None,
+            franky_earlier_runs,
+            tap_source: TapSource::None,
         })
     }
 
@@ -538,6 +559,8 @@ impl PreparedRequest {
             cache_namespace: CacheNamespace::default(),
             sampling_defaults,
             franky_sandy_ids: None,
+            franky_earlier_runs: Vec::new(),
+            tap_source: TapSource::None,
         })
     }
 
@@ -572,6 +595,8 @@ impl PreparedRequest {
             sampling_defaults: Vec::new(),
             responder: None,
             franky_sandy_ids: None,
+            franky_earlier_runs: Vec::new(),
+            tap_source: TapSource::None,
         }
     }
 
@@ -600,8 +625,8 @@ impl PreparedRequest {
         Some(&tokens.ids)
     }
 
-    /// The ids of a Sandy that tokenizes on its own, which a chain of blocks
-    /// takes to send Sandy its own ids for every block.
+    /// The ids of a Sandy that tokenizes on its own, which a chain takes to
+    /// send Sandy its own ids for every call.
     pub(super) fn take_franky_sandy_ids(&mut self) -> Option<Vec<u32>> {
         self.franky_sandy_ids.take()
     }
@@ -611,27 +636,47 @@ impl PreparedRequest {
         self.franky_sandy_ids = Some(ids);
     }
 
-    /// Adds `spans` to the engine body as `franky_generated_spans`.
-    pub(super) fn add_franky_generated_spans(
+    fn convert_client_spans(&mut self) -> Result<(), ApiError> {
+        let mut runs = Ok(Vec::new());
+        self.edit_body(|body| runs = client_spans_to_tap_runs(body))?;
+        self.franky_earlier_runs = runs?;
+        Ok(())
+    }
+
+    /// The tap runs of the request's earlier answers, which a chain extends
+    /// with its own.
+    pub(super) fn franky_earlier_runs(&self) -> &[TapRun] {
+        &self.franky_earlier_runs
+    }
+
+    /// Marks the earlier answers at `spans` of an input of `input_len` tokens:
+    /// Ricky reads them as tap runs, and the answer after the input all taps.
+    pub(super) fn add_franky_earlier_answers(
         &mut self,
         spans: &[Range<usize>],
+        input_len: usize,
     ) -> Result<(), ApiError> {
-        self.edit_body(|body| body["franky_generated_spans"] = json!(span_pairs(spans)))
+        self.franky_earlier_runs = earlier_answer_runs(spans, None);
+        let runs = answer_runs(&self.franky_earlier_runs, input_len, input_len);
+        self.edit_body(|body| body["franky_tap_runs"] = runs)
     }
 
     /// Gives Ricky's legs Sandy's input ids, which key Ricky's taps, and the
-    /// runs of the earlier answers in Sandy's tokens, `generated_spans` being
-    /// their runs in Ricky's, and keeps Sandy's ids for its leg.
+    /// tap runs of the earlier answers at `generated_spans` of Ricky's input of
+    /// `input_len` tokens, and keeps Sandy's ids for its leg.
     pub(super) fn add_franky_sandy_chat(
         &mut self,
         generated_spans: &[Range<usize>],
+        input_len: usize,
         sandy: SandyChat,
     ) -> Result<(), ApiError> {
+        self.franky_earlier_runs =
+            earlier_answer_runs(generated_spans, Some(&sandy.generated_spans));
+        let runs = answer_runs(&self.franky_earlier_runs, input_len, sandy.input_ids.len());
         self.edit_body(|body| {
             body["franky_sandy_input_ids"] = json!(sandy.input_ids);
             if !generated_spans.is_empty() {
-                body["franky_generated_spans"] = json!(span_pairs(generated_spans));
-                body["franky_sandy_spans"] = json!(span_pairs(&sandy.generated_spans));
+                body["franky_tap_runs"] = runs;
             }
         })?;
         self.franky_sandy_ids = Some(sandy.input_ids);
@@ -651,38 +696,49 @@ impl PreparedRequest {
         Ok(())
     }
 
-    /// The engine body of a Franky request's Sandy leg. A Sandy that tokenizes
-    /// on its own gets its own ids, without the fields that count Ricky's tokens.
+    /// The engine body of a Franky request's Sandy leg, which runs the prompt
+    /// for its taps and writes nothing. A Sandy that tokenizes on its own gets
+    /// its own ids, and no Sandy gets the fields that count Ricky's tokens.
     pub(super) fn sandy_outgoing_body(
         &mut self,
-        ctx: &AppContext,
         franky_room: &FrankyRoom,
         engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
-        let Some(sandy_ids) = &self.franky_sandy_ids else {
-            return self.outgoing_body(ctx, None, Some(franky_room), engine_rid);
+        let mut body = match &self.parsed_body {
+            Some(parsed_body) => parsed_body.clone(),
+            None => serde_json::from_slice(&self.body).map_err(|_| invalid_request())?,
         };
-        let mut body: Value = serde_json::from_slice(&self.body).map_err(|_| invalid_request())?;
         let Value::Object(fields) = &mut body else {
             return Err(invalid_request());
         };
-        for ricky_field in [
-            "franky_generated_spans",
-            "franky_sandy_spans",
-            "franky_sandy_input_ids",
-        ] {
+        for ricky_field in ["franky_tap_runs", "franky_sandy_input_ids"] {
             fields.remove(ricky_field);
         }
-        fields.insert("input_ids".into(), json!(sandy_ids));
+        if let Some(Value::Object(chain)) = fields.get_mut("franky_chain") {
+            chain.remove("blocks");
+        }
+        fields.insert("franky_taps_only".into(), true.into());
+        let input_ids = match &self.franky_sandy_ids {
+            Some(sandy_ids) => Some(sandy_ids.as_slice()),
+            None => self.forwarded_input_ids(),
+        };
         build_outgoing_body(
             &self.body,
             Some(body),
-            None,
+            input_ids,
             None,
             Some(franky_room),
             &self.sampling_defaults,
             engine_rid,
         )
+    }
+
+    /// The router's ids of the prompt, when it sends them in place of the text.
+    fn forwarded_input_ids(&self) -> Option<&[u32]> {
+        self.tokens
+            .as_ref()
+            .filter(|_| self.input_ids_forwarding == Some(InputIdsForwarding::Forwarded))
+            .map(|tokens| tokens.ids.as_slice())
     }
 
     /// The engine body for one dispatch attempt; each attempt brings its own
@@ -697,16 +753,12 @@ impl PreparedRequest {
         if self.body.is_empty() {
             return Ok(self.body.clone());
         }
-        let input_ids = self
-            .tokens
-            .as_ref()
-            .filter(|_| self.input_ids_forwarding == Some(InputIdsForwarding::Forwarded))
-            .map(|tokens| tokens.ids.as_slice());
         // The first attempt consumes the cached parse; a retry re-parses `body`.
+        let parsed_body = self.parsed_body.take();
         let body = build_outgoing_body(
             &self.body,
-            self.parsed_body.take(),
-            input_ids,
+            parsed_body,
+            self.forwarded_input_ids(),
             bootstrap,
             franky_room,
             &self.sampling_defaults,
@@ -1354,14 +1406,63 @@ pub(super) struct BootstrapFields {
 
 /// Where a Franky request's taps meet: its Sandy's tap bootstrap server and a
 /// room, sent as `franky_room` to the Sandy and every Ricky leg.
+#[derive(Clone, Debug)]
 pub(super) struct FrankyRoom {
     pub(super) host: String,
     pub(super) port: Option<u16>,
     pub(super) room: u64,
 }
 
-fn span_pairs(spans: &[Range<usize>]) -> Vec<[usize; 2]> {
-    spans.iter().map(|span| [span.start, span.end]).collect()
+/// Where a Ricky request's taps come from.
+#[derive(Clone, Debug)]
+pub(super) enum TapSource {
+    /// It reads none.
+    None,
+    /// A Sandy leg beside it, in a room each dispatch opens, sends the taps of
+    /// its prompt.
+    SandyLeg,
+    /// A Sandy call already ran; its room holds the taps.
+    Room(FrankyRoom),
+}
+
+/// The tap runs of a request whose answer starts after its `input_len`
+/// tokens and reads all `num_taps` taps, after its earlier answers' runs.
+fn answer_runs(earlier: &[TapRun], input_len: usize, num_taps: usize) -> Value {
+    let answer = TapRun {
+        start: input_len,
+        taps: num_taps,
+    };
+    wire(&joined(earlier.iter().copied().chain([answer])))
+}
+
+/// Replaces a client's `franky_generated_spans`, positions of its earlier
+/// answers in `input_ids`, by the tap runs Ricky reads.
+///
+/// Returns: the earlier answers' runs, empty without spans.
+/// Errors: `ApiError::BadRequest` for spans without `input_ids`, or that are
+/// not `[start, end)` pairs.
+fn client_spans_to_tap_runs(body: &mut Value) -> Result<Vec<TapRun>, ApiError> {
+    let Some(spans) = body
+        .as_object_mut()
+        .and_then(|fields| fields.remove("franky_generated_spans"))
+        .filter(|spans| !spans.is_null())
+    else {
+        return Ok(Vec::new());
+    };
+    let spans: Vec<[usize; 2]> = serde_json::from_value(spans).map_err(|_| {
+        ApiError::BadRequest("franky_generated_spans must be [start, end) pairs".into())
+    })?;
+    let Some(input_len) = body["input_ids"].as_array().map(Vec::len) else {
+        return Err(ApiError::BadRequest(
+            "franky_generated_spans are positions in input_ids, so a request that \
+             sends them must send input_ids too"
+                .into(),
+        ));
+    };
+    let spans: Vec<Range<usize>> = spans.iter().map(|[start, end]| *start..*end).collect();
+    let earlier = earlier_answer_runs(&spans, None);
+    body["franky_tap_runs"] = answer_runs(&earlier, input_len, input_len);
+    Ok(earlier)
 }
 
 /// Append JSON-encoded `fields` before the closing brace, so they win over
@@ -2014,21 +2115,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn franky_generated_spans_reach_every_outgoing_body() {
+    /// A context whose model a Sandy serves, so its requests are Franky's.
+    fn franky_stub() -> AppContext {
         let ctx = AppContext::stub();
-        let body = Bytes::from(json!({"input_ids": [1, 2, 3, 4]}).to_string());
+        let sandy = crate::discovery::WorkerSpec {
+            id: crate::discovery::WorkerId("sandy".into()),
+            url: "http://sandy:0".into(),
+            mode: WorkerMode::Sandy,
+            model_ids: vec![ModelId("stub-model".into())],
+            bootstrap_port: Some(8996),
+            ..Default::default()
+        };
+        ctx.registry.add(sandy).unwrap();
+        ctx
+    }
+
+    #[test]
+    fn a_clients_earlier_answers_reach_every_outgoing_body_as_tap_runs() {
+        let ctx = franky_stub();
+        let body = json!({"input_ids": [1, 2, 3, 4], "franky_generated_spans": [[1, 3]]});
         let model = ModelId("stub-model".into());
-        let mut request = PreparedRequest::generate(&ctx, model, body).unwrap();
+        let mut request =
+            PreparedRequest::generate(&ctx, model, Bytes::from(body.to_string())).unwrap();
         let room = FrankyRoom {
             host: "h".into(),
             port: Some(9),
             room: 42,
         };
 
-        request
-            .add_franky_generated_spans(&[Range { start: 1, end: 3 }])
-            .unwrap();
         let first = request
             .outgoing_body(&ctx, None, Some(&room), None)
             .unwrap();
@@ -2036,15 +2150,35 @@ mod tests {
             .outgoing_body(&ctx, None, Some(&room), None)
             .unwrap();
 
+        assert_eq!(
+            request.franky_earlier_runs(),
+            [TapRun { start: 1, taps: 1 }, TapRun { start: 3, taps: 0 }]
+        );
         for body in [first, retry] {
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["input_ids"], json!([1, 2, 3, 4]));
-            assert_eq!(body["franky_generated_spans"], json!([[1, 3]]));
+            assert_eq!(body["franky_tap_runs"], json!([[1, 1], [3, 0], [4, 4]]));
+            assert!(body.get("franky_generated_spans").is_none());
         }
     }
 
     #[test]
-    fn a_sandy_with_its_own_tokens_gets_its_ids_and_ricky_the_spans_in_both() {
+    fn a_solo_engine_gets_a_clients_spans_as_sent() {
+        let ctx = AppContext::stub();
+        let body = json!({"input_ids": [1, 2, 3, 4], "franky_generated_spans": [[1, 3]]});
+        let model = ModelId("stub-model".into());
+
+        let mut request =
+            PreparedRequest::generate(&ctx, model, Bytes::from(body.to_string())).unwrap();
+        let outgoing = request.outgoing_body(&ctx, None, None, None).unwrap();
+
+        let outgoing: Value = serde_json::from_slice(&outgoing).unwrap();
+        assert_eq!(outgoing, body);
+        assert!(request.franky_earlier_runs().is_empty());
+    }
+
+    #[test]
+    fn a_sandy_with_its_own_tokens_gets_its_ids_and_ricky_runs_counting_them() {
         let ctx = AppContext::stub();
         let body = Bytes::from(json!({"input_ids": [1, 2, 3, 4, 5, 6]}).to_string());
         let model = ModelId("stub-model".into());
@@ -2060,26 +2194,22 @@ mod tests {
         };
 
         request
-            .add_franky_sandy_chat(&[Range { start: 1, end: 3 }], sandy_chat)
+            .add_franky_sandy_chat(&[Range { start: 1, end: 3 }], 6, sandy_chat)
             .unwrap();
         let ricky = request
             .outgoing_body(&ctx, None, Some(&room), None)
             .unwrap();
-        let sandy = request.sandy_outgoing_body(&ctx, &room, None).unwrap();
+        let sandy = request.sandy_outgoing_body(&room, None).unwrap();
 
         let ricky: Value = serde_json::from_slice(&ricky).unwrap();
         let sandy: Value = serde_json::from_slice(&sandy).unwrap();
         assert_eq!(ricky["input_ids"], json!([1, 2, 3, 4, 5, 6]));
-        assert_eq!(ricky["franky_generated_spans"], json!([[1, 3]]));
-        assert_eq!(ricky["franky_sandy_spans"], json!([[2, 4]]));
+        assert_eq!(ricky["franky_tap_runs"], json!([[1, 2], [3, 0], [6, 5]]));
         assert_eq!(ricky["franky_sandy_input_ids"], json!([7, 8, 9, 10, 11]));
         assert_eq!(sandy["input_ids"], json!([7, 8, 9, 10, 11]));
         assert_eq!(sandy["franky_room"], ricky["franky_room"]);
-        for ricky_field in [
-            "franky_generated_spans",
-            "franky_sandy_spans",
-            "franky_sandy_input_ids",
-        ] {
+        assert_eq!(sandy["franky_taps_only"], json!(true));
+        for ricky_field in ["franky_tap_runs", "franky_sandy_input_ids"] {
             assert!(sandy.get(ricky_field).is_none(), "{ricky_field}");
         }
     }

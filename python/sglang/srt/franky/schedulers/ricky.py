@@ -14,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
+from sglang.srt.franky.finish_rules.request_blocks import start_blocks
 from sglang.srt.franky.ricky_taps.prefill_tap_limit import PrefillTapLimit
 from sglang.srt.franky.ricky_taps.taps import RickyTaps
 from sglang.srt.franky.schedulers.parked_chunks import FrankyParkedChunks
@@ -185,6 +186,8 @@ class RickyScheduler(Scheduler):
     @override
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False) -> None:
         self.franky_receive_queue.add(req=req)
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            start_blocks(req)
         super()._add_request_to_queue(req, is_retracted=is_retracted)
 
     @override
@@ -285,10 +288,10 @@ class RickyScheduler(Scheduler):
         self.abort_request(AbortReq(rid=recv_req.chain_id))
         self.franky_taps.chain_holds.release(chain_id=recv_req.chain_id)
 
-    def _fail_franky_request(self, req: Req, reason: str) -> None:
-        finished_reason = FINISH_ABORT(
-            reason, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-        )
+    def _fail_franky_request(
+        self, req: Req, reason: str, status_code: HTTPStatus
+    ) -> None:
+        finished_reason = FINISH_ABORT(reason, status_code=status_code)
         if req is self.chunked_req:
             req.discard_output_reason = finished_reason
             self._pending_chunked_abort_req = req

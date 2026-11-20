@@ -16,10 +16,7 @@ from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional
 
-from sglang.srt.franky.cache.generated_spans import (
-    FrankyGeneratedSpans,
-    GeneratedSpan,
-)
+from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
@@ -142,12 +139,13 @@ def _pr_query_reader(*, queries, taps, visible, weights, prefix):
 
 
 def _spans(tap_len, *, block_size=None):
+    """An answer that starts after ``tap_len`` prompt tokens, in blocks of
+    ``block_size`` where Sandy writes nothing, or in one piece."""
     if tap_len == 0:
         return None
-    return FrankyGeneratedSpans(
-        spans=(GeneratedSpan(start=tap_len, sandy_start=tap_len),),
-        block_size=block_size,
-    )
+    step = block_size or 1
+    starts = range(tap_len, tap_len + 3 * step, step) if block_size else (tap_len,)
+    return FrankyGeneratedSpans(starts=tuple(starts), taps=tuple(starts))
 
 
 class _Files(CustomTestCase):

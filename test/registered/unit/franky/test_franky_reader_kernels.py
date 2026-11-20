@@ -11,10 +11,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.franky.cache.generated_spans import (
-    FrankyGeneratedSpans,
-    GeneratedSpan,
-)
+from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE, TapBuffers
 from sglang.srt.franky.cache.tap_request_table import TapRequestTable
 from sglang.srt.franky.cache.tap_stripes import TapStripes
@@ -48,12 +45,16 @@ def _taps_to_read(token, *, generation_start, block_size):
 
 
 def _spans(generation_start, block_size):
+    """An answer from ``generation_start`` on, in blocks of ``block_size``
+    where Sandy writes nothing, each reading the context before it."""
     if generation_start is None:
         return None
-    return FrankyGeneratedSpans(
-        spans=(GeneratedSpan(start=generation_start, sandy_start=generation_start),),
-        block_size=block_size,
+    starts = (
+        range(generation_start, _CONTEXT, block_size)
+        if block_size
+        else [generation_start]
     )
+    return FrankyGeneratedSpans(starts=tuple(starts), taps=tuple(starts))
 
 
 class _Ranks:

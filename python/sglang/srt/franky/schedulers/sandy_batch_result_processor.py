@@ -5,24 +5,28 @@ from typing import TYPE_CHECKING, Union
 
 from typing_extensions import override
 
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-from sglang.srt.managers.scheduler_components.batch_result_processor import (
-    SchedulerBatchResultProcessor,
+from sglang.srt.disaggregation.utils import is_aborted
+from sglang.srt.franky.request import FrankyRequest
+from sglang.srt.franky.schedulers.chain_batch_result_processor import (
+    FrankyChainBatchResultProcessor,
+    fields_of,
 )
-from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 
 if TYPE_CHECKING:
     from sglang.srt.franky.transfer.send_queue import FrankySendQueue
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.scheduler_components.batch_result_processor import (
+        SchedulerBatchResultProcessor,
+    )
     from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
 
 
 # A subclass of a dataclass must stay one to add a field.
-@dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
-class SandyBatchResultProcessor(SchedulerBatchResultProcessor):
-    """Sandy's prefill results. A request whose prefill ended is held until its
-    taps are sent, as PD prefill holds one until its transfer ends; it leaves
-    the running batch as finished, so it never decodes.
+@dataclasses.dataclass(kw_only=True, frozen=True)
+class SandyBatchResultProcessor(FrankyChainBatchResultProcessor):
+    """Sandy's results, processed as on any engine. The taps of a prefill chunk
+    land once its forward ended, and a request with a room that finished goes to
+    the send queue, which keeps its KV until its taps are sent.
     """
 
     franky_send_queue: FrankySendQueue
@@ -34,10 +38,7 @@ class SandyBatchResultProcessor(SchedulerBatchResultProcessor):
         *,
         franky_send_queue: FrankySendQueue,
     ) -> SandyBatchResultProcessor:
-        fields = {
-            field.name: getattr(base, field.name) for field in dataclasses.fields(base)
-        }
-        return cls(**fields, franky_send_queue=franky_send_queue)
+        return cls(**fields_of(base), franky_send_queue=franky_send_queue)
 
     @override
     def process_batch_result_prefill(
@@ -45,45 +46,20 @@ class SandyBatchResultProcessor(SchedulerBatchResultProcessor):
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ) -> None:
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
-        # Waits for the forward, so the batch's taps are written.
-        result.next_token_ids.tolist()
-        self.token_to_kv_pool_allocator.free_group_begin()
-        aborted = []
-        for req, prefix_len, extend_len in zip(
-            batch.reqs, batch.prefix_lens, batch.extend_lens, strict=True
-        ):
-            if req.inflight_middle_chunks > 0:
-                req.inflight_middle_chunks -= 1
-                req.time_stats.set_last_chunked_prefill_finish_time()
-                self.franky_send_queue.after_chunk(
-                    req=req, end=prefix_len + extend_len, last=False
-                )
-            elif req.finished():
-                # An aborted chunked request, which its abort released.
-                continue
-            elif req.to_finish is not None:
-                # Aborted while it ran: end it as the normal path does.
-                self.franky_send_queue.forget(req=req)
-                req.update_finish_state(0)
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
-                req.time_stats.set_completion_time()
-                aborted.append(req)
-            else:
-                req.time_stats.set_prefill_finished_time()
-                checkpoint_kv_cache(req, self.tree_cache)
-                self.franky_send_queue.after_chunk(
-                    req=req, end=prefix_len + extend_len, last=True
-                )
-                req.finished_reason = FINISH_LENGTH(length=0)
-        self.token_to_kv_pool_allocator.free_group_end()
-        if aborted:
-            self.output_streamer.stream_output(aborted, False)
-        if batch.prefill_stats is not None:
-            self.metrics_reporter.report_prefill_stats(
-                batch=batch,
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=result.can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
+        middle_chunks = [
+            (req, prefix_len + extend_len)
+            for req, prefix_len, extend_len in zip(
+                batch.reqs, batch.prefix_lens, batch.extend_lens, strict=True
             )
+            if req.inflight_middle_chunks > 0
+        ]
+        super().process_batch_result_prefill(batch, result)
+        for req, end in middle_chunks:
+            self.franky_send_queue.after_chunk(req=req, end=end)
+
+    @override
+    def release_finished_kv(self, req: Req, *, checkpoint: bool) -> None:
+        if FrankyRequest.of(req).room is None or is_aborted(req):
+            super().release_finished_kv(req, checkpoint=checkpoint)
+            return
+        self.franky_send_queue.after_end(req=req, checkpoint=checkpoint)

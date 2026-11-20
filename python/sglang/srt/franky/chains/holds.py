@@ -72,16 +72,16 @@ class FrankyChainHolds:
     def hold_for_next_block(
         self, req: Req, *, tap_lock: Optional[TreeLock] = None
     ) -> None:
-        """Lock what ``req`` left for its chain's next block, in place of the
-        chain's last hold; a last block releases the chain's hold instead.
+        """``req`` ended well: lock what it left for its chain's next request,
+        in place of the chain's last hold. Only the router knows when a chain
+        ends; it ends the chain on every engine.
 
         Args:
             tap_lock: the tap prefix tree's lock on the taps ``req`` left, which
                 the holds own from now on.
         """
         chain = FrankyRequest.of(req).chain
-        if chain is None or chain.last_block:
-            self.release_chain_of(req)
+        if chain is None:
             self._release_tap_lock(tap_lock)
             return
         self.release(chain_id=chain.id)

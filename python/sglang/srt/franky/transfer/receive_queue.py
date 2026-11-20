@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import msgspec
@@ -48,8 +49,14 @@ class FrankyReceiveQueue:
         tap_manager: FrankyTapManager,
         rank_reports: FrankyRankReports,
         release_timeout_seconds: float,
-        fail_request: Callable[[Req, str], None],
+        fail_request: Callable[[Req, str, HTTPStatus], None],
     ) -> None:
+        """
+        Args:
+            fail_request: fails a request with a reason and a status: one that
+                can never read its taps is a bad request; one whose room never
+                filled failed upstream, at its Sandy.
+        """
         self.tap_cache = tap_cache
         self.tap_requests = tap_requests
         self.tap_manager = tap_manager
@@ -82,7 +89,7 @@ class FrankyReceiveQueue:
         """
         failing, self._failing = self._failing, []
         for req, problem in failing:
-            self.fail_request(req, problem)
+            self.fail_request(req, problem, HTTPStatus.BAD_REQUEST)
         for reception in self._live_receptions():
             if reception.req.finished():
                 self._end(reception)
@@ -113,6 +120,7 @@ class FrankyReceiveQueue:
             self.fail_request(
                 reception.req,
                 f"Franky taps of request {message.request_rid} did not arrive.",
+                HTTPStatus.BAD_GATEWAY,
             )
             return
         state = reception.req.franky_taps

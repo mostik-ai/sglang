@@ -244,6 +244,19 @@ impl TokenizerRegistry {
         (!ids.is_empty()).then(|| affixes.apply(&ids))
     }
 
+    /// The model's tokens of `text` inside an answer it already holds the start
+    /// of: plain text, which cannot name special tokens. `None` without the
+    /// model's tokenizer, or when it fails.
+    pub fn encode_answer_text(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
+        let tokenizer = self.get(model_id)?;
+        let segment = [EncodeSegment::new(text, false)];
+        if self.stats.backend() == stats::EncodeBackend::Tiktoken {
+            return kimi::encode(&tokenizer, &segment).ok();
+        }
+        let encoding = tokenizer.encode_segments(&segment).ok()?;
+        Some(encoding.token_ids().to_vec())
+    }
+
     /// Whether this model has a chat formatter (and thus the chat-aware
     /// tokenization path is available for it).
     pub fn has_chat_formatter(&self, model_id: &str) -> bool {

@@ -141,6 +141,7 @@ class TestHandleFranky(_WithFiles):
         is_multimodal=False,
         is_hybrid_swa=False,
         num_hidden_layers=16,
+        vocab_size=1000,
         **fields,
     ):
         server_args = ServerArgs(model_path="dummy")
@@ -158,6 +159,7 @@ class TestHandleFranky(_WithFiles):
             is_multimodal=is_multimodal,
             is_hybrid_swa=is_hybrid_swa,
             num_hidden_layers=num_hidden_layers,
+            vocab_size=vocab_size,
         )
         return server_args
 
@@ -230,6 +232,40 @@ class TestHandleFranky(_WithFiles):
                     handle_franky(server_args)
                 handle_franky(self._server_args(side="sandy", **fields))
 
+    def test_a_side_without_parts_writes_text_only_and_refuses_only_chain_rules(self):
+        for side in ("sandy", "ricky"):
+            with self.subTest(side=side):
+                text_only = self._server_args(
+                    side=side,
+                    franky_config=None,
+                    franky_weights=None,
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="mooncake",
+                    enable_mixed_chunk=True,
+                )
+
+                handle_franky(text_only)
+
+                self.assertNotIn(
+                    "handle_franky", dict(getattr(text_only, "_resolved_overrides", []))
+                )
+                with self.assertRaisesRegex(ValueError, "--dp-size"):
+                    handle_franky(
+                        self._server_args(
+                            side=side,
+                            franky_config=None,
+                            franky_weights=None,
+                            dp_size=2,
+                        )
+                    )
+
+    def test_parts_need_both_their_config_and_their_weights(self):
+        for missing in ("franky_config", "franky_weights"):
+            with self.subTest(missing=missing):
+                server_args = self._server_args(side="ricky", **{missing: None})
+                with self.assertRaisesRegex(ValueError, "together"):
+                    handle_franky(server_args)
+
     def test_a_tap_pool_ratio_sizes_rickys_tap_pool_whatever_its_tokenizer(self):
         own_tokenizer = copy.deepcopy(_CONFIG)
         own_tokenizer["shared_tokenizer"] = False
@@ -287,7 +323,7 @@ class TestHandleFranky(_WithFiles):
             server_args._resolved_overrides,
         )
 
-    def test_sandy_runs_without_overlap_scheduling_or_decode_graphs(self):
+    def test_sandy_runs_without_overlap_scheduling_and_keeps_its_graphs(self):
         sandy = self._server_args(side="sandy")
         ricky = self._server_args(side="ricky")
 
@@ -295,11 +331,7 @@ class TestHandleFranky(_WithFiles):
         handle_franky(ricky)
 
         resolved = dict(sandy._resolved_overrides)["handle_franky"]
-        self.assertTrue(resolved["disable_overlap_schedule"])
-        self.assertEqual(resolved["cuda_graph_config"].decode.backend, Backend.DISABLED)
-        self.assertEqual(
-            resolved["cuda_graph_config"].prefill, CudaGraphConfig().prefill
-        )
+        self.assertEqual(resolved, {"disable_overlap_schedule": True})
         self.assertNotIn(
             "handle_franky", dict(getattr(ricky, "_resolved_overrides", []))
         )

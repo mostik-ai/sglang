@@ -1589,6 +1589,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj,
                 prompt_len=len(input_ids_arr or ()),
                 on_sandy=get_franky().franky_side == "sandy",
+                passes_taps=get_franky().franky_config is not None,
             )
 
             tokenized_obj = self.tokenized_generate_req_type(

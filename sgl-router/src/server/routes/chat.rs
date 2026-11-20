@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-mod blocks;
 mod earlier_answers;
 mod forward;
+mod franky_chain;
 mod openai;
 mod preparation;
 mod reorg;
+mod tap_runs;
 
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
@@ -27,13 +28,14 @@ use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
-use blocks::BlockChain;
 use bytes::Bytes;
 use earlier_answers::prepare_franky_chat;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
+use franky_chain::FrankyChain;
 use preparation::{
     forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
-    CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
+    TapSource, CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH,
+    RERANK_PATH,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,9 +122,12 @@ async fn serve_http(
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let (mut request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
-    match BlockChain::plan(&ctx, &mut request, &headers)? {
+    match FrankyChain::plan(&ctx, &mut request, &headers)? {
         Some(chain) => chain.serve(&ctx, &routing, headers, start).await,
-        None => routing.dispatch(&ctx, request, headers, start).await,
+        None => {
+            request.tap_source = one_request_tap_source(&ctx, &request.model);
+            routing.dispatch(&ctx, request, headers, start).await
+        }
     }
 }
 
@@ -312,6 +317,37 @@ fn serves_franky(ctx: &AppContext, model: &ModelId) -> bool {
         .any(|w| w.needs_taps() || w.mode() == WorkerMode::Sandy)
 }
 
+/// Where a request to `model` that is no chain gets its taps: a Sandy leg
+/// beside it, when its Ricky workers read taps and `--franky-chain` passes them.
+fn one_request_tap_source(ctx: &AppContext, model: &ModelId) -> TapSource {
+    let reads_taps = ctx
+        .registry
+        .workers_for(model)
+        .iter()
+        .any(|w| w.needs_taps());
+    if reads_taps && ctx.config.proxy.franky_chain.taps {
+        TapSource::SandyLeg
+    } else {
+        TapSource::None
+    }
+}
+
+/// Waits before retry `attempt` of a request that started at `start`.
+///
+/// Returns: false when the request's stale deadline passed, so it must not
+/// retry.
+async fn back_off(ctx: &AppContext, start: Instant, attempt: u32) -> bool {
+    // A retry never starts past the request's stale deadline, so the backoff
+    // is capped by what remains of it. Backing off before selecting lets the
+    // pick see fresh breaker and load state.
+    let deadline = ctx.router_inflight_load.stale_request_timeout();
+    let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
+        return false;
+    };
+    tokio::time::sleep(ctx.config.proxy.backoff(attempt).min(remaining)).await;
+    start.elapsed() < deadline
+}
+
 /// A model's routing state, resolved before the request is prepared.
 enum ModelRouting<'a> {
     Legacy(Arc<dyn Policy>),
@@ -366,7 +402,8 @@ impl<'a> ModelRouting<'a> {
     /// Select workers for `request`, or take `pinned` for the first attempt,
     /// and forward it to them. An attempt that fails before any response reaches
     /// the client is retried, after a backoff, on workers it has not tried, up
-    /// to `--retry-max-attempts`.
+    /// to `--retry-max-attempts`; a request reading the room of a Sandy call
+    /// gets one attempt, since the room sends its taps once.
     ///
     /// Returns the response, and the workers that gave it unless every attempt
     /// failed.
@@ -381,19 +418,13 @@ impl<'a> ModelRouting<'a> {
     ) -> Result<(Response<Body>, Option<SelectedWorkers>), ApiError> {
         let mut excluded = Vec::new();
         let mut failed = None;
-        for attempt in 0..ctx.config.proxy.max_attempts.get() {
-            if attempt > 0 {
-                // A retry never starts past the request's stale deadline, so the
-                // backoff is capped by what remains of it. Backing off before
-                // selecting lets the pick see fresh breaker and load state.
-                let deadline = ctx.router_inflight_load.stale_request_timeout();
-                let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
-                    break;
-                };
-                tokio::time::sleep(ctx.config.proxy.backoff(attempt).min(remaining)).await;
-                if start.elapsed() >= deadline {
-                    break;
-                }
+        let attempts = match request.tap_source {
+            TapSource::Room(_) => 1,
+            TapSource::None | TapSource::SandyLeg => ctx.config.proxy.max_attempts.get(),
+        };
+        for attempt in 0..attempts {
+            if attempt > 0 && !back_off(ctx, start, attempt).await {
+                break;
             }
             let workers = match pinned.take() {
                 Some(workers) => workers,
@@ -451,7 +482,7 @@ impl<'a> ModelRouting<'a> {
                 reorg::select_workers(ctx, resolver, request, headers, excluded, &prefix).await?
             }
         };
-        if workers.prefill.needs_taps() {
+        if matches!(request.tap_source, TapSource::SandyLeg) {
             workers.sandy = Some(pick_sandy(ctx, request, headers, excluded, &prefix).await?);
         }
         Ok(workers)

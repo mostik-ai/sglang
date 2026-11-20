@@ -762,7 +762,7 @@ class ModelRunner:
                 dtype=self.dtype,
                 device=self.device,
             )
-            if franky.franky_side != "null"
+            if franky.franky_config is not None
             else None
         )
 

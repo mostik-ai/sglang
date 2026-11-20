@@ -126,7 +126,7 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
+                self.release_finished_kv(req, checkpoint=True)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -384,10 +384,8 @@ class SchedulerBatchResultProcessor:
                             self.hisparse_coordinator.request_finished(req)
                         if batch.decoding_reqs and req in batch.decoding_reqs:
                             self._prepare_kv_cache_release(req)
-                        release_kv_cache(
-                            req,
-                            self.tree_cache,
-                            checkpoint=discard_finish_reason is None,
+                        self.release_finished_kv(
+                            req, checkpoint=discard_finish_reason is None
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -1353,6 +1351,13 @@ class SchedulerBatchResultProcessor:
             "InternalServerError",
         )
 
+    def release_finished_kv(self, req: Req, *, checkpoint: bool) -> None:
+        """Give the KV row of a request that finished generating back; with
+        ``checkpoint`` the tree first keeps what it can key. An engine that keeps
+        a finished request's KV for longer overrides this.
+        """
+        release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+
     def _prepare_kv_cache_release(self, req: Req) -> None:
         # Only workers that keep KV outside the pool (MLX) define the hook.
         prepare_release = getattr(
@@ -1463,7 +1468,7 @@ class SchedulerBatchResultProcessor:
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+                self.release_finished_kv(req, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
 

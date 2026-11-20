@@ -34,10 +34,9 @@ pub struct ProxyConfig {
     pub decode_dispatch_limit: Option<NonZeroU32>,
     /// PD: return decode's response only once prefill completes.
     pub stream_after_prefill: bool,
-    /// Franky: run each request as blocks of at most this many generated tokens,
-    /// so a block's tokens read their own taps in the next block. `None` runs
-    /// it in one block.
-    pub franky_block_size: Option<NonZeroU32>,
+    /// Franky: how requests to Franky workers run, in one Ricky request or as a
+    /// chain of Sandy calls and Ricky legs.
+    pub franky_chain: FrankyChainConfig,
     /// Franky: the chat template whose earlier answers the router marks in the
     /// chats it renders. `None` refuses a Franky chat with earlier answers
     /// unless it carries `input_ids`.
@@ -45,6 +44,47 @@ pub struct ProxyConfig {
     /// Franky with a Sandy that tokenizes on its own; `None` when Sandy reads
     /// the served model's tokens.
     pub franky_sandy: Option<FrankySandyConfig>,
+}
+
+/// How the router serves a request to Franky workers. The defaults run it as
+/// one Ricky request that reads the taps a Sandy leg beside it sends; with
+/// Sandy's text or Ricky's blocks it runs as a chain: each Sandy call writes
+/// part of the answer, then a Ricky leg writes blocks until its engine decides
+/// that Sandy writes next.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrankyChainConfig {
+    /// Tokens of the answer each Sandy call writes; 0 writes none.
+    #[serde(default)]
+    pub sandy_call_tokens: u32,
+    /// Whether Sandy sends the taps of what it ran and Ricky reads them.
+    #[serde(default = "taps_by_default")]
+    pub taps: bool,
+    /// Ricky's blocks, which the router forwards unread to every Ricky leg and
+    /// the Ricky engine checks; `None` runs Ricky in one leg to the end.
+    #[serde(default)]
+    pub blocks: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+fn taps_by_default() -> bool {
+    true
+}
+
+impl Default for FrankyChainConfig {
+    fn default() -> Self {
+        Self {
+            sandy_call_tokens: 0,
+            taps: true,
+            blocks: None,
+        }
+    }
+}
+
+impl FrankyChainConfig {
+    /// Whether requests run as chains: Sandy writes, or Ricky has blocks.
+    pub fn runs_chains(&self) -> bool {
+        self.sandy_call_tokens > 0 || self.blocks.is_some()
+    }
 }
 
 /// A Franky Sandy that tokenizes on its own. The router renders each Franky
@@ -92,7 +132,7 @@ impl Default for ProxyConfig {
             max_backoff_ms: 2000,
             decode_dispatch_limit: None,
             stream_after_prefill: false,
-            franky_block_size: None,
+            franky_chain: FrankyChainConfig::default(),
             franky_chat_adapter: None,
             franky_sandy: None,
         }

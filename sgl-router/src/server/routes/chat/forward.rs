@@ -6,7 +6,7 @@
 use super::nonempty_header;
 use super::preparation::{
     append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, FrankyRoom,
-    PreparedRequest,
+    PreparedRequest, TapSource,
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
@@ -41,7 +41,7 @@ const X_DATA_PARALLEL_RANK: HeaderName = HeaderName::from_static("x-data-paralle
 type LoadGuards = (LoadGuard, RouterInflightLoadGuard, Option<DpRankGuard>);
 
 /// A plain worker, or a prefill worker paired with a decode worker for PD, and
-/// the Sandy that sends their taps when they read taps.
+/// the Sandy leg that sends their taps when the request's taps come from one.
 #[derive(Clone)]
 pub(super) struct SelectedWorkers {
     pub(super) prefill: Arc<Worker>,
@@ -218,12 +218,17 @@ async fn dispatch<T: Transport>(
         duration,
     );
     let pd_prefill = decode.is_some().then(|| prefill.id.clone());
-    // The Sandy and every Ricky leg receive the same Franky room for the taps.
-    let franky_room = sandy.as_ref().map(|sandy| FrankyRoom {
-        host: sandy.bootstrap_host().to_string(),
-        port: sandy.bootstrap_port(),
-        room: generate_room_id(),
-    });
+    // The Sandy and every Ricky leg receive the same Franky room for the taps:
+    // a Sandy leg's, opened per attempt, or the room of a Sandy call that ran.
+    let franky_room = match &request.tap_source {
+        TapSource::None => None,
+        TapSource::SandyLeg => sandy.as_ref().map(|sandy| FrankyRoom {
+            host: sandy.bootstrap_host().to_string(),
+            port: sandy.bootstrap_port(),
+            room: generate_room_id(),
+        }),
+        TapSource::Room(room) => Some(room.clone()),
+    };
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
     let pd = decode.map(|decode| {
         let bootstrap = BootstrapFields {
@@ -257,7 +262,7 @@ async fn dispatch<T: Transport>(
     // Sandy computes the same prompt, outside PD.
     let sandy_leg = match (sandy, &franky_room) {
         (Some(sandy), Some(room)) => {
-            let body = request.sandy_outgoing_body(ctx, room, engine_rid.as_deref())?;
+            let body = request.sandy_outgoing_body(room, engine_rid.as_deref())?;
             let rank = dp_aware
                 .then(|| prompt_dp_rank(ctx, request, &headers, &sandy))
                 .flatten();
@@ -413,6 +418,10 @@ async fn dispatch<T: Transport>(
         dispatch_outcome::<T>(&result),
         RequestOutcome::Error | RequestOutcome::Backpressure
     );
+    // A Ricky answers 502 when its taps never arrived, which the Sandy that
+    // sends them is to blame for.
+    let taps_failed = matches!(&result, Ok(response) if T::status(response) == 502);
+    let tap_blame = sandy_id.clone().filter(|_| taps_failed);
     let side_ids: Vec<_> = pd_prefill.into_iter().chain(sandy_id).collect();
     let retry_excluding = match &blame {
         _ if !retryable => Vec::new(),
@@ -422,7 +431,7 @@ async fn dispatch<T: Transport>(
             .chain([response_worker.id.clone()])
             .collect(),
         Some(blame) => vec![blame.worker.id.clone()],
-        None => vec![response_worker.id.clone()],
+        None => vec![tap_blame.unwrap_or_else(|| response_worker.id.clone())],
     };
     let result = match result {
         Ok(response) => Ok(T::respond(request, response, metrics.streaming).await),

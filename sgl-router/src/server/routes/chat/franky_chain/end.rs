@@ -10,13 +10,12 @@ const END_CHAIN_PATH: &str = "/franky/end_chain";
 const END_CHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// On drop, asks every engine the chain reached to abort its requests and release
-/// its holds, unless the chain ended with its last block.
+/// its holds: only the router knows when a chain ended.
 pub(super) struct ChainEnd {
     client: Client,
     chain_id: String,
     authorization: Option<HeaderValue>,
     engine_urls: Vec<String>,
-    must_end: bool,
 }
 
 impl ChainEnd {
@@ -26,7 +25,6 @@ impl ChainEnd {
             chain_id,
             authorization: headers.get(AUTHORIZATION).cloned(),
             engine_urls: Vec::new(),
-            must_end: true,
         }
     }
 
@@ -42,15 +40,11 @@ impl ChainEnd {
             }
         }
     }
-
-    pub(super) fn ended_with_last_block(&mut self) {
-        self.must_end = false;
-    }
 }
 
 impl Drop for ChainEnd {
     fn drop(&mut self) {
-        if !self.must_end || self.engine_urls.is_empty() {
+        if self.engine_urls.is_empty() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {

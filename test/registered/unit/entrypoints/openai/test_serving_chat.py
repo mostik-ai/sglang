@@ -1766,13 +1766,12 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.text, "rendered prompt")
         self.assertIsNone(adapted.input_ids)
 
-    def test_chat_passes_franky_generated_spans_to_generate(self):
+    def test_chat_passes_franky_tap_runs_to_generate(self):
         request = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
-            franky_generated_spans=[[3, 7]],
+            franky_tap_runs=[[3, 2], [7, 0], [8, 9]],
             franky_sandy_input_ids=[11, 12, 13, 14, 15, 16, 17, 18, 19],
-            franky_sandy_spans=[[2, 6]],
         )
         processed = MessageProcessingResult(
             "Test prompt", [1, 2, 3, 4, 5, 6, 7, 8], None, None, [], [], None
@@ -1780,11 +1779,10 @@ class ServingChatTestCase(CustomTestCase):
         with patch.object(self.chat, "_process_messages", return_value=processed):
             adapted, _ = self.chat._convert_to_internal_request(request)
 
-        self.assertEqual(adapted.franky_generated_spans, [[3, 7]])
+        self.assertEqual(adapted.franky_tap_runs, [[3, 2], [7, 0], [8, 9]])
         self.assertEqual(
             adapted.franky_sandy_input_ids, [11, 12, 13, 14, 15, 16, 17, 18, 19]
         )
-        self.assertEqual(adapted.franky_sandy_spans, [[2, 6]])
 
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(

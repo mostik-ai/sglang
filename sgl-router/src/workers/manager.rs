@@ -617,7 +617,7 @@ async fn register_one(
         dp_ranks: info.dp_ranks,
         openai: info.openai.map(Arc::new),
         grpc_port: info.grpc_port,
-        needs_taps: info.franky_role == Some(FrankyRole::Ricky),
+        needs_taps: info.franky_role == Some(FrankyRole::Ricky { reads_taps: true }),
     };
     if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration

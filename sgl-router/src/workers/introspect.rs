@@ -90,8 +90,9 @@ pub struct ServerInfo {
 pub enum FrankyRole {
     /// Computes prompts' taps and serves them on its tap bootstrap port.
     Sandy { bootstrap_port: u16 },
-    /// Reads taps: each request needs a Sandy.
-    Ricky,
+    /// Writes a chain's blocks; with `reads_taps` (its `--franky-config`),
+    /// each request needs a Sandy.
+    Ricky { reads_taps: bool },
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -209,6 +210,7 @@ impl WorkerIntrospector {
         let franky_role = resolve_franky_role(
             parsed.franky_side.as_deref(),
             parsed.franky_bootstrap_port,
+            parsed.franky_config.is_some(),
             worker_url,
         );
 
@@ -351,15 +353,19 @@ fn resolve_disaggregation_role(
 
 /// Map `/server_info` `franky_side` into a [`FrankyRole`]; `None` for a solo
 /// engine, an engine that predates the field, or a value this router does not know.
+/// `has_config`: the engine runs a `--franky-config`, so a Ricky reads taps.
 fn resolve_franky_role(
     side: Option<&str>,
     bootstrap_port: Option<u16>,
+    has_config: bool,
     worker_url: &str,
 ) -> Option<FrankyRole> {
     match (side?, bootstrap_port) {
         ("null", _) => None,
         ("sandy", Some(bootstrap_port)) => Some(FrankyRole::Sandy { bootstrap_port }),
-        ("ricky", _) => Some(FrankyRole::Ricky),
+        ("ricky", _) => Some(FrankyRole::Ricky {
+            reads_taps: has_config,
+        }),
         (side, _) => {
             warn!(
                 worker_url = %worker_url,
@@ -482,6 +488,10 @@ struct ServerInfoBody {
     /// `ServerArgs.franky_bootstrap_port`: the tap bootstrap port a Sandy serves on.
     #[serde(default)]
     franky_bootstrap_port: Option<u16>,
+    /// `ServerArgs.franky_config`: the pair's encoders and readers; null on
+    /// engines of text-only chains.
+    #[serde(default)]
+    franky_config: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -515,25 +525,37 @@ mod tests {
     use super::*;
 
     /// Only a Sandy with its tap port, and a Ricky, are Franky roles; anything
-    /// else keeps the worker solo.
+    /// else keeps the worker solo. A Ricky reads taps with its Franky config.
     #[test]
     fn franky_role_comes_from_franky_side() {
-        for (side, port, role) in [
+        for (side, port, has_config, role) in [
             (
                 Some("sandy"),
                 Some(8996),
+                true,
                 Some(FrankyRole::Sandy {
                     bootstrap_port: 8996,
                 }),
             ),
-            (Some("ricky"), None, Some(FrankyRole::Ricky)),
-            (Some("null"), Some(8996), None),
-            (None, Some(8996), None),
-            (Some("sandy"), None, None),
-            (Some("other"), Some(8996), None),
+            (
+                Some("ricky"),
+                None,
+                true,
+                Some(FrankyRole::Ricky { reads_taps: true }),
+            ),
+            (
+                Some("ricky"),
+                Some(8996),
+                false,
+                Some(FrankyRole::Ricky { reads_taps: false }),
+            ),
+            (Some("null"), Some(8996), true, None),
+            (None, Some(8996), true, None),
+            (Some("sandy"), None, true, None),
+            (Some("other"), Some(8996), true, None),
         ] {
             assert_eq!(
-                resolve_franky_role(side, port, "http://w"),
+                resolve_franky_role(side, port, has_config, "http://w"),
                 role,
                 "{side:?}"
             );

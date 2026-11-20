@@ -12,10 +12,12 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.nixl.conn import NixlKVReceiver, NixlKVSender
+from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
 from sglang.srt.franky.cache.tap_buffers import TapBuffers
 from sglang.srt.franky.cache.tap_request_table import TapRequestTable
 from sglang.srt.franky.cache.tap_stripes import TapStripes
+from sglang.srt.franky.chains.blocks.sandy_call import FrankySandyCall
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.request import FrankyRequest
@@ -60,7 +62,9 @@ def _tap_requests(tap_cache, *, shared_tokenizer=True):
             num_slots=_NUM_ROWS, max_stripes=_MAX_STRIPES, device="cpu"
         ),
         chain_holds=FrankyChainHolds(
-            tree_cache=None, tap_cache=tap_cache, hold_seconds=60.0
+            tree_cache=None,
+            tap_cache=tap_cache,
+            hold_seconds=60.0,
         ),
         shared_tokenizer=shared_tokenizer,
     )
@@ -85,7 +89,19 @@ def _request(
         franky=(
             None
             if room is None and chain is None and sandy_input_ids is None
-            else FrankyRequest(room=room, chain=chain, sandy_input_ids=sandy_input_ids)
+            else FrankyRequest(
+                room=room,
+                chain=chain,
+                tap_runs=(
+                    None
+                    if room is None
+                    else FrankyGeneratedSpans.after_input(
+                        num_input_tokens=len(input_ids),
+                        num_taps=len(sandy_input_ids or input_ids),
+                    )
+                ),
+                sandy_input_ids=sandy_input_ids,
+            )
         ),
         origin_input_ids=list(input_ids),
         bootstrap_room=bootstrap_room,
@@ -103,7 +119,7 @@ def _block(chain_id, input_ids, *, block):
     return _request(
         f"{chain_id}-{block}",
         input_ids,
-        chain=FrankyChain(id=chain_id, block=block, block_size=8),
+        chain=FrankyChain(id=chain_id, block=block),
     )
 
 
@@ -133,9 +149,9 @@ class _Requests(CustomTestCase):
         self.requests.end(request, landed=True)
 
     def _hold(self, request):
-        """A block that ended at its length, with all its taps landed."""
+        """A request that ended for a Sandy call, with all its taps landed."""
         self._reserve(request)
-        self._end_landed(request, FINISH_LENGTH(length=8))
+        self._end_landed(request, FrankySandyCall(next_block=2))
 
     def _free_and_evictable(self):
         usage = self.tap_cache.usage()
@@ -368,25 +384,20 @@ class TestHeldChains(_Requests):
         self.assertFalse(self.holds.holds_chain_of(second))
         self.assertEqual(self.tap_cache.num_takeable_stripes(), _NUM_STRIPES - 3)
 
-    def test_a_last_block_or_one_that_stopped_releases_its_chains_hold(self):
-        for name, first_id, last_block, reason in (
-            ("last", 0, True, FINISH_LENGTH(length=8)),
-            ("stopped", 1000, False, FINISH_MATCHED_TOKEN(matched=0)),
+    def test_a_chains_last_request_holds_until_the_router_ends_the_chain(self):
+        for name, first_id, reason in (
+            ("limit", 0, FINISH_LENGTH(length=8)),
+            ("stopped", 1000, FINISH_MATCHED_TOKEN(matched=0)),
         ):
             with self.subTest(name):
                 self._hold(_block(name, range(first_id, first_id + 16), block=1))
-                second = _request(
-                    f"{name}-2",
-                    range(first_id, first_id + 24),
-                    chain=FrankyChain(
-                        id=name, block=2, block_size=8, last_block=last_block
-                    ),
-                )
+                second = _block(name, range(first_id, first_id + 24), block=2)
                 self._reserve(second)
-
                 self._end_landed(second, reason)
+                self.assertTrue(self.holds.holds_chain_of(second))
 
-                self.assertFalse(self.holds.holds_chain_of(second))
+                self.holds.release(chain_id=name)
+
                 self.assertEqual(self.tap_cache.num_takeable_stripes(), _NUM_STRIPES)
 
     def test_a_block_whose_taps_did_not_land_releases_its_chains_hold(self):
