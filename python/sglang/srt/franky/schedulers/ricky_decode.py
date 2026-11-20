@@ -71,6 +71,7 @@ class RickyDecodeScheduler(Scheduler):
             engine_rank=parallel.attn_tp_rank,
             pp_rank=parallel.pp_rank,
             gpu_id=get_device().gpu_id,
+            senders_split_alike=True,
         )
         self.disagg_decode_prealloc_queue.kv_manager.attach_tap_relay(
             tap_relay=self.franky_relay_manager,

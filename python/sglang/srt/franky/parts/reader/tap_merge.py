@@ -27,7 +27,7 @@ class TapExchange(msgspec.Struct, frozen=True, kw_only=True):
 
     Attributes:
         buffer: this rank's buffer, kept alive for its peers.
-        buffers: the buffer's rendezvous handle, with every rank's pointers.
+        buffer_handle: the buffer's rendezvous handle, with every rank's pointers.
         flags: this rank's barrier flags, kept alive for its peers.
         flag_handle: the flags' rendezvous handle.
         epochs: this rank's barriers so far, per program of the kernel.
@@ -35,7 +35,7 @@ class TapExchange(msgspec.Struct, frozen=True, kw_only=True):
     """
 
     buffer: torch.Tensor
-    buffers: Any
+    buffer_handle: Any
     flags: torch.Tensor
     flag_handle: Any
     epochs: torch.Tensor
@@ -76,14 +76,14 @@ class TapExchange(msgspec.Struct, frozen=True, kw_only=True):
             # rank reached it, so no peer signals into stale flags.
             flags.zero_()
             torch.cuda.synchronize(device)
-            buffers = symm_mem.rendezvous(buffer, group=group.device_group)
+            buffer_handle = symm_mem.rendezvous(buffer, group=group.device_group)
             flag_handle = symm_mem.rendezvous(flags, group=group.device_group)
         except Exception as error:  # no P2P between these GPUs
             logger.warning("Franky readers merge over NCCL: %s", error)
             return None
         return TapExchange(
             buffer=buffer,
-            buffers=buffers,
+            buffer_handle=buffer_handle,
             flags=flags,
             flag_handle=flag_handle,
             epochs=torch.zeros(EXCHANGE_MAX_PROGRAMS, dtype=torch.int32, device=device),
@@ -170,12 +170,12 @@ class TapMerge:
                 local_taps,
                 out=out,
                 has_taps=has_taps,
-                buffer_ptrs=exchange.buffers.buffer_ptrs_dev,
+                buffer_ptrs=exchange.buffer_handle.buffer_ptrs_dev,
                 flag_ptrs=exchange.flag_handle.buffer_ptrs_dev,
                 epochs=exchange.epochs,
                 buffer_rows=exchange.slot_rows,
-                rank=exchange.buffers.rank,
-                world_size=exchange.buffers.world_size,
+                rank=exchange.buffer_handle.rank,
+                world_size=exchange.buffer_handle.world_size,
                 lse_is_base_e=lse_is_base_e,
             )
             return

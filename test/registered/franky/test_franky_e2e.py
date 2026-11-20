@@ -449,6 +449,8 @@ class TestFrankyPdEndToEnd(_FrankyPair):
     rank sends its taps to both prefill ranks, each keeping its stripe pages,
     and prefill's ranks relay their pages to decode's rank with the KV."""
 
+    decode_tp_size = 1
+
     @classmethod
     def _servers(cls):
         cls.relay_port = find_available_port(19096)
@@ -477,7 +479,7 @@ class TestFrankyPdEndToEnd(_FrankyPair):
                 "ricky",
                 cls.decode_url,
                 gpu=3,
-                tp_size=1,
+                tp_size=cls.decode_tp_size,
                 extra=[*pd, *relay, "--disaggregation-mode", "decode"],
             ),
         ]
@@ -556,6 +558,14 @@ class TestFrankyPdEndToEnd(_FrankyPair):
             thread.join()
         for (tokens, logprobs), ref in zip(outputs, self._reference(prompts, outputs)):
             self.assertLess((logprobs - ref["readers"]).abs().max().item(), 0.2)
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 5, "requires 5 GPUs")
+class TestFrankyPdDecodeTp2EndToEnd(TestFrankyPdEndToEnd):
+    """Ricky PD decode on two ranks too: each decode rank reads only the prefill
+    rank that keeps its stripe."""
+
+    decode_tp_size = 2
 
 
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")

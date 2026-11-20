@@ -28,7 +28,9 @@ class FrankyTapManager(NixlKVManager):
     attention-TP rank keeps its own stripe pages of every request, so every
     receiving rank pairs with every sending rank of every stage; page lists are
     whole requests with -1 where a rank keeps no page, and only the pages both
-    ends keep move. Encoders pair by id.
+    ends keep move. Where the senders split taps as the receivers do, over as
+    many ranks, each receiving rank pairs only with the sending rank of its
+    stripe. Encoders pair by id.
     """
 
     def __init__(
@@ -39,9 +41,11 @@ class FrankyTapManager(NixlKVManager):
         server_args: ServerArgs,
         bootstrap_port: Optional[int],
         aux_buffer: torch.Tensor,
+        senders_split_alike: bool,
     ) -> None:
         self.franky_bootstrap_port = bootstrap_port
         self.aux_buffer = aux_buffer
+        self.senders_split_alike = senders_split_alike
         self.landed = FrankyLandedPages()
         super().__init__(kv_args, side, server_args, is_mla_backend=True)
 
@@ -55,6 +59,7 @@ class FrankyTapManager(NixlKVManager):
         engine_rank: int,
         pp_rank: int,
         gpu_id: int,
+        senders_split_alike: bool = False,
     ) -> FrankyTapManager:
         """
         Args:
@@ -62,6 +67,9 @@ class FrankyTapManager(NixlKVManager):
             bootstrap_port: the sending engine's bootstrap server port; None on a
                 receiving engine.
             engine_rank: the rank within attention TP on a receiving engine.
+            senders_split_alike: on a receiving engine, whether the sending
+                engine splits taps over its attention-TP ranks as this one does,
+                page by request page: Ricky prefill to Ricky decode.
         """
         aux_buffer = torch.zeros(_AUX_BYTES, dtype=torch.uint8)
         return FrankyTapManager(
@@ -76,6 +84,7 @@ class FrankyTapManager(NixlKVManager):
             server_args=server_args,
             bootstrap_port=bootstrap_port,
             aux_buffer=aux_buffer,
+            senders_split_alike=senders_split_alike,
         )
 
     def track_room(self, room: int) -> None:
@@ -146,10 +155,17 @@ class FrankyTapManager(NixlKVManager):
     @override
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         # handle_franky refuses attention context parallelism at start.
-        info.target_tp_rank = None
-        info.target_tp_ranks = list(range(info.attn_tp_size))
         info.target_cp_ranks = [0]
         info.target_pp_ranks = list(range(info.pp_size))
+        if self.senders_split_alike and info.attn_tp_size == self.attn_tp_size:
+            # The sending rank of this rank's stripe keeps every page it reads.
+            info.target_tp_rank = self.attn_tp_rank
+            info.target_tp_ranks = [self.attn_tp_rank]
+            info.required_dst_info_num = self.pp_size
+            info.required_prefill_response_num = info.pp_size
+            return
+        info.target_tp_rank = None
+        info.target_tp_ranks = list(range(info.attn_tp_size))
         info.required_dst_info_num = self.attn_tp_size * self.pp_size
         info.required_prefill_response_num = info.attn_tp_size * info.pp_size
 

@@ -122,10 +122,12 @@ class TestFrankyTapsPastTheCachedPrefix(CustomTestCase):
         self.assertEqual(receiver.landed(), 70)
 
 
-def _tap_manager(*, attn_tp_size, pp_size):
+def _tap_manager(*, attn_tp_size, pp_size, attn_tp_rank=0, senders_split_alike=False):
     manager = FrankyTapManager.__new__(FrankyTapManager)
     manager.attn_tp_size = attn_tp_size
+    manager.attn_tp_rank = attn_tp_rank
     manager.pp_size = pp_size
+    manager.senders_split_alike = senders_split_alike
     return manager
 
 
@@ -181,6 +183,32 @@ class TestFrankyTapManager(CustomTestCase):
 
         self.assertEqual(sending_engine.required_dst_info_num, 8)
         self.assertEqual(sending_engine.required_prefill_response_num, 8)
+
+    def test_a_rank_reads_only_its_stripes_sender_where_both_engines_split_alike(self):
+        manager = _tap_manager(
+            attn_tp_size=4, pp_size=1, attn_tp_rank=2, senders_split_alike=True
+        )
+        sending_engine = _sending_engine(attn_tp_size=4, pp_size=1)
+
+        manager._resolve_rank_mapping(sending_engine)
+
+        self.assertEqual(sending_engine.target_tp_rank, 2)
+        self.assertEqual(sending_engine.target_tp_ranks, [2])
+        self.assertEqual(sending_engine.target_pp_ranks, [0])
+        self.assertEqual(sending_engine.required_prefill_response_num, 1)
+        self.assertEqual(sending_engine.required_dst_info_num, 1)
+
+    def test_engines_that_split_alike_over_other_rank_counts_pair_every_rank(self):
+        manager = _tap_manager(
+            attn_tp_size=1, pp_size=1, attn_tp_rank=0, senders_split_alike=True
+        )
+        sending_engine = _sending_engine(attn_tp_size=2, pp_size=1)
+
+        manager._resolve_rank_mapping(sending_engine)
+
+        self.assertIsNone(sending_engine.target_tp_rank)
+        self.assertEqual(sending_engine.target_tp_ranks, [0, 1])
+        self.assertEqual(sending_engine.required_prefill_response_num, 2)
 
 
 if __name__ == "__main__":
