@@ -17,6 +17,7 @@ mod dp_rank_routing;
 mod embeddings_routing;
 mod external_indexer_routing;
 mod failover;
+mod franky_earlier_answers;
 mod franky_routing;
 mod generate_routing;
 mod graceful_shutdown;

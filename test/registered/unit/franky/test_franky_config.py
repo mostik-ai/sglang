@@ -22,7 +22,6 @@ from sglang.srt.franky.parts.encoder.all.encoder import AllEncoder
 from sglang.srt.franky.parts.encoder.masked.encoder import MaskedEncoder
 from sglang.srt.franky.parts.encoder.singular.encoder import SingularEncoder
 from sglang.srt.franky.parts.injector.residual.config import ResidualInjectorConfig
-from sglang.srt.franky.parts.reader.fixed_query.reader import FixedQueryReader
 from sglang.srt.franky.parts.reader.residual_query.reader import ResidualQueryReader
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -39,12 +38,12 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 _CONFIG = {
     "encoder": {"type": "masked", "layers": [4, 8, 12], "output_size": 256},
     "reader": {
-        "type": "fixed_query",
+        "type": "residual_query",
         "layers": [1, 4, 9],
         "num_queries": 1,
         "mlp_hidden_size": 1024,
     },
-    "injector": {"type": "residual"},
+    "injector": {"sandy": {"type": "residual"}, "ricky": {"type": "residual"}},
     "tap_page_size": 64,
 }
 
@@ -63,10 +62,9 @@ class _WithFiles(CustomTestCase):
 
 
 class TestFrankyConfig(_WithFiles):
-    def _load(self, *, encoder_type="masked", reader_type="fixed_query"):
+    def _load(self, *, encoder_type="masked"):
         config = copy.deepcopy(_CONFIG)
         config["encoder"]["type"] = encoder_type
-        config["reader"]["type"] = reader_type
         return FrankyConfig.load(self._write_config(config))
 
     def test_each_encoder_type_reads_its_layers(self):
@@ -92,14 +90,19 @@ class TestFrankyConfig(_WithFiles):
             with self.subTest(encoder_type):
                 loaded = self._load(encoder_type=encoder_type)
                 self.assertIs(loaded.encoder.encoder_cls, encoder_cls)
-        for reader_type, reader_cls in {
-            "fixed_query": FixedQueryReader,
-            "residual_query": ResidualQueryReader,
-        }.items():
-            with self.subTest(reader_type):
-                loaded = self._load(reader_type=reader_type)
-                self.assertIs(loaded.reader.reader_cls, reader_cls)
-        self.assertIsInstance(self._load().injector, ResidualInjectorConfig)
+        self.assertIs(self._load().reader.reader_cls, ResidualQueryReader)
+        self.assertIsInstance(self._load().injector.sandy, ResidualInjectorConfig)
+        self.assertIsInstance(self._load().injector.ricky, ResidualInjectorConfig)
+
+    def test_one_injector_serves_both_sides(self):
+        """Configs written before injectors were per side name one injector."""
+        config = copy.deepcopy(_CONFIG)
+        config["injector"] = {"type": "residual"}
+
+        loaded = FrankyConfig.load(self._write_config(config))
+
+        self.assertIsInstance(loaded.injector.sandy, ResidualInjectorConfig)
+        self.assertEqual(loaded.injector.sandy, loaded.injector.ricky)
 
     def test_bad_configs_are_refused(self):
         for reason, edit in {
@@ -107,7 +110,8 @@ class TestFrankyConfig(_WithFiles):
             "unknown field `output_sizes`": lambda c: c["encoder"].update(
                 output_sizes=256
             ),
-            "unknown field `scale`": lambda c: c["injector"].update(scale=2),
+            "unknown field `scale`": lambda c: c["injector"]["ricky"].update(scale=2),
+            "missing required field `sandy`": lambda c: c["injector"].pop("sandy"),
             "missing required field `tap_page_size`": lambda c: c.pop("tap_page_size"),
             "3 encoders and 2 readers": lambda c: c["reader"].update(layers=[1, 4]),
             "at `\\$.encoder.layers\\[0\\]`": lambda c: c["encoder"].update(
@@ -178,14 +182,14 @@ class TestHandleFranky(_WithFiles):
             "--enable-layernorm-sp": {"enable_layernorm_sp": True},
             "--enable-two-batch-overlap": {"enable_two_batch_overlap": True},
             "--enable-pdmux": {"enable_pdmux": True},
-            "page size 16": {"page_size": 16},
+            "--attn-cp-size 2": {"attn_cp_size": 2},
             "--enable-unified-memory": {"enable_unified_memory": True},
             "--enable-hisparse": {"enable_hisparse": True},
             "--enable-kv-cache-sharding": {"enable_kv_cache_sharding": True},
             "--dcp-size": {"dcp_size": 2},
-            "hybrid SWA": {"is_hybrid_swa": True},
             "--enable-hierarchical-cache": {"enable_hierarchical_cache": True},
             "--enable-lmcache": {"enable_lmcache": True},
+            "--franky-tap-pool-ratio 0.0": {"franky_tap_pool_ratio": 0.0},
         }.items():
             for side in ("sandy", "ricky"):
                 with self.subTest(reason, side=side):
@@ -200,6 +204,7 @@ class TestHandleFranky(_WithFiles):
                 "disaggregation_transfer_backend": "nixl",
             },
             "encoder layer 12": {"num_hidden_layers": 10},
+            "page size 16": {"page_size": 16},
         }.items():
             with self.subTest(reason):
                 server_args = self._server_args(side="sandy", **fields)
@@ -214,9 +219,12 @@ class TestHandleFranky(_WithFiles):
         wide_taps["encoder"]["output_size"] = 512
         odd_taps = copy.deepcopy(_CONFIG)
         odd_taps["encoder"]["output_size"] = 100
+        large_tap_pages = copy.deepcopy(_CONFIG)
+        large_tap_pages["tap_page_size"] = 256
         for reason, fields in {
             "encoder output_size 512": {"config": wide_taps},
             "encoder output_size 100": {"config": odd_taps},
+            "tap_page_size 256": {"config": large_tap_pages, "page_size": 256},
             "--chunked-prefill-size": {"chunked_prefill_size": -1},
             "--disable-radix-cache": {"disable_radix_cache": True},
             "reader layer 9": {"config": shallow_encoders, "num_hidden_layers": 8},
@@ -231,6 +239,33 @@ class TestHandleFranky(_WithFiles):
                 with self.assertRaisesRegex(ValueError, reason):
                     handle_franky(server_args)
                 handle_franky(self._server_args(side="sandy", **fields))
+
+    def test_an_aligned_reader_takes_taps_wider_than_attention_heads(self):
+        aligned = {
+            "encoder": {"type": "singular_normed", "layers": [4], "output_size": 1024},
+            "reader": {"type": "aligned", "layers": [9], "output_scale": 0.283},
+            "injector": {"sandy": {"type": "residual"}, "ricky": {"type": "residual"}},
+            "tap_page_size": 64,
+        }
+
+        handle_franky(self._server_args(side="ricky", config=aligned))
+
+    def test_a_tap_pool_ratio_sizes_rickys_tap_pool_whatever_its_tokenizer(self):
+        own_tokenizer = copy.deepcopy(_CONFIG)
+        own_tokenizer["shared_tokenizer"] = False
+        for config in (_CONFIG, own_tokenizer):
+            handle_franky(
+                self._server_args(
+                    side="ricky", config=config, franky_tap_pool_ratio=0.1
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "--franky-tap-pool-ratio 0.1"):
+            handle_franky(self._server_args(side="sandy", franky_tap_pool_ratio=0.1))
+
+    def test_kv_pages_may_be_any_multiple_of_the_tap_page(self):
+        for side in ("sandy", "ricky"):
+            with self.subTest(side=side):
+                handle_franky(self._server_args(side=side, page_size=256))
 
     def test_ricky_pd_refusals(self):
         pd = {
@@ -272,20 +307,21 @@ class TestHandleFranky(_WithFiles):
             server_args._resolved_overrides,
         )
 
-    def test_sandy_runs_without_overlap_scheduling(self):
+    def test_sandy_runs_without_overlap_scheduling_or_decode_graphs(self):
         sandy = self._server_args(side="sandy")
         ricky = self._server_args(side="ricky")
 
         handle_franky(sandy)
         handle_franky(ricky)
 
-        self.assertIn(
-            ("handle_franky", {"disable_overlap_schedule": True}),
-            sandy._resolved_overrides,
+        resolved = dict(sandy._resolved_overrides)["handle_franky"]
+        self.assertTrue(resolved["disable_overlap_schedule"])
+        self.assertEqual(resolved["cuda_graph_config"].decode.backend, Backend.DISABLED)
+        self.assertEqual(
+            resolved["cuda_graph_config"].prefill, CudaGraphConfig().prefill
         )
         self.assertNotIn(
-            ("handle_franky", {"disable_overlap_schedule": True}),
-            getattr(ricky, "_resolved_overrides", []),
+            "handle_franky", dict(getattr(ricky, "_resolved_overrides", []))
         )
 
     def test_each_side_picks_its_own_attention_dp_size(self):
@@ -308,12 +344,15 @@ class TestHandleFranky(_WithFiles):
         with self.assertRaisesRegex(ValueError, "LoRA.*--enable-hierarchical-cache"):
             handle_franky(server_args)
 
-    def test_paths_are_required(self):
-        for field in ("franky_config", "franky_weights"):
-            with self.subTest(field):
-                server_args = self._server_args(side="sandy", **{field: None})
-                with self.assertRaisesRegex(ValueError, "--franky-config"):
-                    handle_franky(server_args)
+    def test_the_config_is_required(self):
+        server_args = self._server_args(side="sandy", franky_config=None)
+        with self.assertRaisesRegex(ValueError, "--franky-config"):
+            handle_franky(server_args)
+
+    def test_the_weights_may_come_with_the_first_weight_update(self):
+        for side in ("sandy", "ricky"):
+            with self.subTest(side):
+                handle_franky(self._server_args(side=side, franky_weights=None))
 
     def test_a_solo_server_is_not_checked(self):
         handle_franky(

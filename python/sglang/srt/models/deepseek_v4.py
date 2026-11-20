@@ -56,6 +56,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.franky.parts.franky_mixin import FrankyMixin
+from sglang.srt.franky.parts.injector.hyper_connection.output import (
+    HyperConnectionOutput,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
     Dsv4NpuRoPE,
     prime_rope_cos_sin,
@@ -3563,6 +3567,20 @@ def _gather_late_layer_ids(
     return gathered.squeeze(-1)
 
 
+def _tail_row_indices(tail: LateLayerTail, *, num_tokens: int) -> torch.Tensor:
+    """The extend rows the tail keeps, as indices, in the order of its rows; a
+    padding row points past the extend."""
+    if tail.contiguous_start is not None:
+        indices = torch.arange(
+            tail.contiguous_start, num_tokens, device=tail.positions.device
+        )
+    else:
+        indices = tail.token_indices
+    if tail.pad_rows:
+        indices = torch.cat([indices, indices.new_full((tail.pad_rows,), num_tokens)])
+    return indices
+
+
 def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
 ) -> torch.Tensor:
@@ -3777,7 +3795,9 @@ DeepseekV4DecoderLayer = (
 )
 
 
-class DeepseekV4Model(nn.Module):
+class DeepseekV4Model(FrankyMixin, nn.Module):
+    franky_output_cls = HyperConnectionOutput
+
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
@@ -4073,7 +4093,11 @@ class DeepseekV4Model(nn.Module):
                 in_graph=tail_in_graph,
             )
         use_tail_graph, tail_graph_dp_rows = False, None
-        if self.decoder_replay_tail is not None:
+        # Franky's readers past the tail switch run in this loop, not in the
+        # tail's own graphs.
+        franky_in_tail = self._franky_reads_in_tail()
+        franky_rows = None
+        if self.decoder_replay_tail is not None and not franky_in_tail:
             use_tail_graph, tail_graph_dp_rows = self.decoder_replay_tail.plan(
                 tail,
                 forward_batch=forward_batch,
@@ -4101,6 +4125,7 @@ class DeepseekV4Model(nn.Module):
                     )
                     or layer.engram is not None
                     or (capture_dspark and i in self.dspark_layers_to_capture)
+                    or self._franky_runs_after(i - 1)
                 ):
                     call = hc_boundary.LayerCall(
                         input_ids,
@@ -4114,6 +4139,16 @@ class DeepseekV4Model(nn.Module):
                     hidden_states = state = hc_boundary.materialize(
                         hidden_states, forward_batch, next=next_boundary
                     )
+                if self._franky_runs_after(i - 1):
+                    state = self.franky_after_hyper_connection_layer(
+                        layer_idx=i - 1,
+                        state=state,
+                        forward_batch=forward_batch,
+                        rows=franky_rows,
+                    )
+                    hidden_states = residual_batch.set_written(state, forward_batch)
+            elif self.franky_parts is not None:
+                raise ValueError("Franky runs DeepSeek V4 on CUDA only.")
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
@@ -4142,6 +4177,7 @@ class DeepseekV4Model(nn.Module):
                     saved_full = attn_backend.prefill_graph_late_layer_saved
                     if (
                         self.decoder_replay_tail is not None
+                        and not franky_in_tail
                         and self.decoder_replay_tail.breaks_out_of_prefill_graph(
                             tail, num_tokens=input_ids.shape[0]
                         )
@@ -4168,6 +4204,7 @@ class DeepseekV4Model(nn.Module):
                         return residual, pre, tail
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
+                franky_rows = _tail_row_indices(tail, num_tokens=input_ids.shape[0])
                 state = state.take_rows(tail.rows)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4275,6 +4312,14 @@ class DeepseekV4Model(nn.Module):
                         input_ids_global=input_ids_global,
                     )
         if _is_cuda:
+            if self._franky_runs_after(self.end_layer - 1):
+                state = self.franky_after_hyper_connection_layer(
+                    layer_idx=self.end_layer - 1,
+                    state=hc_boundary.materialize(hidden_states, forward_batch),
+                    forward_batch=forward_batch,
+                    rows=franky_rows,
+                )
+                hidden_states = residual_batch.set_written(state, forward_batch)
             state = residual_batch.read_output(
                 hidden_states, forward_batch, hc_boundary.FinalRead(), None
             )
@@ -4289,6 +4334,13 @@ class DeepseekV4Model(nn.Module):
                 attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail
         return state.residual, state.pre, None
+
+    def _franky_reads_in_tail(self) -> bool:
+        """Whether Franky runs after a layer past the tail switch."""
+        return self.late_layer_start is not None and any(
+            self._franky_runs_after(layer_idx)
+            for layer_idx in range(self.late_layer_start, self.end_layer)
+        )
 
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.

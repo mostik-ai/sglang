@@ -46,10 +46,16 @@ impl ChainEnd {
     pub(super) fn ended_with_last_block(&mut self) {
         self.must_end = false;
     }
-}
 
-impl Drop for ChainEnd {
-    fn drop(&mut self) {
+    /// Ends the chain on the engines it reached now, and goes on as `chain_id`
+    /// on the same engines.
+    pub(super) fn restart(&mut self, chain_id: String) {
+        self.end_on_engines(false);
+        self.chain_id = chain_id;
+        self.must_end = true;
+    }
+
+    fn end_on_engines(&mut self, forget_engines: bool) {
         if !self.must_end || self.engine_urls.is_empty() {
             return;
         }
@@ -60,7 +66,12 @@ impl Drop for ChainEnd {
             );
             return;
         };
-        for url in self.engine_urls.drain(..) {
+        let urls = if forget_engines {
+            std::mem::take(&mut self.engine_urls)
+        } else {
+            self.engine_urls.clone()
+        };
+        for url in urls {
             let mut request = self
                 .client
                 .post(format!("{}{END_CHAIN_PATH}", url.trim_end_matches('/')))
@@ -75,5 +86,11 @@ impl Drop for ChainEnd {
                 }
             });
         }
+    }
+}
+
+impl Drop for ChainEnd {
+    fn drop(&mut self) {
+        self.end_on_engines(true);
     }
 }

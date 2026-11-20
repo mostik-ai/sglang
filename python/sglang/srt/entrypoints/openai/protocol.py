@@ -359,6 +359,10 @@ class PDRoutingFields(BaseModel):
     disagg_prefill_dp_rank: Optional[int] = None
     # For Franky -- where the request's taps meet, as GenerateReqInput.franky_room
     franky_room: Optional[Dict[str, Any]] = None
+    franky_generated_spans: Optional[List[List[int]]] = None
+    franky_sandy_input_ids: Optional[List[int]] = None
+    franky_sandy_spans: Optional[List[List[int]]] = None
+    franky_sandy_block_starts: Optional[List[List[int]]] = None
 
     def pd_routing_kwargs(self) -> Dict[str, Any]:
         return {name: getattr(self, name) for name in PDRoutingFields.model_fields}

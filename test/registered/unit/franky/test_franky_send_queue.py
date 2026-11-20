@@ -14,9 +14,11 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.franky.cache.tap_cache import FrankyTapCache
+from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
+from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
+from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.franky.schedulers.sandy_batch_result_processor import (
     SandyBatchResultProcessor,
 )
@@ -86,10 +88,21 @@ class _PPStore(dict):
         return [self.get(key), self.other_stages.get(key)]
 
 
+def _sandy_cache(*, page_size=_PAGE_SIZE, num_ranks=1, rank=0) -> SandyTapCache:
+    return SandyTapCache.build(
+        encoder_ids=(0,),
+        output_size=2,
+        page_size=page_size,
+        num_kv_slots=32 + _PAGE_SIZE,
+        stripes=TapStripes(num_ranks=num_ranks, rank=rank),
+        device="cpu",
+    )
+
+
 def _req(rid="r", prompt_len=10, chain=None):
     return SimpleNamespace(
         rid=rid,
-        franky_chain=chain,
+        franky=None if chain is None else FrankyRequest(chain=chain),
         last_node=f"node-{rid}",
         origin_input_ids=list(range(prompt_len)),
         extend_end=0,
@@ -99,6 +112,7 @@ def _req(rid="r", prompt_len=10, chain=None):
         finished_reason=None,
         cache_request_handle=f"handle-{rid}",
         return_logprob=False,
+        return_routed_experts=False,
     )
 
 
@@ -140,14 +154,7 @@ class _Queue(CustomTestCase):
         release.start()
         self.addCleanup(release.stop)
         self.queue = FrankySendQueue(
-            tap_cache=FrankyTapCache(
-                encoder_ids=(0,),
-                output_size=2,
-                page_size=_PAGE_SIZE,
-                num_tokens=32,
-                req_to_token=req_to_token,
-                device="cpu",
-            ),
+            tap_cache=_sandy_cache(),
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             tree_cache=self.tree,
             output_streamer=SimpleNamespace(
@@ -159,9 +166,7 @@ class _Queue(CustomTestCase):
                 pp_store=self.store,
             ),
             chain_holds=FrankyChainHolds(
-                tree_cache=self.lock_tree,
-                max_held_tokens=1000,
-                hold_seconds=60,
+                tree_cache=self.lock_tree, tap_cache=None, hold_seconds=60
             ),
             page_size=_PAGE_SIZE,
             open_room=lambda req: self.sender,
@@ -246,6 +251,37 @@ class TestLanding(_Queue):
         self._step()
 
         self.assertEqual(self.sender.landed, [_pages(0, 8), _pages(8, 10)])
+
+
+class TestLandingInTapPages(_Queue):
+    def test_a_kv_page_lands_as_its_tap_pages(self):
+        """With tap pages smaller than Sandy's KV pages, each KV page lands as the
+        tap pages it holds, in prompt order."""
+        self.queue._tap_cache = _sandy_cache(page_size=_PAGE_SIZE // 2)
+        req = _req()
+        self.queue.add(req=req)
+        req.prefix_len = 10
+
+        self.queue.after_chunk(req=req, end=10, last=True)
+
+        self.assertEqual(self.sender.landed, [[10, 11, 4, 5, 14]])
+
+
+class TestLandingStripedTaps(_Queue):
+    def test_each_rank_lands_every_page_marking_the_pages_other_ranks_keep(self):
+        landed = []
+        for rank in range(2):
+            self.sender.landed = []
+            self.queue._tap_cache = _sandy_cache(num_ranks=2, rank=rank)
+            req = _req(rid=f"r{rank}")
+            self.queue.add(req=req)
+            req.prefix_len = 10
+
+            self.queue.after_chunk(req=req, end=10, last=True)
+
+            landed.append(self.sender.landed)
+
+        self.assertEqual(landed, [[[-1, 1, -1]], [[2, -1, 3]]])
 
 
 class TestRelease(_Queue):
@@ -461,7 +497,10 @@ class TestSandyBatchResultProcessor(_Queue):
         )
         batch.prefill_stats = None
         result = SimpleNamespace(
-            copy_done=None, next_token_ids=torch.zeros(2), can_run_cuda_graph=False
+            copy_done=None,
+            routed_experts_output=None,
+            next_token_ids=torch.zeros(2),
+            can_run_cuda_graph=False,
         )
 
         self.processor.process_batch_result_prefill(batch, result)
@@ -475,6 +514,41 @@ class TestSandyBatchResultProcessor(_Queue):
         self.assertEqual(self.released, [])
         self.assertEqual(self.streamed, [])
         self.assertFalse(self.queue.is_empty())
+
+    def test_a_finished_prefill_returns_the_experts_of_every_token_it_read(self):
+        topk_calls = []
+        capturer = SimpleNamespace(
+            has_host_cache=True,
+            get_topk=lambda **kwargs: topk_calls.append(kwargs) or "rows",
+        )
+        with_capturer = patch(
+            "sglang.srt.franky.schedulers.sandy_batch_result_processor."
+            "get_global_experts_capturer",
+            return_value=capturer,
+        )
+        with_capturer.start()
+        self.addCleanup(with_capturer.stop)
+        self.queue._open_room = lambda req: _Sender()
+        req = self._req("last", inflight_middle_chunks=0)
+        req.return_routed_experts = True
+        req.routed_experts_start_len = 3
+        req.extend_end = 10
+        self.queue.add(req=req)
+        batch = SimpleNamespace(reqs=[req], prefix_lens=[0], extend_lens=[10])
+        batch.prefill_stats = None
+        result = SimpleNamespace(
+            copy_done=None,
+            routed_experts_output=None,
+            next_token_ids=torch.zeros(1),
+            can_run_cuda_graph=False,
+        )
+
+        self.processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(req.routed_experts, "rows")
+        # get_topk reads tokens [start_len, seqlen - 1): all 10 of them from 3.
+        self.assertEqual(topk_calls[0]["seqlen"], 11)
+        self.assertEqual(topk_calls[0]["start_len"], 3)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::response::Response;
-use axum::routing::{get, post, MethodRouter};
+use axum::routing::{delete, get, post, MethodRouter};
 use axum::Router;
 use std::sync::{Arc, OnceLock};
 use tower_http::catch_panic::CatchPanicLayer;
@@ -258,6 +258,15 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
+        )
+        .route(
+            "/workers",
+            get(crate::server::routes::workers::list_workers)
+                .post(crate::server::routes::workers::add_worker),
+        )
+        .route(
+            "/workers/{id}",
+            delete(crate::server::routes::workers::remove_worker),
         )
         .route(
             crate::state::kv_events::bootstrap::SNAPSHOT_PATH,

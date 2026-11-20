@@ -15,6 +15,8 @@ use crate::state::kv_events::{
 };
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
+use crate::tokenizer::chat_template_adapter::ChatTemplateAdapter;
+use crate::tokenizer::franky_sandy::FrankySandyTokens;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::{DecodeGate, WorkerRegistry};
 use std::collections::HashMap;
@@ -61,6 +63,12 @@ pub struct AppContext {
     pub chat_routing: ChatRouting,
     /// Where a Franky Ricky's Sandy is picked from, under either routing.
     pub sandy: Option<EngineGroup>,
+    /// Finds the earlier answers in the chats the router renders for Franky
+    /// workers; `None` without `--franky-chat-adapter`.
+    pub franky_chat_adapter: Option<Arc<dyn ChatTemplateAdapter>>,
+    /// Renders the chats of Franky workers for a Sandy that tokenizes on its
+    /// own; `None` without `--franky-sandy-tokenizer-path`.
+    pub franky_sandy: Option<Arc<FrankySandyTokens>>,
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub router_inflight_load: Arc<RouterInflightLoadRegistry>,
@@ -89,6 +97,9 @@ pub struct AppContext {
     /// The local KV-event index; `None` in metadata-only mode, which makes
     /// `/internal/kv_snapshot` a 404. See [`KvEventIndex::snapshot_source`].
     pub kv_index: Option<Arc<KvEventIndex>>,
+    /// Where `/workers` sends the workers it adds and removes; `None` without
+    /// `--worker-api`.
+    pub worker_api_events: Option<tokio::sync::mpsc::Sender<crate::discovery::DiscoveryEvent>>,
     readiness: AtomicU8,
 }
 
@@ -142,6 +153,8 @@ impl AppContext {
             bucket_selector,
             chat_routing: ChatRouting::Legacy,
             sandy: None,
+            franky_chat_adapter: None,
+            franky_sandy: None,
             router_inflight_load,
             decode_gate,
             metrics,
@@ -153,6 +166,7 @@ impl AppContext {
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
+            worker_api_events: None,
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
     }
@@ -251,6 +265,8 @@ impl AppContext {
             bucket_selector: Arc::new(BucketSelector::new(None)),
             chat_routing: ChatRouting::Legacy,
             sandy: None,
+            franky_chat_adapter: None,
+            franky_sandy: None,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
             decode_gate: DecodeGate::new(None),
             metrics: MetricsRegistry::new(),
@@ -262,6 +278,7 @@ impl AppContext {
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
+            worker_api_events: None,
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
     }

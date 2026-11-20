@@ -6,7 +6,7 @@
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
 use reqwest::header::HeaderValue;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
 use crate::config::types::{is_selector_empty, resolve_sandy_selector};
@@ -14,10 +14,11 @@ use crate::config::{
     default_cb_cool_down, default_cb_threshold, default_host, default_port,
     default_proxy_request_timeout_secs, default_shutdown_drain_secs,
     default_stale_request_timeout_secs, resolve_mode, AffinityConfig, AffinityMode, BalancedBy,
-    CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig, Config,
-    DecodePolicyKind, DiscoveryBackend, DpRankPolicy, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
-    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, ChatTemplateAdapterKind,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, DpRankPolicy,
+    EligibilityConfig, FilterKind, FrankySandyConfig, FusedTerm, InflightLoadConfig,
+    K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
     DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
@@ -179,6 +180,60 @@ pub struct ServerArgs {
     /// sequence; unset runs each request in one block.
     #[arg(long)]
     pub franky_block_size: Option<NonZeroU32>,
+    /// Franky: a token id that also ends a block wherever Ricky writes it, such
+    /// as the close of his thinking, unless the client stops on it; the next
+    /// block starts a new answer, whose tokens read the taps of every token
+    /// before it. Needs --franky-block-size.
+    #[arg(long)]
+    pub franky_boundary_token_id: Option<u32>,
+    /// Franky: the served model's chat template, so the router marks the answers
+    /// Ricky generated in a chat's earlier turns (franky_generated_spans) in the
+    /// chats it renders. Without it, a Franky chat with earlier assistant
+    /// messages must send input_ids with its own franky_generated_spans.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "TEMPLATE",
+        conflicts_with = "no_tokenizer"
+    )]
+    pub franky_chat_adapter: Option<ChatTemplateAdapterKind>,
+    /// Franky: pick each request's Sandy among the Sandy engines on the host of
+    /// the Ricky engine that answers it (its prefill engine under PD), for
+    /// engines whose taps cannot cross hosts, as when the transfer library has
+    /// no transport between them. A request whose host has no Sandy gets 503
+    /// no_sandy_workers_available.
+    #[arg(long)]
+    pub franky_same_host_sandy: bool,
+    /// Franky with a Sandy that tokenizes on its own: Sandy's model files or
+    /// HuggingFace repo id, for its tokenizer and chat template. The router then
+    /// renders each Franky chat for both models, sends Sandy its own input_ids,
+    /// and gives Ricky Sandy's input length and answer runs.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "franky_chat_adapter",
+        requires = "franky_sandy_chat_adapter"
+    )]
+    pub franky_sandy_tokenizer_path: Option<String>,
+    /// Franky: Sandy's chat template, as --franky-chat-adapter names the served
+    /// model's.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "TEMPLATE",
+        requires = "franky_sandy_tokenizer_path"
+    )]
+    pub franky_sandy_chat_adapter: Option<ChatTemplateAdapterKind>,
+    /// Franky: Sandy reads the earlier answers of each chat the router renders
+    /// for it whole and, outside them, only every Kth token of its rendering,
+    /// counted from the start; 1 reads every token.
+    #[arg(
+        long,
+        value_name = "K",
+        default_value_t = NonZeroUsize::MIN,
+        requires = "franky_sandy_tokenizer_path"
+    )]
+    pub franky_sandy_keep_every: NonZeroUsize,
 
     /// PD: at most N requests per prefill DP rank go to decode before their
     /// first token; the rest wait and get their decode DP rank when sent.
@@ -207,6 +262,12 @@ pub struct DiscoveryArgs {
     /// Static worker URLs, space-separated or repeated. Conflicts with --service-discovery.
     #[arg(long, num_args = 1..)]
     pub worker_urls: Vec<String>,
+
+    /// Let clients add and remove workers over POST /workers, GET /workers and
+    /// DELETE /workers/{id}, as Miles registers its engines; the router may then
+    /// start without --worker-urls. Conflicts with --service-discovery.
+    #[arg(long)]
+    pub worker_api: bool,
 
     /// Enable Kubernetes EndpointSlice discovery.
     #[arg(long)]
@@ -701,6 +762,19 @@ impl Cli {
                 decode_dispatch_limit: self.server.decode_dispatch_limit,
                 stream_after_prefill: self.server.pd_stream_after_prefill,
                 franky_block_size: self.server.franky_block_size,
+                franky_boundary_token_id: self.server.franky_boundary_token_id,
+                franky_chat_adapter: self.server.franky_chat_adapter,
+                franky_same_host_sandy: self.server.franky_same_host_sandy,
+                franky_sandy: self
+                    .server
+                    .franky_sandy_tokenizer_path
+                    .clone()
+                    .zip(self.server.franky_sandy_chat_adapter)
+                    .map(|(tokenizer_path, chat_adapter)| FrankySandyConfig {
+                        tokenizer_path,
+                        chat_adapter,
+                        keep_every: self.server.franky_sandy_keep_every,
+                    }),
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -716,17 +790,18 @@ impl Cli {
 
 impl DiscoveryArgs {
     fn into_config(self) -> Result<DiscoveryBackend> {
-        let has_static = !self.worker_urls.is_empty();
-        let backend = match (has_static, self.service_discovery) {
+        let static_urls_backend = !self.worker_urls.is_empty() || self.worker_api;
+        let backend = match (static_urls_backend, self.service_discovery) {
             (true, true) => {
                 return Err(anyhow!(
-                    "--worker-urls and --service-discovery are mutually exclusive; pass exactly one"
+                    "--worker-urls and --worker-api are mutually exclusive with \
+                     --service-discovery; pass exactly one backend"
                 ));
             }
             (false, false) => {
                 return Err(anyhow!(
-                    "no discovery backend selected; pass --worker-urls <URL...> (static) \
-                     or --service-discovery (kubernetes)"
+                    "no discovery backend selected; pass --worker-urls <URL...> (static), \
+                     --worker-api (workers added at run time) or --service-discovery (kubernetes)"
                 ));
             }
             (true, false) => {
@@ -749,9 +824,14 @@ impl DiscoveryArgs {
                     "--kv-peer-selector requires --service-discovery (peer replicas are \
                      found via Kubernetes EndpointSlices)"
                 );
-                DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                let urls = StaticUrlsDiscoveryConfig {
                     urls: self.worker_urls,
-                })
+                };
+                if self.worker_api {
+                    DiscoveryBackend::WorkerApi(urls)
+                } else {
+                    DiscoveryBackend::StaticUrls(urls)
+                }
             }
             (false, true) => {
                 let mode = resolve_mode(
@@ -1495,6 +1575,117 @@ mod tests {
         assert_eq!(c.server.shutdown_drain_secs, 30);
     }
 
+    #[test]
+    fn franky_chat_adapter_reaches_the_proxy_config() {
+        let base = with_model(&["--worker-urls", "http://10.0.0.1:30000"]);
+        let adapter = ["--franky-chat-adapter".to_owned(), "qwen3.5".to_owned()];
+
+        let with_adapter = into_config_owned([base.clone(), adapter.to_vec()].concat()).unwrap();
+        let without = into_config_owned(base).unwrap();
+
+        assert_eq!(
+            with_adapter.proxy.franky_chat_adapter,
+            Some(ChatTemplateAdapterKind::Qwen35)
+        );
+        assert_eq!(without.proxy.franky_chat_adapter, None);
+    }
+
+    #[test]
+    fn franky_sandy_tokenizer_reaches_the_proxy_config() {
+        let base = with_model(&["--worker-urls", "http://10.0.0.1:30000"]);
+        let sandy = [
+            "--franky-chat-adapter",
+            "deepseek-v4",
+            "--franky-sandy-tokenizer-path",
+            "/models/kimi-k3",
+            "--franky-sandy-chat-adapter",
+            "kimi-k3",
+        ]
+        .map(str::to_owned);
+
+        let config = into_config_owned([base, sandy.to_vec()].concat()).unwrap();
+
+        assert_eq!(
+            config.proxy.franky_chat_adapter,
+            Some(ChatTemplateAdapterKind::DeepseekV4)
+        );
+        assert_eq!(
+            config.proxy.franky_sandy,
+            Some(FrankySandyConfig {
+                tokenizer_path: "/models/kimi-k3".into(),
+                chat_adapter: ChatTemplateAdapterKind::KimiK3,
+                keep_every: NonZeroUsize::MIN,
+            })
+        );
+    }
+
+    #[test]
+    fn franky_sandy_keep_every_reaches_the_proxy_config_with_sandys_tokenizer() {
+        let base = with_model(&["--worker-urls", "http://10.0.0.1:30000"]);
+        let keep_every = ["--franky-sandy-keep-every", "4"].map(str::to_owned);
+        let sandy = [
+            "--franky-chat-adapter",
+            "deepseek-v4",
+            "--franky-sandy-tokenizer-path",
+            "/models/kimi-k3",
+            "--franky-sandy-chat-adapter",
+            "kimi-k3",
+        ]
+        .map(str::to_owned);
+
+        let with_sandy = [base.clone(), sandy.to_vec(), keep_every.to_vec()].concat();
+        let without_sandy = [base, keep_every.to_vec()].concat();
+
+        let config = into_config_owned(with_sandy).unwrap();
+
+        assert_eq!(config.proxy.franky_sandy.unwrap().keep_every.get(), 4);
+        assert!(into_config_owned(without_sandy).is_err());
+    }
+
+    #[test]
+    fn franky_sandy_tokenizer_needs_both_chat_adapters() {
+        let base = with_model(&["--worker-urls", "http://10.0.0.1:30000"]);
+        for extra in [
+            vec![
+                "--franky-sandy-tokenizer-path",
+                "/k3",
+                "--franky-sandy-chat-adapter",
+                "kimi-k3",
+            ],
+            vec![
+                "--franky-sandy-tokenizer-path",
+                "/k3",
+                "--franky-chat-adapter",
+                "deepseek-v4",
+            ],
+            vec!["--franky-sandy-chat-adapter", "kimi-k3"],
+        ] {
+            let args = [
+                base.clone(),
+                extra.iter().map(|arg| arg.to_string()).collect(),
+            ]
+            .concat();
+
+            assert!(into_config_owned(args).is_err(), "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn franky_chat_adapter_needs_the_tokenizer() {
+        let error = into_config(&[
+            "--model-id",
+            "qwen3-0.6b",
+            "--no-tokenizer",
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--franky-chat-adapter",
+            "qwen3.5",
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--no-tokenizer"), "{error}");
+    }
+
     /// Several values, not just the default: a clamp or a rescale in the
     /// mapping satisfies any single-value assertion.
     #[test]
@@ -1634,6 +1825,31 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn the_worker_api_takes_workers_with_or_without_static_urls() {
+        for (urls, expected) in [
+            (vec![], vec![]),
+            (
+                vec!["--worker-urls", "http://x:30000"],
+                vec!["http://x:30000".to_owned()],
+            ),
+        ] {
+            let args = [urls, vec!["--worker-api"]].concat();
+            match into_config_owned(with_model(&args)).unwrap().discovery {
+                DiscoveryBackend::WorkerApi(s) => assert_eq!(s.urls, expected),
+                other => panic!("expected the worker API backend, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_the_worker_api_with_service_discovery() {
+        let err = into_config_owned(with_model(&["--worker-api", "--service-discovery"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--worker-api"), "got: {err}");
     }
 
     #[test]

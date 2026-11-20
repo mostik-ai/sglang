@@ -7,7 +7,7 @@
 use crate::common::mock_worker::MockWorker;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Json;
@@ -82,7 +82,7 @@ fn franky_ctx(
     max_attempts: u32,
     reorg: bool,
 ) -> Arc<AppContext> {
-    franky_ctx_with_blocks(ricky, sandy, max_attempts, reorg, None)
+    franky_ctx_with_blocks(ricky, sandy, max_attempts, reorg, None, None)
 }
 
 fn franky_ctx_with_blocks(
@@ -91,13 +91,26 @@ fn franky_ctx_with_blocks(
     max_attempts: u32,
     reorg: bool,
     franky_block_size: Option<u32>,
+    franky_boundary_token_id: Option<u32>,
 ) -> Arc<AppContext> {
     let policy = if reorg {
         PolicyKind::PowerOfTwo
     } else {
         PolicyKind::RoundRobin
     };
-    let cfg = config(max_attempts, policy, franky_block_size);
+    let mut cfg = config(max_attempts, policy, franky_block_size);
+    cfg.proxy.franky_boundary_token_id = franky_boundary_token_id;
+    franky_ctx_from(cfg, ricky, sandy, reorg)
+}
+
+/// A router built from `cfg` over Ricky workers that read taps and over Sandy
+/// workers.
+fn franky_ctx_from(
+    cfg: Config,
+    ricky: &[(&str, &str, WorkerMode)],
+    sandy: &[(&str, &str)],
+    reorg: bool,
+) -> Arc<AppContext> {
     let registry = Arc::new(WorkerRegistry::default());
     for (id, url, mode) in ricky {
         let spec = WorkerSpec {
@@ -150,6 +163,15 @@ fn chat() -> Request<Body> {
             json!({"model": "tiny", "messages": [{"role": "user", "content": "hi"}]}).to_string(),
         ))
         .unwrap()
+}
+
+fn with_request_id(mut request: Request<Body>, request_id: Option<&str>) -> Request<Body> {
+    if let Some(request_id) = request_id {
+        request
+            .headers_mut()
+            .insert("x-request-id", request_id.parse().unwrap());
+    }
+    request
 }
 
 fn without(mut body: Value, fields: &[&str]) -> Value {
@@ -237,6 +259,43 @@ async fn pd_legs_and_their_sandy_share_one_room() {
     }
 }
 
+/// The client's `x-request-id` reaches the Sandy and both PD legs, so each
+/// engine's record names the client's request; without one, none is sent.
+#[tokio::test]
+async fn every_leg_carries_the_clients_request_id() {
+    for request_id in [Some("client-7"), None] {
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let sandy = MockWorker::start(vec![]).await;
+        let ctx = franky_ctx(
+            &[
+                ("p", &prefill.url, WorkerMode::Prefill),
+                ("d", &decode.url, WorkerMode::Decode),
+            ],
+            &[("s", &sandy.url)],
+            1,
+            true,
+        );
+
+        let res = build_router(ctx)
+            .oneshot(with_request_id(chat(), request_id))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        for worker in [&prefill, &decode, &sandy] {
+            worker.captured_json().await;
+            let captured = worker.captured.lock().unwrap();
+            assert_eq!(
+                captured.headers.get("x-request-id").map(String::as_str),
+                request_id,
+                "{}",
+                worker.url
+            );
+        }
+    }
+}
+
 /// A Ricky that reads taps never runs without them: with no Sandy the request
 /// is refused before any worker sees it.
 #[tokio::test]
@@ -254,6 +313,77 @@ async fn a_ricky_that_reads_taps_needs_a_sandy() {
             res.headers().get("x-router-error-code").unwrap(),
             "no_sandy_workers_available"
         );
+        assert!(ricky.captured.lock().unwrap().last_body.is_none());
+    }
+}
+
+/// A router that pairs each Ricky with a Sandy on his own host
+/// (--franky-same-host-sandy), one attempt a request.
+fn same_host_ctx(
+    ricky: &[(&str, &str, WorkerMode)],
+    sandy: &[(&str, &str)],
+    reorg: bool,
+) -> Arc<AppContext> {
+    let policy = if reorg {
+        PolicyKind::PowerOfTwo
+    } else {
+        PolicyKind::RoundRobin
+    };
+    let mut cfg = config(1, policy, None);
+    cfg.proxy.franky_same_host_sandy = true;
+    franky_ctx_from(cfg, ricky, sandy, reorg)
+}
+
+/// A Ricky takes his taps only from the Sandy on his own host, though the
+/// policy alone would also hand him the Sandy on the other host (round-robin
+/// alternates between the two): taps that cross hosts would never arrive.
+#[tokio::test]
+async fn a_ricky_takes_taps_only_from_a_sandy_on_his_host() {
+    for reorg in [false, true] {
+        let ricky = MockWorker::start_at("127.0.0.1", vec![]).await;
+        let near = MockWorker::start_at("127.0.0.1", vec![]).await;
+        let far = MockWorker::start_at("127.0.0.2", vec![]).await;
+        let ctx = same_host_ctx(
+            &[("r", &ricky.url, WorkerMode::Plain)],
+            &[("near", &near.url), ("far", &far.url)],
+            reorg,
+        );
+        let router = build_router(ctx);
+        for _ in 0..8 {
+            let res = router.clone().oneshot(chat()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "reorg={reorg}");
+            let room = &ricky.captured_json().await["franky_room"];
+            assert_eq!(room["bootstrap_host"], json!("127.0.0.1"), "reorg={reorg}");
+        }
+        assert!(
+            far.captured.lock().unwrap().last_body.is_none(),
+            "reorg={reorg}"
+        );
+    }
+}
+
+/// A Ricky whose host has no Sandy is refused rather than paired across hosts.
+#[tokio::test]
+async fn a_ricky_without_a_sandy_on_his_host_is_refused() {
+    for reorg in [false, true] {
+        let ricky = MockWorker::start_at("127.0.0.1", vec![]).await;
+        let far = MockWorker::start_at("127.0.0.2", vec![]).await;
+        let ctx = same_host_ctx(
+            &[("r", &ricky.url, WorkerMode::Plain)],
+            &[("far", &far.url)],
+            reorg,
+        );
+        let res = build_router(ctx).oneshot(chat()).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reorg={reorg}"
+        );
+        assert_eq!(
+            res.headers().get("x-router-error-code").unwrap(),
+            "no_sandy_workers_available"
+        );
+        assert!(far.captured.lock().unwrap().last_body.is_none());
         assert!(ricky.captured.lock().unwrap().last_body.is_none());
     }
 }
@@ -298,18 +428,35 @@ async fn a_failed_sandy_is_blamed_and_not_retried() {
 #[derive(Clone, Default)]
 struct BlockEngine {
     stop_at: usize,
+    /// Answers as Sandy does: its routed experts cover every input token.
+    prefill_only: bool,
     prompt_len: Arc<Mutex<Option<usize>>>,
     requests: Arc<Mutex<Vec<Value>>>,
+    request_ids: Arc<Mutex<Vec<Option<String>>>>,
+    request_came: Arc<tokio::sync::Notify>,
     chain_ends: Arc<Mutex<Vec<Value>>>,
     chain_ended: Arc<tokio::sync::Notify>,
 }
 
 impl BlockEngine {
     async fn start(stop_at: usize) -> (Self, String, Shutdown) {
-        let engine = Self {
+        Self::serve(Self {
             stop_at,
             ..Default::default()
-        };
+        })
+        .await
+    }
+
+    async fn start_sandy() -> (Self, String, Shutdown) {
+        Self::serve(Self {
+            stop_at: usize::MAX,
+            prefill_only: true,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn serve(engine: Self) -> (Self, String, Shutdown) {
         let app = axum::Router::new()
             .route("/generate", post(Self::generate))
             .route("/franky/end_chain", post(Self::end_chain))
@@ -328,8 +475,17 @@ impl BlockEngine {
         (engine, url, shutdown)
     }
 
-    async fn generate(State(engine): State<Self>, Json(request): Json<Value>) -> Response {
+    async fn generate(
+        State(engine): State<Self>,
+        headers: HeaderMap,
+        Json(request): Json<Value>,
+    ) -> Response {
         engine.requests.lock().unwrap().push(request.clone());
+        let request_id = headers
+            .get("x-request-id")
+            .map(|id| id.to_str().unwrap().to_owned());
+        engine.request_ids.lock().unwrap().push(request_id);
+        engine.request_came.notify_one();
         let input = request["input_ids"].as_array().unwrap().len();
         let prompt = *engine.prompt_len.lock().unwrap().get_or_insert(input);
         let generated = input - prompt;
@@ -337,14 +493,29 @@ impl BlockEngine {
             .as_u64()
             .unwrap() as usize;
         let count = max_new_tokens.min(engine.stop_at.saturating_sub(generated));
-        let ids: Vec<usize> = (input..input + count).collect();
-        let finish = if generated + count >= engine.stop_at {
+        let mut ids: Vec<usize> = (input..input + count).collect();
+        let mut finish = if generated + count >= engine.stop_at {
             json!({"type": "stop", "matched": 0})
         } else {
             json!({"type": "length", "length": count})
         };
+        let stops = request["sampling_params"]["stop_token_ids"].as_array();
+        let stopped = stops.and_then(|stops| ids.iter().position(|&id| stops.contains(&json!(id))));
+        if let Some(position) = stopped {
+            ids.truncate(position + 1);
+            finish = json!({"type": "stop", "matched": ids[position]});
+        }
+        let routed_experts = (request["return_routed_experts"] == json!(true)).then(|| {
+            let start = request["routed_experts_start_len"].as_u64().unwrap_or(0) as usize;
+            let end = if engine.prefill_only {
+                input
+            } else {
+                input + ids.len() - 1
+            };
+            position_rows(start..end)
+        });
         let frame = |ids: &[usize], finish: Value| {
-            json!({
+            let mut frame = json!({
                 "text": ids.iter().map(|id| format!("<{id}>")).collect::<String>(),
                 "output_ids": ids,
                 "meta_info": {
@@ -353,7 +524,11 @@ impl BlockEngine {
                     "completion_tokens": ids.len(),
                     "finish_reason": finish,
                 },
-            })
+            });
+            if let (Some(rows), false) = (&routed_experts, finish.is_null()) {
+                frame["meta_info"]["routed_experts"] = json!(rows);
+            }
+            frame
         };
         if request["stream"] != json!(true) {
             return Json(frame(&ids, finish)).into_response();
@@ -386,12 +561,47 @@ impl BlockEngine {
         self.chain_ends.lock().unwrap().clone()
     }
 
+    /// The `x-request-id` of each request, once `count` requests came: a
+    /// Sandy's leg may still be on its way when the chain answers.
+    async fn wait_for_request_ids(&self, count: usize) -> Vec<Option<String>> {
+        let came = async {
+            while self.request_ids.lock().unwrap().len() < count {
+                self.request_came.notified().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), came)
+            .await
+            .expect("the engine got too few requests within 5 seconds");
+        self.request_ids.lock().unwrap().clone()
+    }
+
     async fn wait_for_chain_end(&self) -> Vec<Value> {
         tokio::time::timeout(Duration::from_secs(5), self.chain_ended.notified())
             .await
             .expect("the engine got no chain end within 5 seconds");
         self.chain_ends()
     }
+}
+
+/// One int32 row per position, the position itself, as SGLang encodes routed
+/// experts.
+fn position_rows(positions: std::ops::Range<usize>) -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = positions
+        .flat_map(|position| (position as i32).to_le_bytes())
+        .collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn rows_of(encoded: &Value) -> Vec<i32> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_str().unwrap())
+        .unwrap();
+    bytes
+        .chunks(4)
+        .map(|row| i32::from_le_bytes(row.try_into().unwrap()))
+        .collect()
 }
 
 fn generate(body: Value) -> Request<Body> {
@@ -405,6 +615,24 @@ type Shutdown = tokio::sync::oneshot::Sender<()>;
 
 async fn blocks_router(stop_at: usize) -> (Arc<AppContext>, [BlockEngine; 2], [Shutdown; 2]) {
     let (ricky, ricky_url, ricky_stop) = BlockEngine::start(stop_at).await;
+    let (sandy, sandy_url, sandy_stop) = BlockEngine::start_sandy().await;
+    let ctx = franky_ctx_with_blocks(
+        &[("r", &ricky_url, WorkerMode::Plain)],
+        &[("s", &sandy_url)],
+        1,
+        false,
+        Some(4),
+        None,
+    );
+    (ctx, [ricky, sandy], [ricky_stop, sandy_stop])
+}
+
+/// A router running blocks of 4 that also end at `boundary`.
+async fn boundary_router(
+    stop_at: usize,
+    boundary: u32,
+) -> (Arc<AppContext>, [BlockEngine; 2], [Shutdown; 2]) {
+    let (ricky, ricky_url, ricky_stop) = BlockEngine::start(stop_at).await;
     let (sandy, sandy_url, sandy_stop) = BlockEngine::start(usize::MAX).await;
     let ctx = franky_ctx_with_blocks(
         &[("r", &ricky_url, WorkerMode::Plain)],
@@ -412,8 +640,18 @@ async fn blocks_router(stop_at: usize) -> (Arc<AppContext>, [BlockEngine; 2], [S
         1,
         false,
         Some(4),
+        Some(boundary),
     );
     (ctx, [ricky, sandy], [ricky_stop, sandy_stop])
+}
+
+async fn answer_of(res: Response) -> Value {
+    serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -460,6 +698,24 @@ async fn blocks_run_until_ricky_stops_and_answer_once() {
             engine.wait_for_chain_end().await,
             [json!({"chain_id": chain})]
         );
+    }
+}
+
+#[tokio::test]
+async fn every_block_carries_the_clients_request_id() {
+    for request_id in [Some("client-7"), None] {
+        let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+        let body = json!({"input_ids": [1, 2, 3], "sampling_params": {"max_new_tokens": 100}});
+
+        let res = build_router(ctx)
+            .oneshot(with_request_id(generate(body), request_id))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let expected = vec![request_id.map(str::to_owned); 3];
+        assert_eq!(ricky.wait_for_request_ids(3).await, expected);
+        assert_eq!(sandy.wait_for_request_ids(3).await, expected);
     }
 }
 
@@ -531,6 +787,7 @@ async fn requests_blocks_cannot_serve_are_refused() {
         json!({"input_ids": [1, 2], "sampling_params": {"max_new_tokens": 8, "n": 2}}),
         json!({"input_ids": [1, 2], "sampling_params": {"max_new_tokens": 8, "regex": "a+"}}),
         json!({"input_ids": [1, 2], "return_hidden_states": true}),
+        json!({"input_ids": [1, 2], "session_params": {"id": "s"}}),
     ] {
         let res = build_router(Arc::clone(&ctx))
             .oneshot(generate(body.clone()))
@@ -543,5 +800,493 @@ async fn requests_blocks_cannot_serve_are_refused() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(ricky.requests().is_empty());
+}
+
+/// Each block asks Ricky for the experts of its own tokens and Sandy for those
+/// of the tokens she has not prefilled, and the response joins them: Ricky's
+/// from his prompt's first token to his answer's last forward, Sandy's over
+/// every token she prefilled.
+#[tokio::test]
+async fn a_chain_joins_each_blocks_routed_experts_on_both_sides() {
+    let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "return_routed_experts": true,
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = answer_of(res).await;
+    assert_eq!(answer["output_ids"].as_array().unwrap().len(), 10);
+    let starts = |engine: &BlockEngine| -> Vec<Value> {
+        engine
+            .requests()
+            .iter()
+            .map(|request| request["routed_experts_start_len"].clone())
+            .collect()
+    };
+    assert_eq!(starts(&ricky), [Value::Null, json!(6), json!(10)]);
+    assert_eq!(starts(&sandy), [Value::Null, json!(3), json!(7)]);
+    assert_eq!(
+        rows_of(&answer["meta_info"]["routed_experts"]),
+        (0..12).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rows_of(&answer["meta_info"]["franky_sandy_routed_experts"]),
+        (0..11).collect::<Vec<_>>()
+    );
+}
+
+/// A router running blocks of 4 for a Sandy that tokenizes on her own, Kimi
+/// K3's; Ricky's tokens are the tiny byte-level tokenizer's.
+async fn own_tokenizer_router(
+    stop_at: usize,
+) -> (
+    Arc<AppContext>,
+    [BlockEngine; 2],
+    [Shutdown; 2],
+    tempfile::TempDir,
+) {
+    let (ricky, ricky_url, ricky_stop) = BlockEngine::start(stop_at).await;
+    let (sandy, sandy_url, sandy_stop) = BlockEngine::start_sandy().await;
+    let mut ctx = Arc::into_inner(franky_ctx_with_blocks(
+        &[("r", &ricky_url, WorkerMode::Plain)],
+        &[("s", &sandy_url)],
+        1,
+        false,
+        Some(4),
+        None,
+    ))
+    .unwrap();
+    let kimi = crate::common::kimi_k3_fixture::tokenizer();
+    let sandy_config = sgl_router::config::FrankySandyConfig {
+        tokenizer_path: kimi.path().join("tiktoken.model").display().to_string(),
+        chat_adapter: sgl_router::config::ChatTemplateAdapterKind::KimiK3,
+        keep_every: std::num::NonZeroUsize::MIN,
+    };
+    ctx.franky_sandy = Some(Arc::new(
+        sgl_router::tokenizer::franky_sandy::FrankySandyTokens::load(
+            &sandy_config,
+            Default::default(),
+        )
+        .unwrap(),
+    ));
+    (
+        Arc::new(ctx),
+        [ricky, sandy],
+        [ricky_stop, sandy_stop],
+        kimi,
+    )
+}
+
+/// Each block's Sandy ids extend the last block's with her tokens of Ricky's
+/// finished blocks, Ricky's blocks name where each starts in her tokens, and
+/// the response carries her tokens of the whole answer and the later blocks'
+/// starts, as one function made them.
+#[tokio::test]
+async fn a_chain_makes_sandys_tokens_of_each_finished_block() {
+    let (ctx, [ricky, sandy], _stop, _kimi) = own_tokenizer_router(10).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "franky_sandy_input_ids": [40, 41],
+        "return_routed_experts": true,
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = answer_of(res).await;
+    let ricky_requests = ricky.requests();
+    let sandy_requests = sandy.requests();
+    assert_eq!(ricky_requests.len(), 3);
+    let sandy_ids: Vec<Vec<Value>> = sandy_requests
+        .iter()
+        .map(|request| request["input_ids"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(sandy_ids[0], [json!(40), json!(41)]);
+    for (earlier, later) in sandy_ids.iter().zip(&sandy_ids[1..]) {
+        assert!(later.len() > earlier.len(), "{sandy_ids:?}");
+        assert!(later.starts_with(earlier), "{sandy_ids:?}");
+    }
+    let starts: Vec<usize> = sandy_ids.iter().map(Vec::len).collect();
+    for (block, (ricky_request, sandy_request)) in
+        ricky_requests.iter().zip(&sandy_requests).enumerate()
+    {
+        assert_eq!(
+            ricky_request["franky_sandy_input_ids"],
+            sandy_request["input_ids"]
+        );
+        assert_eq!(
+            ricky_request["franky_chain"]["sandy_block_starts"],
+            json!(starts[..block])
+        );
+        assert!(
+            sandy_request.get("franky_sandy_input_ids").is_none(),
+            "{sandy_request}"
+        );
+    }
+    let output = answer["meta_info"]["franky_sandy_output_ids"]
+        .as_array()
+        .unwrap();
+    assert!(output.starts_with(&sandy_ids[2][2..]), "{answer}");
+    assert!(output.len() > sandy_ids[2].len() - 2, "{answer}");
+    assert_eq!(
+        answer["meta_info"]["franky_sandy_block_starts"],
+        json!(starts[1..])
+    );
+    let sandy_rows = |request: &Value| request["routed_experts_start_len"].clone();
+    assert_eq!(
+        sandy_requests.iter().map(sandy_rows).collect::<Vec<_>>(),
+        [json!(0), json!(starts[0]), json!(starts[1])]
+    );
+    assert_eq!(
+        rows_of(&answer["meta_info"]["franky_sandy_routed_experts"]),
+        (0..starts[2] as i32).collect::<Vec<_>>()
+    );
+}
+
+/// Sandy reads her own view of a `/generate` prompt and Ricky his; the field
+/// that carries hers reaches no engine.
+#[tokio::test]
+async fn a_sandy_reads_her_own_view_of_the_prompt() {
+    let ricky = MockWorker::start(vec![]).await;
+    let sandy = MockWorker::start(vec![]).await;
+    let ctx = franky_ctx(
+        &[("r", &ricky.url, WorkerMode::Plain)],
+        &[("s", &sandy.url)],
+        1,
+        false,
+    );
+    let body = json!({
+        "input_ids": [1, 2, 3, 4],
+        "franky_sandy_input_ids": [1, 9, 9, 4],
+        "sampling_params": {"max_new_tokens": 4},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let ricky_body = ricky.captured_json().await;
+    let sandy_body = sandy.captured_json().await;
+    assert_eq!(ricky_body["input_ids"], json!([1, 2, 3, 4]));
+    assert_eq!(sandy_body["input_ids"], json!([1, 9, 9, 4]));
+    for body in [&ricky_body, &sandy_body] {
+        assert!(body.get("franky_sandy_input_ids").is_none(), "{body}");
+    }
+    assert_eq!(
+        without(sandy_body, &["input_ids"]),
+        without(ricky_body, &["input_ids"])
+    );
+}
+
+/// Ricky's cached KV holds what his readers added, so it depends on Sandy's
+/// view: one Ricky prompt under two views gets two cache keys on both engines,
+/// the same view the same key, and a client's own key stays in front.
+#[tokio::test]
+async fn each_sandy_view_keys_both_engines_caches() {
+    async fn keys(sandy_view: Value, client_key: Option<&str>) -> (String, String) {
+        let ricky = MockWorker::start(vec![]).await;
+        let sandy = MockWorker::start(vec![]).await;
+        let ctx = franky_ctx(
+            &[("r", &ricky.url, WorkerMode::Plain)],
+            &[("s", &sandy.url)],
+            1,
+            false,
+        );
+        let mut body = json!({
+            "input_ids": [1, 2, 3, 4],
+            "franky_sandy_input_ids": sandy_view,
+            "sampling_params": {"max_new_tokens": 4},
+        });
+        if let Some(key) = client_key {
+            body["extra_key"] = key.into();
+        }
+        let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let key = |body: Value| body["extra_key"].as_str().unwrap().to_owned();
+        (
+            key(ricky.captured_json().await),
+            key(sandy.captured_json().await),
+        )
+    }
+
+    let (ricky_first, sandy_first) = keys(json!([1, 9, 9, 4]), None).await;
+    let (ricky_same, _) = keys(json!([1, 9, 9, 4]), None).await;
+    let (ricky_other, _) = keys(json!([1, 8, 8, 4]), None).await;
+    let (ricky_keyed, _) = keys(json!([1, 9, 9, 4]), Some("eval:3")).await;
+
+    assert_eq!(ricky_first, sandy_first);
+    assert_eq!(ricky_first, ricky_same);
+    assert_ne!(ricky_first, ricky_other);
+    assert_eq!(ricky_keyed, format!("eval:3|{ricky_first}"));
+}
+
+/// Every block gives Sandy her own view and every token Ricky generated so far,
+/// and Ricky his view and the same tokens.
+#[tokio::test]
+async fn every_block_gives_sandy_her_view_and_rickys_tokens_so_far() {
+    let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "franky_sandy_input_ids": [7, 8, 9],
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let (ricky_requests, sandy_requests) = (ricky.requests(), sandy.requests());
+    assert_eq!((ricky_requests.len(), sandy_requests.len()), (3, 3));
+    for (block, (ricky_request, sandy_request)) in
+        ricky_requests.iter().zip(&sandy_requests).enumerate()
+    {
+        let generated: Vec<u64> = (3..3 + 4 * block as u64).collect();
+        let ricky_context: Vec<u64> = [1, 2, 3].into_iter().chain(generated.clone()).collect();
+        let sandy_context: Vec<u64> = [7, 8, 9].into_iter().chain(generated).collect();
+        assert_eq!(ricky_request["input_ids"], json!(ricky_context));
+        assert_eq!(sandy_request["input_ids"], json!(sandy_context));
+        assert_eq!(sandy_request["franky_chain"], ricky_request["franky_chain"]);
+        for request in [ricky_request, sandy_request] {
+            assert!(request.get("franky_sandy_input_ids").is_none(), "{request}");
+        }
+    }
+}
+
+/// Every block of a chain carries one cache key, made from Sandy's view of the
+/// prompt behind the client's own key, so a block reuses the KV its chain's
+/// earlier blocks left; another view of the same prompt gets another key.
+#[tokio::test]
+async fn every_block_of_a_chain_keys_the_cache_by_the_prompts_view() {
+    async fn block_keys(sandy_view: Value) -> Vec<(Value, Value)> {
+        let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+        let body = json!({
+            "input_ids": [1, 2, 3],
+            "franky_sandy_input_ids": sandy_view,
+            "extra_key": "rollout:5",
+            "sampling_params": {"max_new_tokens": 100},
+        });
+        let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let (ricky_requests, sandy_requests) = (ricky.requests(), sandy.requests());
+        assert_eq!(ricky_requests.len(), 3);
+        ricky_requests
+            .iter()
+            .zip(&sandy_requests)
+            .map(|(r, s)| (r["extra_key"].clone(), s["extra_key"].clone()))
+            .collect()
+    }
+
+    let matched = block_keys(json!([7, 8, 9])).await;
+    let foreign = block_keys(json!([7, 6, 9])).await;
+
+    let (first, _) = &matched[0];
+    let key = first.as_str().unwrap();
+    assert!(key.starts_with("rollout:5|sandy-view:"), "{key}");
+    assert_eq!(key.matches("sandy-view:").count(), 1, "{key}");
+    for (ricky_key, sandy_key) in &matched {
+        assert_eq!((ricky_key, sandy_key), (first, first));
+    }
+    assert!(foreign.iter().all(|(ricky_key, _)| ricky_key != first));
+}
+
+/// A view of another length, a prompt sent as text, or a view that is not token
+/// ids is refused before any engine sees it.
+#[tokio::test]
+async fn a_sandy_view_that_cannot_align_with_rickys_prompt_is_refused() {
+    let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+    for body in [
+        json!({"input_ids": [1, 2, 3], "franky_sandy_input_ids": [7, 8]}),
+        json!({"text": "one two three", "franky_sandy_input_ids": [7, 8, 9]}),
+        json!({"input_ids": [1, 2, 3], "franky_sandy_input_ids": "seven eight nine"}),
+    ] {
+        let res = build_router(Arc::clone(&ctx))
+            .oneshot(generate(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    assert!(ricky.requests().is_empty());
+    assert!(sandy.requests().is_empty());
+}
+
+/// The boundary token ends a block before its size and the next block starts a
+/// new answer: a new chain whose blocks list the answer before it, with the old
+/// chain ended on both engines; the client still gets one answer.
+#[tokio::test]
+async fn a_boundary_token_ends_an_answer_and_the_next_block_starts_another() {
+    let (ctx, [ricky, sandy], _stop) = boundary_router(10, 5).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "franky_sandy_input_ids": [7, 8, 9],
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = answer_of(res).await;
+    assert_eq!(answer["output_ids"], json!((3..13).collect::<Vec<_>>()));
+    assert_eq!(
+        answer["meta_info"]["finish_reason"],
+        json!({"type": "stop", "matched": 0})
+    );
+    let requests = ricky.requests();
+    let chains: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            (
+                request["franky_chain"]["id"].clone(),
+                request["franky_chain"]["block"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(requests.len(), 3);
+    let (first, second) = (chains[0].0.clone(), chains[1].0.clone());
+    assert_ne!(first, second);
+    assert_eq!(
+        chains,
+        [
+            (first.clone(), json!(1)),
+            (second.clone(), json!(1)),
+            (second.clone(), json!(2))
+        ]
+    );
+    assert_eq!(
+        requests[1]["rid"],
+        json!(format!("{}-1", second.as_str().unwrap()))
+    );
+    assert!(requests[0].get("franky_generated_spans").is_none());
+    for request in &requests[1..] {
+        assert_eq!(request["franky_generated_spans"], json!([[3, 6]]));
+    }
+    assert_eq!(requests[1]["input_ids"], json!([1, 2, 3, 3, 4, 5]));
+    for request in &requests {
+        assert_eq!(request["sampling_params"]["stop_token_ids"], json!([5]));
+    }
+    let sandy_requests = sandy.requests();
+    assert_eq!(sandy_requests[1]["input_ids"], json!([7, 8, 9, 3, 4, 5]));
+    assert_eq!(
+        sandy_requests[1]["franky_chain"],
+        requests[1]["franky_chain"]
+    );
+    assert_eq!(sandy_requests[1]["franky_generated_spans"], json!([[3, 6]]));
+    for engine in [&ricky, &sandy] {
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ends = engine.chain_ends();
+                if ends.len() == 2 {
+                    return ends;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both chains end on the engine");
+        assert_eq!(
+            ended,
+            [json!({"chain_id": first}), json!({"chain_id": second})]
+        );
+    }
+}
+
+/// A client that stops on the boundary token ends its answer there.
+#[tokio::test]
+async fn a_client_that_stops_on_the_boundary_token_ends_its_answer_there() {
+    let (ctx, [ricky, _sandy], _stop) = boundary_router(10, 5).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "sampling_params": {"max_new_tokens": 100, "stop_token_ids": [5]},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = answer_of(res).await;
+    assert_eq!(answer["output_ids"], json!([3, 4, 5]));
+    assert_eq!(
+        answer["meta_info"]["finish_reason"],
+        json!({"type": "stop", "matched": 5})
+    );
+    let requests = ricky.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["sampling_params"]["stop_token_ids"], json!([5]));
+}
+
+/// ignore_eos turns stops off, so a request asking for it under a boundary
+/// token is refused.
+#[tokio::test]
+async fn ignore_eos_under_a_boundary_token_is_refused() {
+    let (ctx, [ricky, _sandy], _stop) = boundary_router(10, 5).await;
+    let body = json!({"input_ids": [1, 2, 3], "sampling_params": {"max_new_tokens": 8, "ignore_eos": true}});
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(ricky.requests().is_empty());
+}
+
+/// A presence penalty over the whole answer reaches each block as a logit bias on the tokens of
+/// the blocks before it, added to the client's own bias, and the field reaches no engine.
+#[tokio::test]
+async fn a_presence_penalty_over_blocks_biases_each_block_against_the_tokens_before_it() {
+    let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
+    let body = json!({
+        "input_ids": [1, 2, 3],
+        "franky_presence_over_blocks": 1.5,
+        "sampling_params": {"max_new_tokens": 100, "logit_bias": {"4": 2.0, "99": -1.0}},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let requests = ricky.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0]["sampling_params"]["logit_bias"],
+        json!({"4": 2.0, "99": -1.0})
+    );
+    for (block, request) in requests.iter().enumerate().skip(1) {
+        let mut expected = serde_json::Map::new();
+        expected.insert("99".into(), json!(-1.0));
+        for token in 3..3 + 4 * block as u64 {
+            let client = if token == 4 { 2.0 } else { 0.0 };
+            expected.insert(token.to_string(), json!(client - 1.5));
+        }
+        assert_eq!(
+            request["sampling_params"]["logit_bias"],
+            Value::Object(expected),
+            "block {}",
+            block + 1
+        );
+    }
+    for request in ricky.requests().iter().chain(&sandy.requests()) {
+        assert!(
+            request.get("franky_presence_over_blocks").is_none(),
+            "{request}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_presence_penalty_over_blocks_beside_sglangs_own_or_below_zero_is_refused() {
+    let (ctx, [ricky, _sandy], _stop) = blocks_router(10).await;
+    for body in [
+        json!({"input_ids": [1, 2], "franky_presence_over_blocks": 1.5,
+               "sampling_params": {"max_new_tokens": 8, "presence_penalty": 1.5}}),
+        json!({"input_ids": [1, 2], "franky_presence_over_blocks": -1.0,
+               "sampling_params": {"max_new_tokens": 8}}),
+        json!({"input_ids": [1, 2], "franky_presence_over_blocks": "high",
+               "sampling_params": {"max_new_tokens": 8}}),
+    ] {
+        let res = build_router(Arc::clone(&ctx))
+            .oneshot(generate(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
     assert!(ricky.requests().is_empty());
 }

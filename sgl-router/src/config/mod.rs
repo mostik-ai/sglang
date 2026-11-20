@@ -66,6 +66,10 @@ impl Config {
             "--retry-initial-backoff-ms must not exceed --retry-max-backoff-ms"
         );
         ensure!(
+            self.proxy.franky_boundary_token_id.is_none() || self.proxy.franky_block_size.is_some(),
+            "--franky-boundary-token-id needs --franky-block-size: a boundary token ends a block"
+        );
+        ensure!(
             self.server.shutdown_drain_secs <= MAX_SHUTDOWN_DRAIN_SECS,
             "shutdown_drain_secs must be at most {MAX_SHUTDOWN_DRAIN_SECS} (got {}); \
              past the ceiling a value is a typo rather than a drain. A long but \
@@ -98,37 +102,43 @@ impl Config {
                     !s.urls.is_empty(),
                     "discovery.static_urls.urls must be a non-empty list"
                 );
-                // Normalize URLs before deduplication so trailing slashes cannot register a worker twice.
-                let mut seen = std::collections::HashSet::new();
-                for raw in &s.urls {
-                    let trimmed = raw.trim();
-                    ensure!(
-                        !trimmed.is_empty(),
-                        "discovery.static_urls.urls contains an empty or whitespace-only entry"
-                    );
-                    let parsed = url::Url::parse(trimmed).map_err(|e| {
-                        anyhow!("discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}")
-                    })?;
-                    match parsed.scheme() {
-                        "http" | "https" => {}
-                        other => {
-                            return Err(anyhow!(
-                                "discovery.static_urls.urls entry {raw:?} has unsupported scheme {other:?}; only http and https are supported"
-                            ));
-                        }
-                    }
-                    let normalized = parsed.as_str().trim_end_matches('/').to_string();
-                    ensure!(
-                        seen.insert(normalized.clone()),
-                        "discovery.static_urls.urls contains duplicate entry {raw:?} (normalized: {normalized:?})"
-                    );
-                }
+                validate_static_urls(&s.urls)?;
             }
+            DiscoveryBackend::WorkerApi(s) => validate_static_urls(&s.urls)?,
             // Kubernetes selector combinations are validated by `resolve_mode` during construction.
             DiscoveryBackend::K8s(_) => {}
         }
         Ok(())
     }
+}
+
+fn validate_static_urls(urls: &[String]) -> Result<()> {
+    // Normalize URLs before deduplication so trailing slashes cannot register a worker twice.
+    let mut seen = std::collections::HashSet::new();
+    for raw in urls {
+        let trimmed = raw.trim();
+        ensure!(
+            !trimmed.is_empty(),
+            "discovery.static_urls.urls contains an empty or whitespace-only entry"
+        );
+        let parsed = url::Url::parse(trimmed).map_err(|e| {
+            anyhow!("discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}")
+        })?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => {
+                return Err(anyhow!(
+                    "discovery.static_urls.urls entry {raw:?} has unsupported scheme {other:?}; only http and https are supported"
+                ));
+            }
+        }
+        let normalized = parsed.as_str().trim_end_matches('/').to_string();
+        ensure!(
+            seen.insert(normalized.clone()),
+            "discovery.static_urls.urls contains duplicate entry {raw:?} (normalized: {normalized:?})"
+        );
+    }
+    Ok(())
 }
 
 fn validate_bucket_config(bucket_config: &BucketConfig) -> Result<()> {
@@ -620,6 +630,16 @@ mod tests {
         config.proxy.request_timeout_secs = 0;
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("request_timeout_secs"), "{error}");
+    }
+
+    #[test]
+    fn validate_rejects_boundary_tokens_without_blocks() {
+        let mut config = cfg("qwen3-0.6b", &["http://10.0.0.1:30000"]);
+        config.proxy.franky_boundary_token_id = Some(7);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("--franky-block-size"), "{error}");
+        config.proxy.franky_block_size = std::num::NonZeroU32::new(4);
+        config.validate().unwrap();
     }
 
     #[test]

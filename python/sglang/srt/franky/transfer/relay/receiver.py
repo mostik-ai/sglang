@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-import numpy as np
 import numpy.typing as npt
 from typing_extensions import override
 
@@ -17,8 +16,10 @@ if TYPE_CHECKING:
 
 
 class FrankyRelayReceiver(NixlKVReceiver):
-    """PD's KV receiver on Ricky decode that also receives the relayed taps of
-    the pages it registers, and ends only when both have landed.
+    """PD's KV receiver on Ricky decode that also receives the relayed taps, in
+    the stripes its request reserved past their cached prefix, and ends only
+    once both landed. Until the request reserves its stripes, it reports the
+    handshake unfinished, so PD prepares no KV for the request.
     """
 
     kv_mgr: FrankyRelayManager
@@ -52,17 +53,29 @@ class FrankyRelayReceiver(NixlKVReceiver):
         )
         if self.conclude_state == KVPoll.Failed:
             return
-        tap_pages = self.kv_mgr.tap_cache.pages_of(kv_pages=kv_indices)
-        self.tap_receiver = FrankyReceiver(
+        rid = self._rid()
+        reservation = None if rid is None else self.kv_mgr.tap_requests.reservation(rid)
+        if reservation is None:
+            return
+        self.tap_receiver = FrankyReceiver.of_reservation(
             manager=self.kv_mgr.tap_relay,
             franky_room=self._relay_room(),
-            tap_pages=np.asarray(tap_pages, dtype=np.int32),
-            num_tokens=len(tap_pages) * self.kv_mgr.tap_cache.page_size,
+            tap_cache=self.kv_mgr.tap_cache,
+            reservation=reservation,
         )
         self.kv_mgr.track_tap_receiver(self.bootstrap_room, self.tap_receiver)
 
     @override
     def poll(self) -> int:
+        rid = self._rid()
+        if self.conclude_state is None and rid is not None:
+            tap_requests = self.kv_mgr.tap_requests
+            refusal = tap_requests.refusal(rid)
+            if refusal is not None:
+                self.kv_mgr.record_failure(self.bootstrap_room, refusal)
+                self.conclude_state = KVPoll.Failed
+            elif tap_requests.waits(rid):
+                return KVPoll.Bootstrapping
         state = super().poll()
         return (
             state if self.tap_receiver is None else min(state, self.tap_receiver.poll())
@@ -80,6 +93,9 @@ class FrankyRelayReceiver(NixlKVReceiver):
         if self.tap_receiver is not None:
             self.tap_receiver.close()
             self.kv_mgr.forget_tap_receiver(self.bootstrap_room)
+
+    def _rid(self) -> Optional[str]:
+        return self.kv_mgr.tap_requests.rid_of_room(self.bootstrap_room)
 
     def _relay_room(self) -> FrankyRoom:
         return FrankyRoom(

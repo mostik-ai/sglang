@@ -3,6 +3,8 @@
 
 pub mod adapter;
 pub mod chat_formatter;
+pub mod chat_template_adapter;
+pub mod franky_sandy;
 mod kimi;
 pub mod stats;
 

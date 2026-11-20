@@ -6,45 +6,61 @@ import torch
 from torch import nn
 from typing_extensions import override
 
+from sglang.kernels.ops.attention.franky_reader_merge import PACK_COLUMNS
+from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+    recommended_max_tokens,
+)
+from sglang.srt.distributed.parallel_state import get_attn_tp_group
+from sglang.srt.franky.cache.tap_buffers import TapBuffers
+from sglang.srt.franky.cache.tap_request_table import TapRequestTable
+from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts.franky_parts import FrankyParts, load_part
-from sglang.srt.franky.parts.reader.query.reader import attention_workspace
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.franky.parts.reader.current_tap_reading import CurrentTapReading
+from sglang.srt.franky.parts.reader.query.config import QueryReaderConfig
+from sglang.srt.franky.parts.reader.tap_attention import TapAttention, TrtllmWorkspace
+from sglang.srt.franky.parts.reader.tap_gather import TapGather
+from sglang.srt.runtime_context import get_franky
+from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.franky.config import FrankyConfig
     from sglang.srt.franky.parts.franky_mixin import FrankyMixin
     from sglang.srt.franky.parts.injector.injector import Injector
+    from sglang.srt.franky.parts.injector.layer_output import LayerOutput
     from sglang.srt.franky.parts.reader.reader import Reader
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class RickyParts(FrankyParts):
-    """Ricky's side on this rank: the readers of this PP stage, each with its
-    injector. Reader ``i`` reads encoder ``i``'s taps.
+    """Ricky's side on this rank: the readers of this PP stage. Reader ``i``
+    reads encoder ``i``'s taps, and the injector adds its result.
     """
 
     def __init__(
         self,
         *,
         config: FrankyConfig,
+        injector: Injector,
         readers: dict[int, Reader],
-        injectors: dict[int, Injector],
         device: str,
+        stripes: TapStripes,
+        tap_pool_ratio: float = 1.0,
     ) -> None:
         self._readers = readers
-        self._injectors = injectors
         # Reader layers count from 1, the layer loop from 0.
         self._index_of_layer = {
             config.reader.layers[index] - 1: index for index in readers
         }
-        # Row 0 serves padded requests and stays zero.
-        self._outputs_past_the_taps: dict[int, torch.Tensor] = {}
+        self.tap_buffers: Optional[TapBuffers] = None
+        self.request_table: Optional[TapRequestTable] = None
+        self._attentions: dict[int, TapAttention] = {}
         super().__init__(
             config=config,
+            injector=injector,
             layer_indices=frozenset(self._index_of_layer),
             device=device,
+            stripes=stripes,
+            tap_pool_ratio=tap_pool_ratio,
         )
 
     @classmethod
@@ -55,11 +71,12 @@ class RickyParts(FrankyParts):
         model: nn.Module,
         language_model: FrankyMixin,
         config: FrankyConfig,
-        weights: dict[str, torch.Tensor],
+        injector: Injector,
+        weights: Optional[dict[str, torch.Tensor]],
         dtype: torch.dtype,
         device: str,
     ) -> RickyParts:
-        readers, injectors = {}, {}
+        readers = {}
         for index, layer in enumerate(config.reader.layers):
             if language_model.start_layer < layer <= language_model.end_layer:
                 readers[index] = load_part(
@@ -72,46 +89,63 @@ class RickyParts(FrankyParts):
                     dtype=dtype,
                     device=device,
                 )
-                injectors[index] = config.injector.build()
-        return cls(config=config, readers=readers, injectors=injectors, device=device)
+        return cls(
+            config=config,
+            injector=injector,
+            readers=readers,
+            device=device,
+            stripes=TapStripes.of_attention_tp(),
+            tap_pool_ratio=get_franky().franky_tap_pool_ratio,
+        )
 
     @override
-    def init_tap_cache(
+    def init_taps(
         self,
         *,
-        num_tokens: int,
-        kv_allocator: BaseTokenToKVPoolAllocator,
+        num_kv_tokens: int,
+        kv_page_size: int,
         req_to_token_pool: ReqToTokenPool,
     ) -> None:
-        super().init_tap_cache(
-            num_tokens=num_tokens,
-            kv_allocator=kv_allocator,
-            req_to_token_pool=req_to_token_pool,
-        )
-        num_rows = req_to_token_pool.req_to_token.shape[0]
-        self._outputs_past_the_taps = {
-            index: reader.mlp[-1].weight.new_zeros(
-                (num_rows, reader.mlp[-1].out_features)
-            )
-            for index, reader in self._readers.items()
-            if reader.same_past_the_taps
-        }
-
-    def keep_past_the_taps(self, *, req_pool_indices: list[int]) -> None:
-        """Read once what the decoded tokens of these requests get, now that all
-        their taps are in; a request without taps gets zero.
+        """Ricky's taps get pages of their own: ``tap_pool_ratio`` taps per KV
+        token over the attention-TP ranks, at least one request of the context
+        length; the scheduler's ``RickyTapCache`` hands them to requests. Also
+        the request table and the readers' attentions over the pages.
         """
-        if not self._outputs_past_the_taps or not req_pool_indices:
-            return
-        rows = async_h2d(req_pool_indices, dtype=torch.int64, device=self.device)
-        for index, outputs in self._outputs_past_the_taps.items():
-            outputs[rows] = self._readers[index].read_past_the_taps(
-                tap_cache=self.tap_cache, encoder_id=index, req_pool_indices=rows
+        page_size = self.config.tap_page_size
+        stripe_size = self.stripes.num_ranks * page_size
+        context_len = req_to_token_pool.req_to_token.shape[1]
+        num_stripes = int(self._tap_pool_ratio * num_kv_tokens) // stripe_size
+        if num_stripes < ceil_div(context_len, stripe_size):
+            raise ValueError(
+                f"Tap pool ratio {self._tap_pool_ratio} holds the taps of "
+                f"{num_stripes * stripe_size} tokens, fewer than one request at the "
+                f"context length {context_len}; raise --franky-tap-pool-ratio."
             )
+        self.tap_buffers = TapBuffers(
+            encoder_ids=self._tap_encoder_ids(),
+            output_size=self.config.encoder.output_size,
+            page_size=page_size,
+            num_pages=num_stripes + 1,
+            device=self.device,
+        )
+        self.request_table = TapRequestTable(
+            num_slots=req_to_token_pool.req_to_token.shape[0],
+            max_stripes=ceil_div(context_len, stripe_size),
+            device=self.device,
+        )
+        self._attentions = self._build_attentions()
 
     @override
-    def _attention_workspace(self) -> Optional[torch.Tensor]:
-        return attention_workspace(device=self.device)
+    def _weight_prefix(self) -> str:
+        return "readers"
+
+    @override
+    def _parts_by_index(self) -> dict[int, nn.Module]:
+        return dict(self._readers)
+
+    @override
+    def _num_parts_on_all_stages(self) -> int:
+        return len(self.config.reader.layers)
 
     @override
     def _tap_encoder_ids(self) -> tuple[int, ...]:
@@ -120,24 +154,47 @@ class RickyParts(FrankyParts):
         return tuple(range(len(self.config.encoder.layers)))
 
     @override
-    def _after_layer(
-        self, *, layer_idx: int, residual: torch.Tensor, forward_batch: ForwardBatch
-    ) -> Optional[torch.Tensor]:
+    def _after_layer(self, *, layer_idx: int, output: LayerOutput) -> LayerOutput:
         index = self._index_of_layer[layer_idx]
-        if (
-            index in self._outputs_past_the_taps
-            and forward_batch.forward_mode.is_decode_or_idle()
-        ):
-            reader_output = self._outputs_past_the_taps[index][
-                forward_batch.req_pool_indices
-            ]
-        else:
-            reader_output = self._readers[index](
-                tap_cache=self.tap_cache,
-                encoder_id=index,
-                residual=residual,
-                forward_batch=forward_batch,
-            )
-        return self._injectors[index].inject(
-            reader_output=reader_output, residual=residual
+        reader_output = self._readers[index](
+            taps=self._attentions[index],
+            residual=self.injector.read(output=output),
+            forward_batch=output.forward_batch,
+            rows=output.rows,
         )
+        return self.injector.inject(output=output, addition=reader_output)
+
+    def _gather(self) -> TapGather:
+        return TapGather.build(
+            group=get_attn_tp_group(),
+            max_rows=recommended_max_tokens(include_prefill=True, floor=256),
+            row_size=self.config.reader.num_queries
+            * (self.config.encoder.output_size + PACK_COLUMNS),
+        )
+
+    def _build_attentions(self) -> dict[int, TapAttention]:
+        reading = CurrentTapReading(
+            request_table=self.request_table,
+            stripes=self.stripes,
+            page_size=self.config.tap_page_size,
+        )
+        workspace = TrtllmWorkspace.for_device(self.device)
+        # An aligned reader attends over no taps: the ranks sum its reads.
+        attends = isinstance(self.config.reader, QueryReaderConfig)
+        gather = (
+            self._gather()
+            if attends and self.stripes.num_ranks > 1 and self._readers
+            else None
+        )
+        first_index = min(self._readers, default=None)
+        return {
+            index: TapAttention(
+                encoder_id=index,
+                pages=self.tap_buffers.pages(index),
+                reading=reading,
+                builds_reading=index == first_index,
+                gather=gather,
+                workspace=workspace,
+            )
+            for index in self._readers
+        }

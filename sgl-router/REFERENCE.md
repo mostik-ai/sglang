@@ -19,6 +19,23 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 
 ## Discovery and KV signals
 
+### Workers added at run time
+
+With `--worker-api`, clients add and remove workers over HTTP, as Miles
+registers the engines it launches. The router may then start without
+`--worker-urls`; the flag conflicts with `--service-discovery`.
+
+- `POST /workers` takes `{"url", "worker_type", "bootstrap_port"}`, where
+  `worker_type` is `regular` (the default), `prefill` or `decode`. The worker's
+  role (Sandy included) and models come from its `/server_info`, as for a static
+  URL. The router answers `{"id", "url"}` once it routes to the worker, and
+  `500` when that takes over two minutes.
+- `GET /workers` lists every registered worker, static or added, with its `id`,
+  `url`, `mode` and `model_ids`.
+- `DELETE /workers/{id}` asks the router to remove that worker, and answers
+  before the worker leaves the registry.
+- Without `--worker-api`, `POST` and `DELETE` get `400`.
+
 ### PD version groups
 
 To run two engine versions side by side in PD mode (e.g. during a rollout),
@@ -438,10 +455,30 @@ in the next block:
   ended with its last block, the router posts `/franky/end_chain` to its engines
   when it ends: after a stop, an error, or a client that left.
 - Blocks need token ids (`input_ids`, or text or chat the router renders) and
-  one sequence. Batches, `n` above 1, constrained decoding, hidden states,
-  routed experts and sessions are refused with `400`, as is chat the router
-  does not lower to `/generate`: it lowers chat only for the templates it
-  renders as SGLang does (see [Chat rendering](#chat-rendering)).
+  one sequence. Batches, `n` above 1, constrained decoding, hidden states and
+  sessions are refused with `400`, as is chat the router does not lower to
+  `/generate`: it lowers chat only for the templates it renders as SGLang does
+  (see [Chat rendering](#chat-rendering)).
+- With `return_routed_experts`, each block after the first asks Ricky for the
+  experts of its own tokens only (`routed_experts_start_len` at the forward of
+  the block's last input token), those its decode routed, and the chain's
+  response carries every block's rows joined: as one request's
+  `routed_experts`, from the client's `routed_experts_start_len`. A later
+  block's prefill that recomputes earlier tokens and routes them anew is left
+  out. Unary responses also carry Sandy's experts as
+  `franky_sandy_routed_experts`, the rows of every token of hers that a block
+  prefilled, joined in her ids' order: her prompt and the tokens before the
+  last block (see [Routed experts](#routed-experts)).
+- With `--franky-boundary-token-id ID` (such as the close of Ricky's thinking),
+  a block also ends where Ricky writes `ID`, unless the client stops on it, and
+  the next block starts a new answer: the router ends the chain on its engines
+  and goes on with a new chain whose blocks list every earlier answer of the
+  request as `franky_generated_spans` after the client's own, so the tokens
+  after the boundary read the taps of every token before them. Each block asks
+  the engines to stop on `ID`; `ignore_eos`, which turns stops off, gets `400`.
+  The client still gets one response, which ends only at the client's own stop
+  or limit. A trainer reading the same answers must start a new answer after
+  every `ID` that Ricky generated before the answer's last token.
 - A stop string across two blocks is not matched; each block checks its own
   output.
 - Between two blocks a chain waits for Sandy to prefill the last block's tokens
@@ -450,6 +487,113 @@ in the next block:
   scheduling so a batch's taps leave right after its forward. Engines started
   with a smaller `--chunked-prefill-size` (2048 in our runs) make a next block
   wait less behind other prefills, at a small cost in throughput.
+
+### Earlier answers
+
+A Franky request lists the answers Ricky generated in its earlier turns as
+`franky_generated_spans`: `[start, end)` runs of its `input_ids`. Ricky
+recomputes those tokens with the taps their decode read.
+
+- `/generate` and `/v1/completions` clients, and chat clients that send
+  `input_ids` (Miles' session server), send their own spans; the router passes
+  them on unchanged, also in the `/generate` body it lowers a request to.
+- For a chat that sends only messages, `--franky-chat-adapter` names the
+  served model's chat template (`qwen3.5`, `deepseek-v4`, `kimi-k3`). The router
+  renders the chat as usual, the adapter finds the earlier answers in the
+  rendered ids, and both engines get those ids with the spans: in the
+  `/generate` body when the router lowers the chat, otherwise in the chat body.
+  An answer starts after its header and the opening a generation prompt ends
+  with, and ends with its closing token, included:
+
+  | Template | Header | Openings | Closing |
+  | --- | --- | --- | --- |
+  | `qwen3.5` | `<\|im_start\|>assistant\n` | `<think>\n\n</think>\n\n`, `<think>\n` | `<\|im_end\|>` |
+  | `deepseek-v4` | `<｜Assistant｜>` | `<think>`, `</think>` | `<｜end▁of▁sentence｜>` |
+  | `kimi-k3` | `<\|open\|>message role="assistant"<\|sep\|>` | `<\|open\|>think<\|sep\|>`, `<\|open\|>response<\|sep\|>` | `<\|end_of_msg\|>` |
+
+- A Franky chat gets `400` for `franky_generated_spans` without `input_ids`,
+  and for assistant messages without `--franky-chat-adapter` or in a chat the
+  router leaves to the engine to render (see [Chat rendering](#chat-rendering)).
+
+### Sandy's own view
+
+A Franky `/generate` request to a pair whose Sandy reads Ricky's tokens may
+give Sandy her own view of the prompt as `franky_sandy_input_ids`: token ids,
+as many as its `input_ids`. Sandy's leg reads them in place of Ricky's prompt,
+and in a chain every block gives her that view and the tokens Ricky generated
+so far, as it gives Ricky his. The views must be one length so that every tap
+keeps its position: a part only Sandy may read is replaced one for one by
+filler in Ricky's view.
+
+- The router answers `400` for a view of another length, a prompt sent as
+  `text`, or a view that is not one prompt's token ids.
+- No engine gets the field; Sandy gets her view as her `input_ids`.
+- Both legs get a digest of her view in `extra_key`, after any key the
+  client sent, because Ricky's cached KV holds what his readers added from
+  her taps: requests with one Ricky prompt under different views share no
+  cache, and requests under one view still share it.
+
+### A Sandy with its own tokenizer
+
+When Sandy is another model family than Ricky (Kimi K3 for DeepSeek V4.1), its
+engines run with `"shared_tokenizer": false` in the Franky config, and the
+router gets `--franky-sandy-tokenizer-path` (Sandy's model files) and
+`--franky-sandy-chat-adapter`, with `--franky-chat-adapter` for Ricky.
+
+- The router renders each Franky chat twice, with each model's template and
+  tokenizer, and finds the earlier answers in both renderings.
+- Sandy gets its own ids as `input_ids`, without the fields below.
+- Ricky gets its own ids, `franky_sandy_input_ids` (Sandy's ids, which key
+  Ricky's cached taps), and for the earlier answers `franky_generated_spans` and `franky_sandy_spans`, the same
+  answers' runs in Sandy's ids, one to one. A Ricky token of an answer reads
+  Sandy's taps before that answer's run.
+- `--franky-sandy-keep-every K` (default 1) shortens Sandy's ids: they keep the
+  earlier answers whole and, outside them, only every Kth token of Sandy's
+  rendering, counted from its start, so a chat's earlier turns keep the same
+  tokens in Sandy's cache. Ricky's `franky_sandy_input_ids` and
+  `franky_sandy_spans` hold the kept tokens.
+- Clients that keep both sides' ids, as a trainer does over the turns of a
+  session, send them: `/generate`, and chats that send `input_ids`, send
+  Sandy's ids of the prompt as `franky_sandy_input_ids`, any length, and for
+  the earlier answers `franky_generated_spans`, `franky_sandy_spans` and
+  `franky_sandy_block_starts`, one list per answer: Sandy's tokens before each
+  of the answer's blocks after the first, counted from the start of her ids,
+  as a response reported them. Ricky recomputes each earlier answer with the
+  taps its decode read; an answer without block starts reads before its whole
+  run. Such a request without `franky_sandy_input_ids` gets `400`, as does
+  `/v1/completions`.
+- With blocks, each block's Sandy ids extend the last block's: the router
+  decodes Ricky's ids of the answer so far with Ricky's tokenizer, special
+  tokens kept as text (his end token too), drops one trailing U+FFFD (a
+  character his ids end inside of, which the next block finishes), and encodes
+  the text added since the last block with Sandy's tokenizer as plain text;
+  the answer's last block encodes the rest of its whole text. Ricky's block gets Sandy's ids and, in
+  `franky_chain.sandy_block_starts`, her tokens before each earlier block of
+  the answer. An answer ended at a boundary token joins the earlier answers in
+  Sandy's tokens too.
+- A unary `/generate` response, with or without blocks, carries in its
+  `meta_info` `franky_sandy_output_ids`, Sandy's tokens of the whole answer,
+  the last block's text too, made as the blocks made them, so that her ids of
+  the prompt and these extend every block's Sandy ids and a later turn's ids
+  can extend them; and `franky_sandy_block_starts`, her tokens before each
+  block after the first, counted from the start of her ids. An answer ended at
+  a boundary token continues in both: the next answer's tokens follow, and
+  its first block is one of the blocks after the first.
+- A chat without `input_ids` gets `400` when the router leaves it to the
+  engine or Sandy's template does not render it, and when the two renderings
+  hold different numbers of answers.
+
+### Routed experts
+
+A Franky request with `return_routed_experts` gets Ricky's experts as SGLang
+returns them, `routed_experts`: per token from `routed_experts_start_len`, per
+MoE layer, its top-k experts, as base64 of int32 rows. Sandy's engine returns
+the experts of every token it prefills, its last one too, since each token's
+forward makes its taps; a unary response carries them as
+`franky_sandy_routed_experts` in the same encoding, from her first token, or
+from the client's `routed_experts_start_len` when she reads Ricky's tokens.
+A Sandy whose engine captures no experts (no `--enable-return-routed-experts`)
+adds none.
 
 ## Chat rendering
 

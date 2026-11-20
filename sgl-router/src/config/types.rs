@@ -1,7 +1,7 @@
 use crate::config::sampling::SamplingOverrides;
 use reqwest::header::HeaderValue;
 use serde::Deserialize;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 /// Single-model configuration built and validated by [`crate::config::Cli::into_config`].
 #[derive(Debug, Clone)]
@@ -16,7 +16,7 @@ pub struct Config {
 }
 
 /// Outbound request timeout and retry settings.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ProxyConfig {
     /// Timeout for upstream response headers, and for a non-streaming body.
     /// SGLang's chat endpoint sends streaming headers with the first token.
@@ -38,6 +38,34 @@ pub struct ProxyConfig {
     /// so a block's tokens read their own taps in the next block. `None` runs
     /// it in one block.
     pub franky_block_size: Option<NonZeroU32>,
+    /// Franky: a token id that also ends a block wherever Ricky writes it; the
+    /// next block starts a new answer. `None`: blocks end only at their size.
+    pub franky_boundary_token_id: Option<u32>,
+    /// Franky: the chat template whose earlier answers the router marks in the
+    /// chats it renders. `None` refuses a Franky chat with earlier answers
+    /// unless it carries `input_ids`.
+    pub franky_chat_adapter: Option<ChatTemplateAdapterKind>,
+    /// Franky: pick each request's Sandy among the Sandy engines on the host of
+    /// the Ricky engine that answers it, for engines whose taps cannot cross
+    /// hosts. With no Sandy there, the request gets `no_sandy_workers_available`.
+    pub franky_same_host_sandy: bool,
+    /// Franky with a Sandy that tokenizes on its own; `None` when Sandy reads
+    /// the served model's tokens.
+    pub franky_sandy: Option<FrankySandyConfig>,
+}
+
+/// A Franky Sandy that tokenizes on its own. The router renders each Franky
+/// chat for it too, sends it its own `input_ids`, and gives Ricky its input
+/// length and the runs of the earlier answers in its tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrankySandyConfig {
+    /// Sandy's model files or HuggingFace repo id: its tokenizer and chat template.
+    pub tokenizer_path: String,
+    /// Sandy's chat template, whose earlier answers the router marks.
+    pub chat_adapter: ChatTemplateAdapterKind,
+    /// Sandy reads its earlier answers whole and, outside them, every
+    /// `keep_every`-th token of its rendering; 1 reads every token.
+    pub keep_every: NonZeroUsize,
 }
 
 impl ProxyConfig {
@@ -72,6 +100,10 @@ impl Default for ProxyConfig {
             decode_dispatch_limit: None,
             stream_after_prefill: false,
             franky_block_size: None,
+            franky_boundary_token_id: None,
+            franky_chat_adapter: None,
+            franky_same_host_sandy: false,
+            franky_sandy: None,
         }
     }
 }
@@ -112,6 +144,18 @@ pub enum TokenizerBackend {
     /// `fastokens` BPE encoding with Hugging Face decoding.
     #[value(name = "fast")]
     Fast,
+}
+
+/// Chat templates whose earlier answers the router can find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ChatTemplateAdapterKind {
+    #[value(name = "qwen3.5")]
+    Qwen35,
+    /// DeepSeek V4 and V4.1.
+    #[value(name = "deepseek-v4")]
+    DeepseekV4,
+    #[value(name = "kimi-k3")]
+    KimiK3,
 }
 
 /// Router tokenizer encode settings.
@@ -772,6 +816,9 @@ pub fn default_cb_cool_down() -> u64 {
 #[derive(Debug, Clone)]
 pub enum DiscoveryBackend {
     StaticUrls(StaticUrlsDiscoveryConfig),
+    /// The static URLs, then the workers clients add and remove over `/workers`,
+    /// as Miles registers the engines it launches.
+    WorkerApi(StaticUrlsDiscoveryConfig),
     K8s(K8sDiscoveryConfig),
 }
 
@@ -781,7 +828,7 @@ impl DiscoveryBackend {
     pub fn peer_selector(&self) -> Option<&str> {
         match self {
             Self::K8s(k) => k.peer_selector.as_deref(),
-            Self::StaticUrls(_) => None,
+            Self::StaticUrls(_) | Self::WorkerApi(_) => None,
         }
     }
 }

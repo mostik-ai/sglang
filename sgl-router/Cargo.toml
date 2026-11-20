@@ -71,6 +71,8 @@ hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 
 # Utilities
 anyhow = "1"
+# Joins the base64 rows (routed experts) of a Franky chain's blocks.
+base64 = "0.22"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"

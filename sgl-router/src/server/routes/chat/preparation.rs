@@ -13,6 +13,7 @@ use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
 use crate::state::kv_events::CacheNamespace;
+use crate::tokenizer::franky_sandy::SandyChat;
 use crate::tokenizer::ForwardingScope;
 use axum::http::HeaderMap;
 use bytes::Bytes;
@@ -22,7 +23,10 @@ use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
     lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
 };
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::sync::Arc;
 
 /// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
@@ -113,6 +117,39 @@ pub(super) struct PreparedRequest {
     sampling_defaults: Vec<(SamplingField, Number)>,
     /// Turns the engine's `/generate` response back into the OpenAI one.
     pub(super) responder: Option<Responder>,
+    /// The ids Sandy's leg reads in place of Ricky's.
+    franky_sandy_ids: Option<SandyPrompt>,
+    /// Whether the `/generate` body asks for the routed experts of its tokens.
+    pub(super) returns_routed_experts: bool,
+    /// The first of Sandy's tokens whose routed experts her leg returns, in
+    /// place of the client's `routed_experts_start_len`; `None` keeps the
+    /// client's for a Sandy that reads Ricky's ids and 0 for one with her own.
+    franky_sandy_experts_start: Option<usize>,
+}
+
+/// The ids a Franky request's Sandy leg reads in place of Ricky's.
+#[derive(Debug, Clone)]
+enum SandyPrompt {
+    /// Her own view of a `/generate` prompt, as long as Ricky's: Sandy reads
+    /// Ricky's tokens, so her leg gets his fields too.
+    View(Vec<u32>),
+    /// The ids of a Sandy that tokenizes on its own, whose leg gets none of the
+    /// fields that count Ricky's tokens.
+    Own(Vec<u32>),
+}
+
+impl SandyPrompt {
+    fn ids(&self) -> &[u32] {
+        match self {
+            Self::View(ids) | Self::Own(ids) => ids,
+        }
+    }
+
+    fn into_ids(self) -> Vec<u32> {
+        match self {
+            Self::View(ids) | Self::Own(ids) => ids,
+        }
+    }
 }
 
 impl PreparedRequest {
@@ -198,6 +235,9 @@ impl PreparedRequest {
             if let Value::Object(fields) = &mut generate {
                 fields.retain(|_, value| !value.is_null());
             }
+            for (name, value) in fields.franky_fields {
+                generate[name] = value;
+            }
             if path == CHAT_PATH {
                 ctx.metrics
                     .record_input_ids_forwarding(&model.0, InputIdsForwarding::Forwarded);
@@ -252,6 +292,9 @@ impl PreparedRequest {
             parsed_body,
             sampling_defaults,
             responder: None,
+            franky_sandy_ids: None,
+            returns_routed_experts: false,
+            franky_sandy_experts_start: None,
         })
     }
 
@@ -313,6 +356,9 @@ impl PreparedRequest {
             cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
             sampling_defaults,
+            franky_sandy_ids: None,
+            returns_routed_experts: false,
+            franky_sandy_experts_start: None,
         })
     }
 
@@ -342,6 +388,21 @@ impl PreparedRequest {
             Some(_) => apply_sampling_overrides(ctx, &mut value)?,
             None => true,
         };
+        // A Sandy that reads Ricky's tokens takes her view of the prompt out of
+        // the body; one that tokenizes on its own reads the ids Ricky keeps.
+        let sandy_prompt = match ctx.franky_sandy {
+            None => take_sandy_input_ids(&mut value)?.map(SandyPrompt::View),
+            Some(_) => own_sandy_input_ids(&value)?.map(SandyPrompt::Own),
+        };
+        if let Some(SandyPrompt::View(view)) = &sandy_prompt {
+            add_write_ranges(&mut value, view);
+            // a chain's block already carries its chain's key: its view also holds the tokens generated so far
+            if value.get("franky_chain").is_none() {
+                key_cache_by_view(&mut value, view);
+            }
+            rewrite = true;
+        }
+        let returns_routed_experts = value["return_routed_experts"].as_bool() == Some(true);
         let text_ids = tokenize_text(ctx, &model, &value);
         // Routing sees `text` as the engine's ids, whether or not they are forwarded.
         let routed = text_ids.as_ref().map(|ids| json!({ "input_ids": ids }));
@@ -406,6 +467,9 @@ impl PreparedRequest {
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
             responder: None,
+            franky_sandy_ids: sandy_prompt,
+            returns_routed_experts,
+            franky_sandy_experts_start: None,
         })
     }
 
@@ -527,6 +591,9 @@ impl PreparedRequest {
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
             sampling_defaults,
+            franky_sandy_ids: None,
+            returns_routed_experts: false,
+            franky_sandy_experts_start: None,
         })
     }
 
@@ -560,6 +627,9 @@ impl PreparedRequest {
             parsed_body: None,
             sampling_defaults: Vec::new(),
             responder: None,
+            franky_sandy_ids: None,
+            returns_routed_experts: false,
+            franky_sandy_experts_start: None,
         }
     }
 
@@ -576,6 +646,138 @@ impl PreparedRequest {
             return None;
         }
         Some(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    /// The ids the router rendered from this chat, which the engine reads in
+    /// place of its messages: those of the `/generate` body it lowered the chat
+    /// to, or those it forwards with the chat. `None` when the engine renders it.
+    pub(super) fn rendered_chat_ids(&self) -> Option<&[u32]> {
+        let lowered = self.responder.is_some();
+        let forwarded = self.input_ids_forwarding == Some(InputIdsForwarding::Forwarded);
+        let tokens = self.tokens.as_ref().filter(|_| lowered || forwarded)?;
+        Some(&tokens.ids)
+    }
+
+    /// Whether Sandy's leg reads ids of her own: a view of the prompt, or the
+    /// ids of a Sandy that tokenizes on its own.
+    pub(super) fn has_franky_sandy_ids(&self) -> bool {
+        self.franky_sandy_ids.is_some()
+    }
+
+    /// Sandy's own ids, for the response of a Sandy that tokenizes on its own.
+    pub(super) fn franky_sandy_ids(&self) -> Option<&[u32]> {
+        self.franky_sandy_ids.as_ref().map(SandyPrompt::ids)
+    }
+
+    /// The ids of a Sandy that tokenizes on its own, which a chain of blocks
+    /// takes to send Sandy its own ids for every block.
+    pub(super) fn take_franky_sandy_ids(&mut self) -> Option<Vec<u32>> {
+        self.franky_sandy_ids.take().map(SandyPrompt::into_ids)
+    }
+
+    /// Sends a Sandy that tokenizes on its own `ids` in place of Ricky's.
+    pub(super) fn set_franky_sandy_ids(&mut self, ids: Vec<u32>) {
+        self.franky_sandy_ids = Some(SandyPrompt::Own(ids));
+    }
+
+    /// Adds `spans` to the engine body as `franky_generated_spans`.
+    pub(super) fn add_franky_generated_spans(
+        &mut self,
+        spans: &[Range<usize>],
+    ) -> Result<(), ApiError> {
+        self.edit_body(|body| body["franky_generated_spans"] = json!(span_pairs(spans)))
+    }
+
+    /// Gives Ricky's legs Sandy's input ids, which key Ricky's taps, and the
+    /// runs of the earlier answers in Sandy's tokens, `generated_spans` being
+    /// their runs in Ricky's, and keeps Sandy's ids for its leg.
+    pub(super) fn add_franky_sandy_chat(
+        &mut self,
+        generated_spans: &[Range<usize>],
+        sandy: SandyChat,
+    ) -> Result<(), ApiError> {
+        self.edit_body(|body| {
+            body["franky_sandy_input_ids"] = json!(sandy.input_ids);
+            if !generated_spans.is_empty() {
+                body["franky_generated_spans"] = json!(span_pairs(generated_spans));
+                body["franky_sandy_spans"] = json!(span_pairs(&sandy.generated_spans));
+            }
+        })?;
+        self.franky_sandy_ids = Some(SandyPrompt::Own(sandy.input_ids));
+        Ok(())
+    }
+
+    fn edit_body(&mut self, edit: impl FnOnce(&mut Value)) -> Result<(), ApiError> {
+        let mut body = match self.parsed_body.take() {
+            Some(parsed_body) => parsed_body,
+            None => serde_json::from_slice(&self.body).map_err(|_| invalid_request())?,
+        };
+        edit(&mut body);
+        self.body = serde_json::to_vec(&body)
+            .map_err(|error| ApiError::Internal(error.into()))?
+            .into();
+        self.parsed_body = Some(body);
+        Ok(())
+    }
+
+    /// The engine body of a Franky request's Sandy leg: Ricky's body, with
+    /// Sandy's own ids or view of the prompt when she has them; a Sandy that
+    /// tokenizes on its own gets none of the fields that count Ricky's tokens.
+    /// It asks for the routed experts of Sandy's tokens from
+    /// `franky_sandy_experts_start` on when Ricky's body asks for his: from her
+    /// first token for a Sandy with her own tokens, else from Ricky's start.
+    pub(super) fn sandy_outgoing_body(
+        &mut self,
+        ctx: &AppContext,
+        franky_room: &FrankyRoom,
+        engine_rid: Option<&str>,
+    ) -> Result<Bytes, ApiError> {
+        let own_tokens = matches!(self.franky_sandy_ids, Some(SandyPrompt::Own(_)));
+        let experts_start = match self.franky_sandy_experts_start {
+            None if own_tokens => Some(0),
+            start => start,
+        }
+        .filter(|_| self.returns_routed_experts);
+        let Some(sandy_prompt) = &self.franky_sandy_ids else {
+            let body = self.outgoing_body(ctx, None, Some(franky_room), engine_rid)?;
+            return match experts_start {
+                Some(start) => with_routed_experts_start(&body, start),
+                None => Ok(body),
+            };
+        };
+        let mut body: Value = serde_json::from_slice(&self.body).map_err(|_| invalid_request())?;
+        let Value::Object(fields) = &mut body else {
+            return Err(invalid_request());
+        };
+        let ricky_fields = [
+            "franky_generated_spans",
+            "franky_sandy_spans",
+            "franky_sandy_input_ids",
+            "franky_sandy_block_starts",
+            "franky_write_ranges",
+        ];
+        for ricky_field in ricky_fields.iter().filter(|_| own_tokens) {
+            fields.remove(*ricky_field);
+        }
+        fields.insert("input_ids".into(), json!(sandy_prompt.ids()));
+        if let Some(start) = experts_start {
+            fields.insert("routed_experts_start_len".into(), start.into());
+        }
+        build_outgoing_body(
+            &self.body,
+            Some(body),
+            None,
+            None,
+            Some(franky_room),
+            &self.sampling_defaults,
+            engine_rid,
+        )
+    }
+
+    /// Sandy's leg returns the routed experts of her tokens from `start` on, the
+    /// first of a chain's block that she has not computed before.
+    pub(super) fn set_franky_sandy_experts_start(&mut self, start: usize) {
+        self.franky_sandy_experts_start = Some(start);
     }
 
     /// The engine body for one dispatch attempt; each attempt brings its own
@@ -880,6 +1082,10 @@ pub(super) struct RoutingFields {
     caller_set_rid: bool,
     /// A completions `prompt` listing several prompts, as strings or id lists.
     prompt_batch: bool,
+    /// The client's Franky fields that the engines read (its earlier answers and
+    /// a Sandy's own ids), which the v1 `GenerateRequest` that lowering builds
+    /// has no field for.
+    franky_fields: Vec<(&'static str, Value)>,
 }
 
 impl RoutingFields {
@@ -1032,8 +1238,18 @@ enum RequestKey {
     Sampling(SamplingField),
     Rid,
     Prompt,
+    Franky(&'static str),
     Other,
 }
+
+/// The Franky fields of a client request that the engines read and lowering
+/// keeps.
+const FRANKY_REQUEST_FIELDS: [&str; 4] = [
+    "franky_generated_spans",
+    "franky_sandy_input_ids",
+    "franky_sandy_spans",
+    "franky_sandy_block_starts",
+];
 
 impl<'de> Deserialize<'de> for RequestKey {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -1053,9 +1269,12 @@ impl<'de> Deserialize<'de> for RequestKey {
                     "max_completion_tokens" => RequestKey::Routing(RoutingKey::MaxCompletionTokens),
                     "rid" => RequestKey::Rid,
                     "prompt" => RequestKey::Prompt,
-                    other => match SamplingField::from_wire_name(other) {
-                        Some(field) => RequestKey::Sampling(field),
-                        None => RequestKey::Other,
+                    other => match FRANKY_REQUEST_FIELDS.iter().find(|name| **name == other) {
+                        Some(name) => RequestKey::Franky(name),
+                        None => match SamplingField::from_wire_name(other) {
+                            Some(field) => RequestKey::Sampling(field),
+                            None => RequestKey::Other,
+                        },
                     },
                 })
             }
@@ -1117,6 +1336,11 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                     let prompt = map.next_value::<Value>()?;
                     fields.prompt_batch =
                         prompt.get(0).is_some_and(|p| p.is_string() || p.is_array());
+                }
+                RequestKey::Franky(name) => {
+                    if let Some(value) = map.next_value::<Option<Value>>()? {
+                        fields.franky_fields.push((name, value));
+                    }
                 }
                 RequestKey::Other => {
                     // Validate unrelated JSON without retaining its contents.
@@ -1243,6 +1467,10 @@ pub(super) struct FrankyRoom {
     pub(super) host: String,
     pub(super) port: Option<u16>,
     pub(super) room: u64,
+}
+
+fn span_pairs(spans: &[Range<usize>]) -> Vec<[usize; 2]> {
+    spans.iter().map(|span| [span.start, span.end]).collect()
 }
 
 /// Append JSON-encoded `fields` before the closing brace, so they win over
@@ -1584,13 +1812,155 @@ pub(super) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiErr
     Err(invalid_request())
 }
 
-fn invalid_request() -> ApiError {
+/// Takes the client's `franky_sandy_input_ids`, Sandy's own view of the
+/// prompt, out of a `/generate` body, so no engine sees the field. Design A
+/// replaces Sandy's part one for one by filler in Ricky's view, so every tap
+/// keeps its position: the two views must be token ids of one length.
+///
+/// Errors: `ApiError::BadRequest` for a view that is not token ids, a prompt
+/// sent as text or a batch, or views of different lengths.
+fn take_sandy_input_ids(value: &mut Value) -> Result<Option<Vec<u32>>, ApiError> {
+    let Some(fields) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(view) = fields.remove("franky_sandy_input_ids") else {
+        return Ok(None);
+    };
+    let view: Vec<u32> = serde_json::from_value(view).map_err(|_| {
+        ApiError::BadRequest("franky_sandy_input_ids must be one prompt's token ids".into())
+    })?;
+    let prompt = match fields.get("input_ids") {
+        Some(Value::Array(ids)) if ids.iter().all(Value::is_u64) => ids.len(),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "franky_sandy_input_ids needs Ricky's prompt as one prompt's input_ids".into(),
+            ))
+        }
+    };
+    if view.len() != prompt {
+        return Err(ApiError::BadRequest(format!(
+            "franky_sandy_input_ids holds {} tokens for a prompt of {prompt}: \
+             Sandy's view must be as long as Ricky's",
+            view.len()
+        )));
+    }
+    Ok(Some(view))
+}
+
+/// The client's `franky_sandy_input_ids` for a Sandy that tokenizes on its own:
+/// her token ids of the prompt, any length, which Ricky's body keeps too, since
+/// they key his cached taps.
+///
+/// Errors: `ApiError::BadRequest` for ids that are not token ids, or a prompt
+/// that is not one prompt's `input_ids`.
+fn own_sandy_input_ids(value: &Value) -> Result<Option<Vec<u32>>, ApiError> {
+    let Some(ids) = value
+        .get("franky_sandy_input_ids")
+        .filter(|ids| !ids.is_null())
+    else {
+        return Ok(None);
+    };
+    let ids: Vec<u32> = serde_json::from_value(ids.clone()).map_err(|_| {
+        ApiError::BadRequest("franky_sandy_input_ids must be one prompt's token ids".into())
+    })?;
+    match value.get("input_ids") {
+        Some(Value::Array(prompt)) if prompt.iter().all(Value::is_u64) => Ok(Some(ids)),
+        _ => Err(ApiError::BadRequest(
+            "franky_sandy_input_ids needs Ricky's prompt as one prompt's input_ids".into(),
+        )),
+    }
+}
+
+/// `body` with `routed_experts_start_len` set to `start`.
+fn with_routed_experts_start(body: &Bytes, start: usize) -> Result<Bytes, ApiError> {
+    let mut value: Value = serde_json::from_slice(body).map_err(|_| invalid_request())?;
+    value["routed_experts_start_len"] = start.into();
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| ApiError::Internal(error.into()))
+}
+
+/// Ricky's aligned readers write only where Sandy's view differs from his own
+/// tokens. Lists those positions as `[start, end)` runs of `input_ids` in
+/// `franky_write_ranges`, which his engine takes its writes from; a body whose
+/// views agree gets none. Views of one length come from [`take_sandy_input_ids`].
+fn add_write_ranges(value: &mut Value, view: &[u32]) {
+    let fields = value.as_object_mut().expect("parsed as an object");
+    let Some(Value::Array(ids)) = fields.get("input_ids") else {
+        return;
+    };
+    let mut ranges: Vec<[usize; 2]> = Vec::new();
+    for (position, (ricky, &sandy)) in ids.iter().zip(view).enumerate() {
+        if ricky.as_u64() == Some(u64::from(sandy)) {
+            continue;
+        }
+        match ranges.last_mut() {
+            Some(last) if last[1] == position => last[1] = position + 1,
+            _ => ranges.push([position, position + 1]),
+        }
+    }
+    if !ranges.is_empty() {
+        fields.insert("franky_write_ranges".into(), json!(ranges));
+    }
+}
+
+/// Ricky's cached KV holds what his readers added, which depends on Sandy's
+/// taps and so on her view as well as on his own tokens: requests that share
+/// his tokens but not her view must not share his cache. Appends a digest of
+/// her view of the prompt to the request's `extra_key`, which SGLang's radix
+/// cache keys on, after any key of the client's own. A chain keys every block
+/// by its prompt's view, so that its blocks share the cache with each other.
+pub(super) fn key_cache_by_view(value: &mut Value, view: &[u32]) {
+    let mut hasher = DefaultHasher::new();
+    view.hash(&mut hasher);
+    let digest = format!("sandy-view:{:016x}", hasher.finish());
+    let fields = value.as_object_mut().expect("parsed as an object");
+    let key = match fields.get("extra_key").and_then(Value::as_str) {
+        // a chain's blocks start from its prepared request, which is keyed already
+        Some(keyed) if keyed == digest || keyed.ends_with(&format!("|{digest}")) => return,
+        Some(client) if !client.is_empty() => format!("{client}|{digest}"),
+        _ => digest,
+    };
+    fields.insert("extra_key".into(), Value::String(key));
+}
+
+pub(super) fn invalid_request() -> ApiError {
     ApiError::BadRequest("invalid request: body must be a JSON object".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ricky_writes_only_where_sandys_view_differs_from_his_tokens() {
+        let mut parted = json!({"input_ids": [1, 220, 220, 4, 220, 6]});
+        let mut same = json!({"input_ids": [1, 2, 3]});
+        add_write_ranges(&mut parted, &[1, 7, 8, 4, 9, 6]);
+        add_write_ranges(&mut same, &[1, 2, 3]);
+        assert_eq!(parted["franky_write_ranges"], json!([[1, 3], [4, 5]]));
+        assert!(same.get("franky_write_ranges").is_none());
+    }
+
+    #[test]
+    fn a_sandy_view_keys_the_cache_after_the_clients_own_key() {
+        let mut first = json!({"input_ids": [1, 2, 3]});
+        let mut same = json!({"input_ids": [1, 2, 3]});
+        let mut other = json!({"input_ids": [1, 2, 3]});
+        let mut keyed = json!({"input_ids": [1, 2, 3], "extra_key": "eval:7"});
+        key_cache_by_view(&mut first, &[1, 9, 3]);
+        key_cache_by_view(&mut same, &[1, 9, 3]);
+        key_cache_by_view(&mut other, &[1, 8, 3]);
+        key_cache_by_view(&mut keyed, &[1, 9, 3]);
+        let key = |value: &Value| value["extra_key"].as_str().unwrap().to_owned();
+        assert!(key(&first).starts_with("sandy-view:"));
+        assert_eq!(key(&first), key(&same));
+        assert_ne!(key(&first), key(&other));
+        assert_eq!(key(&keyed), format!("eval:7|{}", key(&first)));
+        let mut twice = keyed.clone();
+        key_cache_by_view(&mut twice, &[1, 9, 3]);
+        assert_eq!(key(&twice), key(&keyed));
+    }
     use crate::tokenizer::TokenizerRegistry;
     use std::sync::Arc;
 
@@ -1892,6 +2262,77 @@ mod tests {
                         .unwrap();
                 assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), expected);
             }
+        }
+    }
+
+    #[test]
+    fn franky_generated_spans_reach_every_outgoing_body() {
+        let ctx = AppContext::stub();
+        let body = Bytes::from(json!({"input_ids": [1, 2, 3, 4]}).to_string());
+        let model = ModelId("stub-model".into());
+        let mut request = PreparedRequest::generate(&ctx, model, body).unwrap();
+        let room = FrankyRoom {
+            host: "h".into(),
+            port: Some(9),
+            room: 42,
+        };
+
+        request
+            .add_franky_generated_spans(&[Range { start: 1, end: 3 }])
+            .unwrap();
+        let first = request
+            .outgoing_body(&ctx, None, Some(&room), None)
+            .unwrap();
+        let retry = request
+            .outgoing_body(&ctx, None, Some(&room), None)
+            .unwrap();
+
+        for body in [first, retry] {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["input_ids"], json!([1, 2, 3, 4]));
+            assert_eq!(body["franky_generated_spans"], json!([[1, 3]]));
+        }
+    }
+
+    #[test]
+    fn a_sandy_with_its_own_tokens_gets_its_ids_and_ricky_the_spans_in_both() {
+        let ctx = AppContext::stub();
+        let body = Bytes::from(json!({"input_ids": [1, 2, 3, 4, 5, 6]}).to_string());
+        let model = ModelId("stub-model".into());
+        let mut request = PreparedRequest::generate(&ctx, model, body).unwrap();
+        let room = FrankyRoom {
+            host: "h".into(),
+            port: Some(9),
+            room: 42,
+        };
+        let sandy_chat = SandyChat {
+            input_ids: vec![7, 8, 9, 10, 11],
+            generated_spans: vec![Range { start: 2, end: 4 }],
+        };
+
+        request
+            .add_franky_sandy_chat(&[Range { start: 1, end: 3 }], sandy_chat)
+            .unwrap();
+        let ricky = request
+            .outgoing_body(&ctx, None, Some(&room), None)
+            .unwrap();
+        let sandy = request.sandy_outgoing_body(&ctx, &room, None).unwrap();
+
+        let ricky: Value = serde_json::from_slice(&ricky).unwrap();
+        let sandy: Value = serde_json::from_slice(&sandy).unwrap();
+        assert_eq!(ricky["input_ids"], json!([1, 2, 3, 4, 5, 6]));
+        assert_eq!(ricky["franky_generated_spans"], json!([[1, 3]]));
+        assert_eq!(ricky["franky_sandy_spans"], json!([[2, 4]]));
+        assert_eq!(ricky["franky_sandy_input_ids"], json!([7, 8, 9, 10, 11]));
+        assert_eq!(sandy["input_ids"], json!([7, 8, 9, 10, 11]));
+        assert_eq!(sandy["franky_room"], ricky["franky_room"]);
+        for ricky_field in [
+            "franky_generated_spans",
+            "franky_sandy_spans",
+            "franky_sandy_input_ids",
+            "franky_write_ranges",
+        ] {
+            assert!(sandy.get(ricky_field).is_none(), "{ricky_field}");
         }
     }
 

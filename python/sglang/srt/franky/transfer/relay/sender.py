@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-import numpy.typing as npt
+import numpy as np
 from typing_extensions import override
 
 from sglang.srt.disaggregation.nixl.conn import NixlKVSender
@@ -14,8 +14,9 @@ if TYPE_CHECKING:
 
 
 class FrankyRelaySender(NixlKVSender):
-    """PD's KV sender on Ricky prefill that also relays the taps of each page it
-    sends to Ricky decode, and ends only when both transfers ended.
+    """PD's KV sender on Ricky prefill that also relays the request's taps to
+    Ricky decode in the same room, once they all landed here, and ends only
+    when both transfers ended.
     """
 
     kv_mgr: FrankyRelayManager
@@ -32,32 +33,24 @@ class FrankyRelaySender(NixlKVSender):
         )
         self.tap_sender: Optional[FrankyRoomSender] = None
 
-    @override
-    def init(self, num_kv_indices: int, aux_index: Optional[int] = None) -> None:
-        super().init(num_kv_indices, aux_index)
+    def relay_taps(self, *, tap_pages: np.ndarray) -> None:
+        """Relay all of the request's taps at once.
+
+        Args:
+            tap_pages: int32, per page of the request, its local page here or -1.
+        """
+        if self.tap_sender is not None:
+            return
         self.tap_sender = FrankyRoomSender(
             manager=self.kv_mgr.tap_relay,
             franky_room=self._relay_room(),
-            num_pages=num_kv_indices,
+            num_pages=len(tap_pages),
         )
+        self.tap_sender.land(tap_pages=tap_pages)
 
-    @override
-    def send(
-        self,
-        kv_indices: npt.NDArray,
-        state_indices: Optional[list] = None,
-        num_kv_tokens: Optional[int] = None,
-        indices_event: Optional[object] = None,
-    ) -> None:
-        super().send(
-            kv_indices,
-            state_indices,
-            num_kv_tokens=num_kv_tokens,
-            indices_event=indices_event,
-        )
-        self.tap_sender.land(
-            tap_pages=self.kv_mgr.tap_cache.pages_of(kv_pages=kv_indices)
-        )
+    @property
+    def relays_taps(self) -> bool:
+        return self.tap_sender is not None
 
     @override
     def poll(self) -> int:
