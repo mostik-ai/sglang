@@ -71,6 +71,7 @@ class RickyTapCache:
     """Ricky's tap pool on this rank, on Ricky prefill and Ricky decode alike, and
     whichever tokenizer Sandy uses: taps count Sandy's tokens. The model's parts
     own the pages; this cache hands them to requests and keeps finished ones.
+    ``version`` counts the calls that change what it holds.
 
     Request page ``k`` holds the taps of Sandy's tokens ``[k * page_size,
     (k + 1) * page_size)``, and ``stripes`` says which rank keeps it. Each stripe
@@ -97,6 +98,7 @@ class RickyTapCache:
             mock_allocator=self._pages, page_size=self.stripe_size
         )
         self._stripe_offsets = torch.arange(self.stripe_size, dtype=torch.int64)
+        self.version = 0
 
     def match(self, sandy_ids: Sequence[int]) -> CachedTaps:
         """
@@ -119,6 +121,7 @@ class RickyTapCache:
             int64 host local pages of ``num_stripes`` new stripes, after evicting
             the cached stripes that no request holds as needed.
         """
+        self.version += 1
         num_tokens = num_stripes * self.stripe_size
         shortfall = num_tokens - self._pages.available_size()
         if shortfall > 0:
@@ -137,6 +140,7 @@ class RickyTapCache:
             A lock on the cached stripes, for a holder that keeps them for a later
             request; ``release`` ends it.
         """
+        self.version += 1
         num_whole = reservation.num_taps // self.stripe_size
         pages = reservation.pages
         values = (
@@ -160,15 +164,18 @@ class RickyTapCache:
         """Give back a request's pages and its hold on what it took from the tree,
         caching nothing: its taps did not all land.
         """
+        self.version += 1
         self.free(reservation.pages[len(reservation.cached.pages) :])
         self._tree.unlock(reservation.cached.lock)
 
     def free(self, pages: torch.Tensor) -> None:
         """Give back local pages that no tree node holds."""
+        self.version += 1
         self._pages.free_page_ids(pages)
 
     def release(self, lock: TreeLock) -> None:
         """End a lock from ``match`` or ``cache``."""
+        self.version += 1
         self._tree.unlock(lock)
 
     def pages_to_land(self, reservation: TapReservation) -> np.ndarray:
@@ -211,6 +218,7 @@ class RickyTapCache:
 
     def reset(self) -> None:
         """Drop every cached stripe; no request may hold any."""
+        self.version += 1
         self._tree.reset()
         self._pages.clear()
 

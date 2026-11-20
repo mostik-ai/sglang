@@ -82,6 +82,9 @@ class RickyTapRequests:
         self._reserved: dict[str, _Reserved] = {}
         self._refused: dict[str, _Refused] = {}
         self._rids_by_room: dict[int, str] = {}
+        # The first waiting request that did not fit, and the tap pool's version
+        # then: it cannot fit before the pool changes.
+        self._blocked: Optional[tuple[str, int]] = None
 
     def arrive(self, req: Req) -> Optional[str]:
         """A request came; one back from a retraction keeps what it had. A request
@@ -131,8 +134,11 @@ class RickyTapRequests:
         self._chain_holds.put_held_chains_first(in_order)
         reserved = []
         for req in in_order:
+            if self._blocked == (req.rid, self._tap_cache.version):
+                break
             reservation = self._reserve(self._waiting[req.rid])
             if reservation is None:
+                self._blocked = (req.rid, self._tap_cache.version)
                 break
             del self._waiting[req.rid]
             self._reserved[req.rid] = _Reserved(req=req, reservation=reservation)
