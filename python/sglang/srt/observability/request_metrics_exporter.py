@@ -23,9 +23,9 @@ ALWAYS_EXCLUDE_FIELDS = {
     "input_embeds",
     "text",
     "input_ids",
-    # Franky: the prompt in Sandy's tokens.
-    "franky_sandy_input_ids",
 }
+# Any other field of token ids of the prompt, in whichever tokenizer.
+ALWAYS_EXCLUDE_SUFFIX = "input_ids"
 
 # Records are written in batches: one write per request, with its worker-thread
 # hop and flush, cost the API server about 9% of its throughput at 80 requests/s.
@@ -72,6 +72,7 @@ class RequestMetricsExporter(ABC):
             if (
                 field_name not in self.obj_skip_names
                 and field_name not in ALWAYS_EXCLUDE_FIELDS
+                and not field_name.endswith(ALWAYS_EXCLUDE_SUFFIX)
             ):
                 value = getattr(obj, field_name)
                 # Convert to serializable format

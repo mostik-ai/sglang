@@ -2,9 +2,10 @@
 
 Every rank stores its rows into every rank's symmetric buffer over NVLink P2P
 and merges them by their log-sum-exp (``franky_reader_exchange_merge``). The
-result, and whether any rank read taps for each row, must match merging the
-NCCL-gathered rows in float32, for natural and base-2 log-sum-exp, rows some or
-no rank reads taps for, eager and in a CUDA graph replayed with new inputs.
+result, and whether each row reads taps, must match merging the NCCL-gathered
+rows in float32: for natural and base-2 log-sum-exp; rows some, all or no rank
+reads taps for; merges of every size back to back with nothing between them;
+eager and in a CUDA graph replayed with new inputs.
 
 Usage::
 
@@ -23,7 +24,7 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
-from sglang.srt.franky.parts.reader.tap_merge import TapExchange, TapMerge
+from sglang.srt.franky.parts.reader.tap_merge import TapMerge
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -51,18 +52,27 @@ def _world() -> ps.GroupCoordinator:
     return ps._WORLD
 
 
-@cache_once
 def _merge(num_queries: int) -> TapMerge:
     merge = TapMerge.build(
-        group=_world(), max_rows=MAX_ROWS, num_queries=num_queries, tap_size=TAP_SIZE
+        group=_world(),
+        max_rows=MAX_ROWS,
+        num_queries=num_queries,
+        tap_size=TAP_SIZE,
+        nnodes=1,
     )
-    assert merge.exchange is not None, "the test GPUs must reach each other over P2P"
+    assert merge.exchange is not None
     return merge
 
 
+def _gather(tensor: torch.Tensor) -> torch.Tensor:
+    return _world().all_gather(tensor.unsqueeze(0).contiguous(), dim=0)
+
+
 def _rank_inputs(rows: int, num_queries: int, *, seed: int):
-    """This rank's results: some rows read no taps here, and row 0 reads none on
-    any rank."""
+    """This rank's results: some rows read no taps here; row 0 reads none on any
+    rank and row 1 reads taps on every rank. A rank that keeps none of a row's
+    taps leaves garbage there, as the attention kernels do.
+    """
     rank = _world().rank_in_group
     generator = torch.Generator(device="cuda").manual_seed(seed * 101 + rank)
     local_out = torch.randn(
@@ -74,21 +84,18 @@ def _rank_inputs(rows: int, num_queries: int, *, seed: int):
     )
     local_taps[torch.rand(rows, generator=generator, device="cuda") < 0.3] = 0
     local_taps[0] = 0
-    # A rank that reads no taps for a row leaves garbage there, as the kernels do.
+    if rows > 1:
+        local_taps[1] = 7
     local_out[local_taps == 0] = float("nan")
-    return local_out, lse, local_taps
+    no_taps = ~(_gather(local_taps) > 0).any(dim=0)
+    return local_out, lse, local_taps, no_taps
 
 
 def _reference(local_out, lse, local_taps, *, lse_is_base_e: bool):
     """Returns:
-    The merged rows, and whether any rank read taps for each row.
+    The merged rows, and whether each row reads taps.
     """
-    group = _world()
-
-    def gather(tensor):
-        return group.all_gather(tensor.unsqueeze(0).contiguous(), dim=0)
-
-    outs, lses, taps = gather(local_out).float(), gather(lse), gather(local_taps)
+    outs, lses, taps = _gather(local_out).float(), _gather(lse), _gather(local_taps)
     reads = (taps > 0)[..., None]
     lses = torch.where(reads, lses, float("-inf"))
     if not lse_is_base_e:
@@ -98,6 +105,32 @@ def _reference(local_out, lse, local_taps, *, lse_is_base_e: bool):
     return merged, (taps > 0).any(dim=0)[:, None].float()
 
 
+def _run(merge, inputs, *, lse_is_base_e):
+    local_out, lse, local_taps, no_taps = inputs
+    out = torch.full_like(local_out, float("nan"))
+    has_taps = torch.full((local_out.shape[0], 1), float("nan"), device="cuda")
+    merge.merge(
+        local_out,
+        lse,
+        local_taps,
+        no_taps,
+        out=out,
+        has_taps=has_taps,
+        lse_is_base_e=lse_is_base_e,
+    )
+    return out, has_taps
+
+
+def _assert_merged(inputs, out, has_taps, *, lse_is_base_e):
+    local_out, lse, local_taps, _ = inputs
+    expected, expected_has_taps = _reference(
+        local_out, lse, local_taps, lse_is_base_e=lse_is_base_e
+    )
+    torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(has_taps, expected_has_taps)
+    assert torch.all(out[0] == 0), "a row no rank reads taps for must be zeros"
+
+
 @pytest.mark.parametrize("lse_is_base_e", [True, False])
 @pytest.mark.parametrize("num_queries", [1, 2])
 @pytest.mark.parametrize("rows", [1, 3, 64, 257, MAX_ROWS])
@@ -105,78 +138,84 @@ def _reference(local_out, lse, local_taps, *, lse_is_base_e: bool):
 def test_exchange_merge_matches_gathered_merge(rows, num_queries, lse_is_base_e):
     merge = _merge(num_queries)
     for repeat in range(REPEATS):
-        local_out, lse, local_taps = _rank_inputs(rows, num_queries, seed=repeat)
-        expected, expected_has_taps = _reference(
-            local_out, lse, local_taps, lse_is_base_e=lse_is_base_e
-        )
-        out = torch.full_like(local_out, float("nan"))
-        has_taps = torch.full((rows, 1), float("nan"), device="cuda")
-        merge.merge(
-            local_out,
-            lse,
-            local_taps,
-            out=out,
-            has_taps=has_taps,
-            lse_is_base_e=lse_is_base_e,
-        )
-        torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(has_taps, expected_has_taps)
-        assert torch.all(out[0] == 0), "a row no rank reads taps for must be zeros"
+        inputs = _rank_inputs(rows, num_queries, seed=repeat)
+        out, has_taps = _run(merge, inputs, lse_is_base_e=lse_is_base_e)
+        _assert_merged(inputs, out, has_taps, lse_is_base_e=lse_is_base_e)
+
+
+@torch.inference_mode()
+def test_merges_of_every_size_run_back_to_back():
+    """No collective runs between these merges, and their grids differ: a rank
+    that runs ahead must neither store into rows a peer still merges nor skip a
+    barrier.
+    """
+    merge = _merge(1)
+    sizes = [1, 64, MAX_ROWS, 3, 257, 1, MAX_ROWS, 2, 128]
+    inputs = [
+        _rank_inputs(rows, 1, seed=50 + index) for index, rows in enumerate(sizes)
+    ]
+    torch.cuda.synchronize()
+    dist.barrier()
+    results = [_run(merge, each, lse_is_base_e=False) for each in inputs]
+    torch.cuda.synchronize()
+    for each, (out, has_taps) in zip(inputs, results):
+        _assert_merged(each, out, has_taps, lse_is_base_e=False)
+
+
+@torch.inference_mode()
+def test_each_merge_counts_once_on_each_of_its_programs():
+    merge = _merge(1)
+    for rows in (1, 300, 5):
+        inputs = _rank_inputs(rows, 1, seed=rows)
+        before = merge.exchange.epochs.tolist()
+        _run(merge, inputs, lse_is_base_e=True)
+        torch.cuda.synchronize()
+        programs = min(-(-rows // 4), 64)
+        expected = [epoch + (pid < programs) for pid, epoch in enumerate(before)]
+        assert merge.exchange.epochs.tolist() == expected
 
 
 @pytest.mark.parametrize("rows", [1, 64])
 @torch.inference_mode()
 def test_exchange_merge_replays_in_a_cuda_graph(rows):
     merge = _merge(1)
-    local_out, lse, local_taps = _rank_inputs(rows, 1, seed=7)
+    inputs = _rank_inputs(rows, 1, seed=7)
+    local_out, lse, local_taps, no_taps = inputs
     out = torch.empty_like(local_out)
     has_taps = torch.empty((rows, 1), dtype=torch.bfloat16, device="cuda")
 
     def step():
         merge.merge(
-            local_out, lse, local_taps, out=out, has_taps=has_taps, lse_is_base_e=False
+            local_out,
+            lse,
+            local_taps,
+            no_taps,
+            out=out,
+            has_taps=has_taps,
+            lse_is_base_e=False,
         )
 
     step()
     torch.cuda.synchronize()
-    # Merges over one buffer need a collective between them, as Ricky's layers
-    # run between readers; here the reference's gathers are that collective.
-    dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         step()
     for repeat in range(REPEATS):
-        new_out, new_lse, new_taps = _rank_inputs(rows, 1, seed=20 + repeat)
-        local_out.copy_(new_out)
-        lse.copy_(new_lse)
-        local_taps.copy_(new_taps)
+        new_inputs = _rank_inputs(rows, 1, seed=20 + repeat)
+        for tensor, new in zip(inputs, new_inputs):
+            tensor.copy_(new)
         graph.replay()
-        expected, expected_has_taps = _reference(
-            local_out, lse, local_taps, lse_is_base_e=False
-        )
-        torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(has_taps.float(), expected_has_taps)
+        graph.replay()
+        _assert_merged(inputs, out, has_taps.float(), lse_is_base_e=False)
 
 
 def test_more_rows_than_a_slot_merge_over_nccl():
     merge = _merge(1)
     rows = merge.exchange.slot_rows + 5
-    local_out, lse, local_taps = _rank_inputs(rows, 1, seed=3)
-    out = torch.empty_like(local_out)
-    has_taps = torch.empty((rows, 1), device="cuda")
     with torch.inference_mode():
-        merge.merge(
-            local_out, lse, local_taps, out=out, has_taps=has_taps, lse_is_base_e=True
-        )
-        expected, expected_has_taps = _reference(
-            local_out, lse, local_taps, lse_is_base_e=True
-        )
-    torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(has_taps, expected_has_taps)
-
-
-def test_exchange_is_built_on_one_node():
-    assert isinstance(_merge(1).exchange, TapExchange)
+        inputs = _rank_inputs(rows, 1, seed=3)
+        out, has_taps = _run(merge, inputs, lse_is_base_e=True)
+        _assert_merged(inputs, out, has_taps, lse_is_base_e=True)
 
 
 if __name__ == "__main__":

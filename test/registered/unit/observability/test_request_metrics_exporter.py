@@ -359,7 +359,7 @@ class TestPromptLeftOut(unittest.TestCase):
         self.assertNotIn("input_ids", params)
         self.assertEqual(result["stage_times"], {})
 
-    def test_sandy_token_ids_stay_out_of_every_record(self):
+    def test_every_input_ids_field_stays_out_of_every_record(self):
         server_args = _make_server_args("/tmp/unused")
         exporter = _ConcreteExporter(
             server_args, obj_skip_names=None, out_skip_names=None

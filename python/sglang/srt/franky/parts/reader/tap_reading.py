@@ -31,8 +31,6 @@ class TapReading(msgspec.Struct, frozen=True, kw_only=True):
         no_taps: [rows + 1] bool, whether each row reads no tap.
         has_taps: [rows + 1, 1], 1 for rows that read taps and 0 for the rest.
         num_rows: the real rows; a CUDA graph pads after them.
-        merged_rows: the rows whose results the ranks merge; None for all real
-            rows.
         row_blocks: the prefill kernel's row blocks; None for a decode forward.
     """
 
@@ -42,7 +40,6 @@ class TapReading(msgspec.Struct, frozen=True, kw_only=True):
     no_taps: torch.Tensor
     has_taps: torch.Tensor
     num_rows: int
-    merged_rows: Optional[torch.Tensor] = None
     row_blocks: Optional[torch.Tensor] = None
 
     @staticmethod
@@ -148,7 +145,6 @@ def _extend_reading(
         no_taps=~reads_on_device,
         has_taps=reads_on_device.to(mask_dtype)[:, None],
         num_rows=total_rows,
-        merged_rows=_to_device(torch.nonzero(reads).flatten(), device=device),
         row_blocks=franky_reader_row_blocks(num_rows, device=device),
     )
 

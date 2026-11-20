@@ -69,7 +69,8 @@ class FrankyTapManager(NixlKVManager):
             engine_rank: the rank within attention TP on a receiving engine.
             senders_split_alike: on a receiving engine, whether the sending
                 engine splits taps over its attention-TP ranks as this one does,
-                page by request page: Ricky prefill to Ricky decode.
+                by a request's page: Ricky prefill to Ricky decode. Sandy splits
+                its tap pages by KV slot, so its senders never split alike.
         """
         aux_buffer = torch.zeros(_AUX_BYTES, dtype=torch.uint8)
         return FrankyTapManager(

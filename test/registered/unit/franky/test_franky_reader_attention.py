@@ -254,7 +254,6 @@ class TestTapReading(CustomTestCase):
                     reading.has_taps[:, 0].tolist(),
                     [float(taps > 0) for taps in _EXTEND_TAPS] + [0.0],
                 )
-                self.assertEqual(reading.merged_rows.tolist(), [1, 2, 5, 8])
                 self.assertEqual(
                     reading.page_table[[0, 6, 9]].tolist(), [[3, 1], [2, 0], [0, 0]]
                 )
@@ -270,7 +269,6 @@ class TestTapReading(CustomTestCase):
                 self.assertEqual(
                     (~reading.no_taps).tolist(), [True, True, False, False]
                 )
-                self.assertIsNone(reading.merged_rows)
                 self.assertIsNone(reading.row_blocks)
                 self.assertEqual(
                     reading.page_table[:, :2].tolist(), [[2, 0], [3, 1], [0, 0]]
@@ -405,6 +403,7 @@ class TestTapAttention(CustomTestCase):
         other_out = torch.randn(2, 1, _TAP_SIZE, dtype=TAP_DTYPE)
         other_lse = torch.tensor([[1.5], [float("-inf")]])
         local_taps = torch.tensor([3, 0], dtype=torch.int32)
+        no_taps = torch.tensor([False, True])
         ranks = _Ranks(2)
         merges = [TapMerge(group=ranks.group(rank), exchange=None) for rank in range(2)]
         merged = torch.full_like(out, float("nan"))
@@ -413,13 +412,20 @@ class TestTapAttention(CustomTestCase):
             other_out,
             other_lse,
             local_taps,
+            no_taps,
             out=torch.empty_like(out),
             has_taps=torch.empty_like(has_taps),
             lse_is_base_e=True,
         )
 
         merges[0].merge(
-            out, lse, local_taps, out=merged, has_taps=has_taps, lse_is_base_e=True
+            out,
+            lse,
+            local_taps,
+            no_taps,
+            out=merged,
+            has_taps=has_taps,
+            lse_is_base_e=True,
         )
 
         weights = torch.softmax(torch.tensor([0.5, 1.5]), dim=0)

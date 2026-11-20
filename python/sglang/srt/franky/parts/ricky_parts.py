@@ -17,7 +17,7 @@ from sglang.srt.franky.parts.franky_parts import FrankyParts, load_part
 from sglang.srt.franky.parts.reader.current_tap_reading import CurrentTapReading
 from sglang.srt.franky.parts.reader.tap_attention import TapAttention, TrtllmWorkspace
 from sglang.srt.franky.parts.reader.tap_merge import TapMerge
-from sglang.srt.runtime_context import get_franky
+from sglang.srt.runtime_context import get_franky, get_parallel
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -156,6 +156,7 @@ class RickyParts(FrankyParts):
             max_rows=recommended_max_tokens(include_prefill=True, floor=256),
             num_queries=self.config.reader.num_queries,
             tap_size=self.config.encoder.output_size,
+            nnodes=get_parallel().nnodes,
         )
 
     def _build_attentions(self) -> dict[int, TapAttention]:

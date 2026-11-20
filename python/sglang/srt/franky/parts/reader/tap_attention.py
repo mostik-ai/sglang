@@ -159,7 +159,6 @@ class TapAttention:
         """
         num_rows = queries.shape[0]
         kernel = self._local_kernel(queries, reading)
-        rows = reading.merged_rows
         if self.merge is None:
             has_taps.copy_(reading.has_taps[:num_rows])
             self._attend_locally(kernel, queries, reading, out=out, lse=None)
@@ -168,31 +167,15 @@ class TapAttention:
         local_out = torch.empty_like(queries)
         lse = torch.empty(queries.shape[:2], dtype=torch.float32, device=queries.device)
         self._attend_locally(kernel, queries, reading, out=local_out, lse=lse)
-        local_taps = reading.local_taps[:num_rows]
-        if rows is None:
-            # The merge also writes has_taps and zeroes the rows that read none.
-            self.merge.merge(
-                local_out,
-                lse,
-                local_taps,
-                out=out,
-                has_taps=has_taps,
-                lse_is_base_e=kernel.lse_is_base_e,
-            )
-            return
-        has_taps.copy_(reading.has_taps[:num_rows])
-        if rows.shape[0] > 0:
-            merged = local_out.new_empty((rows.shape[0], *local_out.shape[1:]))
-            self.merge.merge(
-                local_out[rows],
-                lse[rows],
-                local_taps[rows],
-                out=merged,
-                has_taps=has_taps.new_empty((rows.shape[0], 1)),
-                lse_is_base_e=kernel.lse_is_base_e,
-            )
-            out[rows] = merged
-        out.masked_fill_(reading.no_taps[:num_rows, None, None], 0)
+        self.merge.merge(
+            local_out,
+            lse,
+            reading.local_taps[:num_rows],
+            reading.no_taps[:num_rows],
+            out=out,
+            has_taps=has_taps,
+            lse_is_base_e=kernel.lse_is_base_e,
+        )
 
     def _local_kernel(self, queries: torch.Tensor, reading: TapReading) -> LocalKernel:
         if reading.row_blocks is not None and queries.shape[1] == 1 and queries.is_cuda:
