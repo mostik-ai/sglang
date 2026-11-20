@@ -47,6 +47,8 @@ pub struct EngineGroup {
     /// Match any named Kubernetes Service (namespace/name), across pod replacements.
     pub worker_services: Option<HashSet<String>>,
     pub policy: Arc<dyn Policy>,
+    /// Whether it picks Franky Sandy workers; any other group never does.
+    pub sandy: bool,
 }
 
 impl EngineGroup {
@@ -55,6 +57,7 @@ impl EngineGroup {
             worker_ids: None,
             worker_services: None,
             policy,
+            sandy: false,
         }
     }
 
@@ -89,7 +92,7 @@ impl EngineGroup {
         workers
             .healthy_workers_for(model)
             .into_iter()
-            .filter(|engine| engine.mode() == stage)
+            .filter(|engine| engine.mode() == stage && engine.is_sandy() == self.sandy)
             .filter(|engine| {
                 self.worker_ids
                     .as_ref()

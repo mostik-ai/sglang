@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
-use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
+use crate::discovery::{DiscoveryEvent, FrankyRole, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::state::kv_events::KvEventIndex;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::workers::introspect::{
-    worker_client, DisaggregationRole, FrankyRole, WorkerIntrospector, SERVER_INFO_TIMEOUT,
+    worker_client, DisaggregationRole, WorkerIntrospector, SERVER_INFO_TIMEOUT,
 };
 use crate::workers::{EngineProfile, WireProtocol, Worker, WorkerRegistry};
 use std::collections::HashMap;
@@ -452,6 +452,7 @@ fn reconcile_unresolved_workers(
             bootstrap_port: worker.bootstrap_port(),
             version_group: worker.version_group().map(str::to_owned),
             services: worker.services(),
+            franky: worker.franky_role(),
         };
         // `debug!` not `info!`: this fires every interval for each
         // still-unresolved worker, so info-level would spam for one that is
@@ -565,12 +566,26 @@ async fn register_one(
             spec.bootstrap_port = new_port;
         }
     }
-    // A Sandy serves the router's model as its frozen half, whatever name it serves under.
-    if let Some(FrankyRole::Sandy { bootstrap_port }) = info.franky_role {
-        spec.mode = WorkerMode::Sandy;
-        spec.bootstrap_port = Some(bootstrap_port);
+    if info.franky_role.is_some() {
+        spec.franky = info.franky_role;
+    }
+    if matches!(spec.franky, Some(FrankyRole::Sandy { .. })) {
+        // A Sandy serves the router's model as its frozen half, whatever name it serves under.
         if let Some(cfg) = &cfg {
             spec.model_ids = vec![ModelId(cfg.model.id.clone())];
+        }
+        // A Sandy leg only prefills, so chains that make them need a Sandy outside PD.
+        if spec.mode != WorkerMode::Plain
+            && cfg
+                .as_ref()
+                .is_some_and(|c| c.proxy.franky_chain.makes_sandy_legs())
+        {
+            tracing::error!(
+                worker_url = %worker_url,
+                "worker manager: refused to register a PD Sandy: --franky-chain makes \
+                 Sandy legs (sandy_call_tokens 0 with taps), which need a Sandy outside PD",
+            );
+            return;
         }
     }
     // `--decode-dispatch-limit` sends a request to decode only once earlier
@@ -617,7 +632,6 @@ async fn register_one(
         dp_ranks: info.dp_ranks,
         openai: info.openai.map(Arc::new),
         grpc_port: info.grpc_port,
-        needs_taps: info.franky_role == Some(FrankyRole::Ricky { reads_taps: true }),
     };
     if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
@@ -1412,6 +1426,7 @@ mod tests {
             bootstrap_port: None,
             version_group: Some("v1".into()),
             services: ["ns/prefill".into()].into(),
+            franky: None,
         }))
         .await
         .unwrap();

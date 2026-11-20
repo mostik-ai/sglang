@@ -19,7 +19,7 @@ use crate::policies::selection::{
 };
 use crate::policies::{Policy, PrefixLookupResult};
 use crate::policies_reorg::cache_aware::PrefixMemo;
-use crate::policies_reorg::{PickRequest, Stage};
+use crate::policies_reorg::{PickError, PickRequest, Stage};
 use crate::proxy::grpc::{EngineRpc, GrpcResponse, TypedRpc};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
@@ -315,8 +315,7 @@ fn refuse_franky_over_grpc(ctx: &AppContext, model: &ModelId) -> Result<(), ApiE
 }
 
 fn serves_franky(ctx: &AppContext, model: &ModelId) -> bool {
-    (ctx.registry.workers_for(model).iter())
-        .any(|w| w.needs_taps() || w.mode() == WorkerMode::Sandy)
+    (ctx.registry.workers_for(model).iter()).any(|w| w.needs_taps() || w.is_sandy())
 }
 
 /// Whether requests to `model` read taps: its Ricky workers read them and
@@ -501,7 +500,8 @@ impl<'a> ModelRouting<'a> {
             }
         };
         if request.franky.tap_source.needs_sandy_leg() {
-            workers.sandy = Some(pick_sandy(ctx, request, headers, excluded, &prefix).await?);
+            let sandy = pick_sandy(ctx, request, headers, excluded, &prefix, Stage::Plain);
+            workers.sandy = Some(sandy.await?);
         }
         Ok(workers)
     }
@@ -519,7 +519,8 @@ impl WorkerPicker for ModelRouting<'_> {
     }
 }
 
-/// Picks the Sandy of a Franky chain's Sandy call.
+/// Picks the Sandy of a Franky chain's Sandy call: a plain Sandy, or a Sandy
+/// prefill and a decode in its version group, as PD pairs any prefill.
 struct SandyPicker;
 
 impl WorkerPicker for SandyPicker {
@@ -531,32 +532,45 @@ impl WorkerPicker for SandyPicker {
         excluded: &[WorkerId],
     ) -> Result<SelectedWorkers, ApiError> {
         let prefix = PrefixMemo::default();
-        let sandy = pick_sandy(ctx, request, headers, excluded, &prefix).await?;
+        let sandys = ctx.registry.workers_for(&request.model);
+        let pd = (sandys.iter()).any(|w| w.is_sandy() && w.mode() == WorkerMode::Prefill);
+        let first_stage = if pd { Stage::Prefill } else { Stage::Plain };
+        let prefill = pick_sandy(ctx, request, headers, excluded, &prefix, first_stage).await?;
+        let decode = match pd {
+            false => None,
+            true => {
+                let other_groups = (sandys.iter())
+                    .filter(|w| w.is_sandy() && w.version_group() != prefill.version_group())
+                    .map(|w| w.id.clone());
+                let excluded: Vec<_> = excluded.iter().cloned().chain(other_groups).collect();
+                let decode = pick_sandy(ctx, request, headers, &excluded, &prefix, Stage::Decode);
+                Some(decode.await?)
+            }
+        };
         Ok(SelectedWorkers {
-            prefill: sandy,
-            decode: None,
+            prefill,
+            decode,
             sandy: None,
             track_dispatch_timestamps: false,
         })
     }
 }
 
-/// The Sandy that sends a Franky request's taps: the model's Sandy group picks
-/// it, by prefix when its policy is cache-aware.
+/// A Sandy of PD role `stage` for a Franky request: the model's Sandy group
+/// picks it, by prefix when its policy is cache-aware.
 async fn pick_sandy(
     ctx: &AppContext,
     request: &PreparedRequest,
     headers: &HeaderMap,
     excluded: &[WorkerId],
     prefix: &PrefixMemo,
+    stage: Stage,
 ) -> Result<Arc<Worker>, ApiError> {
     let model = &request.model;
-    let group = ctx
-        .sandy
-        .as_ref()
-        .ok_or_else(|| ApiError::NoSandyWorkersAvailable {
-            model: model.0.clone(),
-        })?;
+    let no_sandy = || ApiError::NoSandyWorkersAvailable {
+        model: model.0.clone(),
+    };
+    let group = ctx.sandy.as_ref().ok_or_else(no_sandy)?;
     let session_key = (ctx.config.model.affinity.as_ref())
         .and_then(|config| nonempty_header(headers, &config.session_id_header));
     let routing_key = (ctx.config.model.sticky.as_ref())
@@ -570,13 +584,18 @@ async fn pick_sandy(
         cache_namespace: &request.cache_namespace,
         session_key,
         routing_key,
-        ..PickRequest::new(model, Stage::Sandy, request.sequence_token_count as u64)
+        ..PickRequest::new(model, stage, request.sequence_token_count as u64)
     };
     let pick = group
         .pick_excluding(&ctx.registry, &pick_request, excluded)
         .await
-        .map_err(|error| reorg::selection_error(error, model, Some(Stage::Sandy)))?;
-    record_prefill_route(ctx, prefix.local_signal().as_deref(), &pick.engine.url);
+        .map_err(|error| match error {
+            PickError::NoCandidates => no_sandy(),
+            error => reorg::selection_error(error, model, Some(stage)),
+        })?;
+    if stage != Stage::Decode {
+        record_prefill_route(ctx, prefix.local_signal().as_deref(), &pick.engine.url);
+    }
     Ok(pick.engine)
 }
 

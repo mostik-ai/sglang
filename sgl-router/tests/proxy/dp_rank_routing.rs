@@ -62,13 +62,13 @@ fn router(
             bootstrap_port: (mode == WorkerMode::Prefill).then_some(8998),
             version_group: None,
             services: Default::default(),
+            franky: None,
         };
         let profile = EngineProfile {
             protocol: WireProtocol::default(),
             dp_ranks,
             openai: None,
             grpc_port: None,
-            needs_taps: false,
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }

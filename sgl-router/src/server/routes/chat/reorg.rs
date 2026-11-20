@@ -137,9 +137,6 @@ pub(super) fn selection_error(error: PickError, model: &ModelId, stage: Option<S
             Some(Stage::Decode) => ApiError::NoDecodeWorkersAvailable {
                 model: model.0.clone(),
             },
-            Some(Stage::Sandy) => ApiError::NoSandyWorkersAvailable {
-                model: model.0.clone(),
-            },
             _ => ApiError::NoHealthyWorkers {
                 model: model.0.clone(),
             },

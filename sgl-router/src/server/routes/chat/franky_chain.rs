@@ -534,7 +534,7 @@ impl FrankyChain {
         if let Some(end) = &mut self.end {
             end.remember_engines(&workers);
         }
-        let sandy = &workers.prefill;
+        let sandy = workers.answering();
         let room = request.franky.take_room().map(|room| {
             Box::new(SandyRoom {
                 room,

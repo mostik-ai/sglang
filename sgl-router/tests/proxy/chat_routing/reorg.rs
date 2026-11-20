@@ -97,6 +97,7 @@ fn group(id: &str, policy: Arc<FirstPolicy>) -> EngineGroup {
         worker_services: None,
         worker_ids: Some([WorkerId(id.into())].into_iter().collect()),
         policy,
+        sandy: false,
     }
 }
 
@@ -677,6 +678,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
             worker_services: None,
             worker_ids: Some([WorkerId("rejected".into())].into_iter().collect()),
             policy: Arc::new(rejecting),
+            sandy: false,
         }),
     );
     first.rank = 0;
@@ -690,6 +692,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
                     .collect(),
             ),
             policy: Arc::new(CacheAwarePolicy::new(source, table, config).unwrap()),
+            sandy: false,
         }),
     );
     second.rank = 1;
@@ -988,6 +991,7 @@ async fn full_decode_group_falls_back_to_another_version_group() {
                 bootstrap_port: Some(8998),
                 version_group: Some(group.into()),
                 services: Default::default(),
+                franky: None,
             })
             .unwrap();
     }

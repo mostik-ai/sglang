@@ -85,6 +85,12 @@ impl FrankyChainConfig {
     pub fn runs_chains(&self) -> bool {
         self.sandy_call_tokens > 0 || self.blocks.is_some()
     }
+
+    /// Whether Ricky requests read taps from a Sandy leg beside them: Sandy
+    /// writes nothing, so only a prefill sends their taps.
+    pub fn makes_sandy_legs(&self) -> bool {
+        self.taps && self.sandy_call_tokens == 0
+    }
 }
 
 /// A Franky Sandy that tokenizes on its own. The router renders each Franky

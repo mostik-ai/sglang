@@ -39,11 +39,13 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
             let cb = w.breaker.snapshot();
             WorkerSnapshot {
                 worker_url: w.url.clone(),
-                mode: match w.mode() {
-                    WorkerMode::Plain => "plain",
-                    WorkerMode::Prefill => "prefill",
-                    WorkerMode::Decode => "decode",
-                    WorkerMode::Sandy => "sandy",
+                mode: match (w.is_sandy(), w.mode()) {
+                    (true, WorkerMode::Plain) => "sandy",
+                    (true, WorkerMode::Prefill) => "sandy_prefill",
+                    (true, WorkerMode::Decode) => "sandy_decode",
+                    (false, WorkerMode::Plain) => "plain",
+                    (false, WorkerMode::Prefill) => "prefill",
+                    (false, WorkerMode::Decode) => "decode",
                 },
                 healthy: cb.admit,
                 cb_state: cb.state_code,

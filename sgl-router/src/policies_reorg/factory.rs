@@ -254,7 +254,7 @@ pub fn build_resolver(
     resolver.ttft_slo = config.ttft_slo;
     resolver.tps_slo = config.tps_slo;
     // Shares the buckets' cache source, so one prefix lookup serves both picks.
-    let sandy = groups.build("sandy", Stage::Sandy, &GroupSpec::default())?;
+    let sandy = groups.build_sandy(&GroupSpec::default())?;
     Ok((resolver, sandy, groups.cleanup))
 }
 
@@ -290,7 +290,7 @@ pub fn build_sandy_group(
         policy: Some(policy),
         ..Default::default()
     };
-    let sandy = groups.build("sandy", Stage::Sandy, &spec)?;
+    let sandy = groups.build_sandy(&spec)?;
     Ok((sandy, groups.cleanup))
 }
 
@@ -377,6 +377,16 @@ impl Groups<'_> {
             worker_ids: spec.worker_ids.clone(),
             worker_services: spec.worker_services.clone(),
             policy,
+            sandy: false,
+        })
+    }
+
+    /// The model's Sandy group, which picks Sandy workers of any PD role.
+    fn build_sandy(&mut self, spec: &GroupSpec) -> Result<EngineGroup> {
+        let group = self.build("sandy", Stage::Plain, spec)?;
+        Ok(EngineGroup {
+            sandy: true,
+            ..group
         })
     }
 

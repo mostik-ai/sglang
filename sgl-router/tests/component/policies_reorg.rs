@@ -121,6 +121,7 @@ fn group(members: &[&str], policy: Arc<dyn Policy>) -> EngineGroup {
         worker_services: None,
         worker_ids: Some(members.iter().map(|id| WorkerId((*id).into())).collect()),
         policy,
+        sandy: false,
     }
 }
 

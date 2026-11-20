@@ -46,8 +46,10 @@ pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
     };
     // A Ricky that reads taps serves nothing until a Sandy can send them.
     let sandy_ready = !(ctx.registry.workers_for(&model).iter()).any(|w| w.needs_taps())
-        || (ctx.sandy.as_ref())
-            .is_some_and(|group| group.has_members(&ctx.registry, &model, Stage::Sandy));
+        || (ctx.sandy.as_ref()).is_some_and(|group| {
+            let has = |stage| group.has_members(&ctx.registry, &model, stage);
+            has(Stage::Plain) || (has(Stage::Prefill) && has(Stage::Decode))
+        });
     if pool_ready && sandy_ready && ctx.kv_bootstrap_admit_ready() {
         StatusCode::OK
     } else {
@@ -312,9 +314,8 @@ mod tests {
     /// A Ricky that reads taps leaves the router unready until a Sandy joins.
     #[tokio::test]
     async fn readiness_waits_for_a_sandy_when_ricky_reads_taps() {
-        use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+        use crate::discovery::{FrankyRole, WorkerId, WorkerMode, WorkerSpec};
         use crate::state::kv_events::KvEventIndex;
-        use crate::workers::{EngineProfile, WireProtocol};
 
         let mut ctx = AppContext::stub();
         ctx.mark_ready();
@@ -325,26 +326,36 @@ mod tests {
         );
         ctx.sandy = Some(sandy_group.unwrap().0);
         let ctx = Arc::new(ctx);
-        let spec = |id: &str, mode| WorkerSpec {
+        let spec = |id: &str, mode, franky| WorkerSpec {
             id: WorkerId(id.into()),
             url: format!("http://{id}:30000"),
             mode,
             model_ids: vec![ModelId(ctx.config.model.id.clone())],
-            bootstrap_port: (mode == WorkerMode::Sandy).then_some(8996),
+            bootstrap_port: (mode == WorkerMode::Prefill).then_some(8998),
+            franky: Some(franky),
             ..Default::default()
         };
-        let ricky = EngineProfile {
-            needs_taps: true,
-            ..EngineProfile::from(WireProtocol::default())
+        let sandy = FrankyRole::Sandy {
+            tap_port: Some(8996),
         };
-        (ctx.registry)
-            .add_with_cb(spec("ricky", WorkerMode::Plain), None, ricky)
+        let ricky = FrankyRole::Ricky { reads_taps: true };
+        ctx.registry
+            .add(spec("ricky", WorkerMode::Plain, ricky))
             .unwrap();
         assert_eq!(
             readyz(State(Arc::clone(&ctx))).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
-        ctx.registry.add(spec("sandy", WorkerMode::Sandy)).unwrap();
+        (ctx.registry)
+            .add(spec("sandy-prefill", WorkerMode::Prefill, sandy))
+            .unwrap();
+        assert_eq!(
+            readyz(State(Arc::clone(&ctx))).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        (ctx.registry)
+            .add(spec("sandy-decode", WorkerMode::Decode, sandy))
+            .unwrap();
         assert_eq!(readyz(State(ctx)).await, StatusCode::OK);
     }
 

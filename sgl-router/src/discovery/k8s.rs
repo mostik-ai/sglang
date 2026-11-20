@@ -8,7 +8,7 @@
 //! [`DiscoveryEvent`]s for the worker manager.
 
 use crate::config::{K8sDiscoveryConfig, K8sDiscoveryMode};
-use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
+use crate::discovery::{DiscoveryEvent, FrankyRole, WorkerId, WorkerMode, WorkerSpec};
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointSlice};
@@ -32,23 +32,27 @@ pub use peers::{peer_address_family, spawn_peer_watch, AddressFamily};
 ///   two roles may not be mergeable into one Kubernetes selector), so this
 ///   client-side classification is the gate that drops irrelevant slices.
 ///
-/// A slice matching `sandy_selector` is a Sandy first. With one, plain mode
-/// also matches its selector client-side, since the watch is unfiltered.
+/// A slice matching `sandy_selector` is a Sandy first: a plain worker with a
+/// Sandy role, until its `/server_info` tells its PD role and tap port. With a
+/// Sandy selector, plain mode also matches its selector client-side, since the
+/// watch is unfiltered.
 fn classify_mode(
     es: &EndpointSlice,
     mode: &K8sDiscoveryMode,
     sandy_selector: Option<&str>,
-) -> Option<WorkerMode> {
+) -> Option<(WorkerMode, Option<FrankyRole>)> {
     if let Some(sandy) = sandy_selector {
         let labels = es.metadata.labels.as_ref().cloned().unwrap_or_default();
         if labels_match_selector(&labels, sandy) {
-            return Some(WorkerMode::Sandy);
+            let role = FrankyRole::Sandy { tap_port: None };
+            return Some((WorkerMode::Plain, Some(role)));
         }
         if let K8sDiscoveryMode::Plain { label_selector } = mode {
-            return labels_match_selector(&labels, label_selector).then_some(WorkerMode::Plain);
+            return labels_match_selector(&labels, label_selector)
+                .then_some((WorkerMode::Plain, None));
         }
     }
-    match mode {
+    let worker_mode = match mode {
         K8sDiscoveryMode::Plain { .. } => Some(WorkerMode::Plain),
         K8sDiscoveryMode::PdDisaggregation {
             prefill_selector,
@@ -63,7 +67,8 @@ fn classify_mode(
                 None
             }
         }
-    }
+    };
+    worker_mode.map(|worker_mode| (worker_mode, None))
 }
 
 /// Match a Kubernetes label set against a comma-separated equality
@@ -317,7 +322,7 @@ async fn process_events<S>(
         version_group_label: Option<&str>,
         sandy_selector: Option<&str>,
     ) -> HashMap<WorkerId, WorkerSpec> {
-        let Some(wm) = classify_mode(es, mode, sandy_selector) else {
+        let Some((wm, franky)) = classify_mode(es, mode, sandy_selector) else {
             return HashMap::new();
         };
         let group = version_group(es, version_group_label);
@@ -325,6 +330,7 @@ async fn process_events<S>(
             .into_iter()
             .map(|mut w| {
                 w.version_group = group.clone();
+                w.franky = franky;
                 (w.id.clone(), w)
             })
             .collect()
@@ -584,7 +590,7 @@ mod tests {
         let s = make_slice(&["10.0.0.1"], 30000, true);
         assert_eq!(
             classify_mode(&s, &plain_mode(), None),
-            Some(WorkerMode::Plain)
+            Some((WorkerMode::Plain, None))
         );
     }
 
@@ -598,7 +604,7 @@ mod tests {
         );
         assert_eq!(
             classify_mode(&s, &pd_mode(), None),
-            Some(WorkerMode::Prefill)
+            Some((WorkerMode::Prefill, None))
         );
     }
 
@@ -612,7 +618,7 @@ mod tests {
         );
         assert_eq!(
             classify_mode(&s, &pd_mode(), None),
-            Some(WorkerMode::Decode)
+            Some((WorkerMode::Decode, None))
         );
     }
 
@@ -639,19 +645,20 @@ mod tests {
         let labels = |role| [("app", "sglang"), ("role", role)];
         let slice = |role| make_slice_with_labels(&["10.0.0.1"], 30000, true, &labels(role));
         let sandy = Some("app=sglang,role=sandy");
+        let sandy_role = Some(FrankyRole::Sandy { tap_port: None });
         for mode in [plain_mode(), pd_mode()] {
             assert_eq!(
                 classify_mode(&slice("sandy"), &mode, sandy),
-                Some(WorkerMode::Sandy)
+                Some((WorkerMode::Plain, sandy_role))
             );
         }
         assert_eq!(
             classify_mode(&slice("prefill"), &pd_mode(), sandy),
-            Some(WorkerMode::Prefill)
+            Some((WorkerMode::Prefill, None))
         );
         assert_eq!(
             classify_mode(&slice("ricky"), &plain_mode(), sandy),
-            Some(WorkerMode::Plain)
+            Some((WorkerMode::Plain, None))
         );
         let other = make_slice_with_labels(&["10.0.0.1"], 30000, true, &[("app", "other")]);
         assert_eq!(classify_mode(&other, &plain_mode(), sandy), None);

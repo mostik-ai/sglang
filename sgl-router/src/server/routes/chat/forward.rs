@@ -49,6 +49,13 @@ pub(super) struct SelectedWorkers {
     pub(super) track_dispatch_timestamps: bool,
 }
 
+impl SelectedWorkers {
+    /// The worker whose response reaches the client: the decode of a PD pair.
+    pub(super) fn answering(&self) -> &Arc<Worker> {
+        self.decode.as_ref().unwrap_or(&self.prefill)
+    }
+}
+
 /// PD sends to both workers and returns the decode response.
 /// One dispatch attempt's client-ready response.
 pub(super) struct HttpDispatched {
@@ -174,6 +181,7 @@ async fn dispatch<T: Transport>(
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<Dispatched<T::Response>, ApiError> {
     request.franky.open_room(&workers);
+    let answering = Arc::clone(workers.answering());
     let SelectedWorkers {
         prefill,
         decode,
@@ -210,13 +218,7 @@ async fn dispatch<T: Transport>(
         request_started_at.elapsed(),
     );
     // Attribute the outcome to the worker supplying the client-visible response.
-    let metrics = DispatchMetrics::new(
-        ctx,
-        request,
-        decode.as_deref().unwrap_or(&prefill),
-        request_started_at,
-        duration,
-    );
+    let metrics = DispatchMetrics::new(ctx, request, &answering, request_started_at, duration);
     let pd_prefill = decode.is_some().then(|| prefill.id.clone());
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
     let pd = decode.map(|decode| {
@@ -1028,10 +1030,10 @@ impl DispatchMetrics {
             model: request.model.0.clone(),
             worker_url: response_worker.url.clone(),
             mode: match response_worker.mode() {
+                _ if response_worker.is_sandy() => WorkerModeLabel::Sandy,
                 WorkerMode::Prefill => WorkerModeLabel::Prefill,
                 WorkerMode::Decode => WorkerModeLabel::Decode,
                 WorkerMode::Plain => WorkerModeLabel::Plain,
-                WorkerMode::Sandy => WorkerModeLabel::Sandy,
             },
             streaming: request.streaming,
             request_started_at,
