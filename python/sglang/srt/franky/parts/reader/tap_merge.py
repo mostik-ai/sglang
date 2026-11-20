@@ -13,9 +13,8 @@ from sglang.kernels.ops.attention.franky_reader_merge import (
     franky_reader_pack,
 )
 from sglang.kernels.ops.communication.franky_reader_exchange import (
-    MAX_PROGRAMS,
-    SIGNAL_PAD_BYTES_PER_RANK,
     franky_reader_exchange_merge,
+    signal_pad_bytes,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 
@@ -23,6 +22,12 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 logger = logging.getLogger(__name__)
+
+# The most programs a merge runs: a decode batch needs a few, a prefill chunk's
+# rows need many to move over NVLink at full speed. On 4xB200, a merge of 16k
+# rows took 179 us with 64 programs, 100 us with 256 and 91 us with 512, and one
+# of 4k rows was fastest with 256.
+EXCHANGE_PROGRAMS = 256
 
 
 class TapExchange(msgspec.Struct, frozen=True, kw_only=True):
@@ -34,24 +39,28 @@ class TapExchange(msgspec.Struct, frozen=True, kw_only=True):
         buffer: this rank's buffer, kept alive for its peers.
         handle: the buffer's rendezvous handle: every rank's buffer and signal
             pad.
-        epochs: [MAX_PROGRAMS] int32, the merges each program ran on this rank.
+        epochs: [programs] int32, the merges each program ran on this rank.
         slot_rows: the query rows one slot holds.
+        programs: the most programs one merge runs.
     """
 
     buffer: torch.Tensor
     handle: Any
     epochs: torch.Tensor
     slot_rows: int
+    programs: int
 
     @staticmethod
-    def build(*, group: GroupCoordinator, slot_rows: int, row_size: int) -> TapExchange:
+    def build(
+        *, group: GroupCoordinator, slot_rows: int, row_size: int, programs: int
+    ) -> TapExchange:
         """Collective: every rank of ``group``, on one node, builds it at the same
         point, outside CUDA graph capture.
         """
         symm_mem.set_signal_pad_size(
             max(
                 symm_mem.get_signal_pad_size(),
-                SIGNAL_PAD_BYTES_PER_RANK * group.world_size,
+                signal_pad_bytes(world_size=group.world_size, programs=programs),
             )
         )
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -64,8 +73,9 @@ class TapExchange(msgspec.Struct, frozen=True, kw_only=True):
         return TapExchange(
             buffer=buffer,
             handle=symm_mem.rendezvous(buffer, group=group.device_group),
-            epochs=torch.zeros(MAX_PROGRAMS, dtype=torch.int32, device=device),
+            epochs=torch.zeros(programs, dtype=torch.int32, device=device),
             slot_rows=slot_rows,
+            programs=programs,
         )
 
     def holds(self, num_query_rows: int) -> bool:
@@ -95,6 +105,7 @@ class TapExchange(msgspec.Struct, frozen=True, kw_only=True):
             slot_rows=self.slot_rows,
             rank=self.handle.rank,
             world_size=self.handle.world_size,
+            programs=self.programs,
             lse_is_base_e=lse_is_base_e,
         )
 
@@ -137,6 +148,7 @@ class TapMerge:
             group=group,
             slot_rows=max_rows * num_queries,
             row_size=tap_size + PACK_COLUMNS,
+            programs=EXCHANGE_PROGRAMS,
         )
         return TapMerge(group=group, exchange=exchange)
 
@@ -158,8 +170,10 @@ class TapMerge:
         Args:
             local_out: [rows, queries, tap_size] bfloat16, this rank's results.
             lse: [rows, queries] float32, their log-sum-exp.
-            local_taps: [rows] int32, the taps each row reads on this rank.
-            no_taps: [rows] bool, whether each row reads no taps on any rank.
+            local_taps: [rows or more] int32, the taps each row reads on this
+                rank.
+            no_taps: [rows or more] bool, whether each row reads no taps on any
+                rank.
             out: [rows, queries, tap_size] bfloat16.
             has_taps: [rows, 1].
         """
@@ -175,6 +189,7 @@ class TapMerge:
                 lse_is_base_e=lse_is_base_e,
             )
             return
+        local_taps, no_taps = local_taps[:rows], no_taps[:rows]
         packed = franky_reader_pack(local_out, lse, local_taps)
         row_size = packed.shape[-1]
         gathered = self.group.all_gather(

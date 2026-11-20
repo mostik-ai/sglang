@@ -199,6 +199,20 @@ def _extend_batch():
     )
 
 
+def _extend_batch_reading_nothing():
+    """Row 1's prompt before its earlier answer, and row 3, which reads none."""
+    rows, prefix_lens, extend_lens = [1, 3], [0, 0], [1, 4]
+    return SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        req_pool_indices=torch.tensor(rows),
+        req_pool_indices_cpu=torch.tensor(rows),
+        extend_prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32),
+        extend_seq_lens_cpu=extend_lens,
+    )
+
+
 _EXTEND_ROWS = [1] * 6 + [2] * 3 + [3] * 3
 _EXTEND_TAPS = [0, 5, 5, 0, 0, 13, 0, 0, 3, 0, 0, 0]
 
@@ -273,6 +287,9 @@ class TestTapReading(CustomTestCase):
                 self.assertEqual(
                     reading.page_table[:, :2].tolist(), [[2, 0], [3, 1], [0, 0]]
                 )
+
+    def test_an_extend_forward_that_reads_no_taps_has_no_reading(self):
+        self.assertIsNone(self._reading(_extend_batch_reading_nothing()))
 
     def test_a_selection_reads_what_its_rows_read_in_the_forward(self):
         reading = self._reading(_extend_batch(), rank=1)
@@ -373,6 +390,20 @@ class TestTapAttention(CustomTestCase):
                 self._assert_reads(
                     attended, has_taps, queries, rows=rows, num_taps=num_taps
                 )
+
+    def test_a_forward_that_reads_no_taps_writes_zeros(self):
+        batch = _extend_batch_reading_nothing()
+        queries = torch.randn(7, _NUM_QUERIES, _TAP_SIZE, dtype=TAP_DTYPE)
+        ranks = _Ranks(2)
+        attention = self._attention(num_ranks=2, rank=0, group=ranks.group(0))
+
+        attended, has_taps = self._attend(
+            attention, queries, batch=batch, padded_rows=7
+        )
+
+        self.assertTrue(torch.all(attended == 0))
+        self.assertTrue(torch.all(has_taps == 0))
+        self.assertEqual(ranks.inputs, {}, "no rank merges a forward without taps")
 
     def test_every_rank_merges_to_what_one_rank_reads(self):
         for batch, rows, num_taps in (

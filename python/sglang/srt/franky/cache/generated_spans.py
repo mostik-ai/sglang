@@ -5,7 +5,7 @@ import sys
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
-import torch
+import numpy as np
 
 if TYPE_CHECKING:
     from sglang.srt.franky.chains.chain import FrankyChain
@@ -86,20 +86,20 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
             spans=(*earlier, current), block_size=chain.block_size
         )
 
-    def taps_to_read(self, tokens: torch.Tensor) -> torch.Tensor:
+    def taps_to_read(self, tokens: np.ndarray) -> np.ndarray:
         """
         Args:
-            tokens: indices of tokens of the request.
+            tokens: int64 indices of tokens of the request.
         Returns:
             Per token, how many taps its forward reads: Sandy's tokens before its
             block, or 0.
         """
-        taps = torch.zeros_like(tokens)
+        taps = np.zeros_like(tokens)
         for span in self.spans:
             inside = tokens >= span.start
             if span.end is not None:
                 inside &= tokens < span.end
-            taps = torch.where(inside, self._block_start(tokens, span), taps)
+            taps = np.where(inside, self._block_start(tokens, span), taps)
         return taps
 
     def rows_reading_at_most(self, num_taps: int) -> int:
@@ -124,18 +124,16 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
                 return first_token - 1
         return sys.maxsize
 
-    def _block_start(self, tokens: torch.Tensor, span: GeneratedSpan) -> torch.Tensor:
+    def _block_start(self, tokens: np.ndarray, span: GeneratedSpan) -> np.ndarray:
         if self.block_size is None:
-            return torch.full_like(tokens, span.sandy_start)
-        blocks = (tokens - span.start).div(self.block_size, rounding_mode="floor")
+            return np.full_like(tokens, span.sandy_start)
+        blocks = (tokens - span.start) // self.block_size
         if span.sandy_block_starts is None:
             return span.sandy_start + blocks * self.block_size
-        starts = torch.tensor(
-            (span.sandy_start, *span.sandy_block_starts),
-            dtype=tokens.dtype,
-            device=tokens.device,
+        starts = np.array(
+            (span.sandy_start, *span.sandy_block_starts), dtype=tokens.dtype
         )
-        return starts[blocks.clamp(min=0, max=len(starts) - 1)]
+        return starts[blocks.clip(0, len(starts) - 1)]
 
 
 def checked_earlier_answers(

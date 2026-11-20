@@ -170,7 +170,7 @@ def test_each_merge_counts_once_on_each_of_its_programs():
         before = merge.exchange.epochs.tolist()
         _run(merge, inputs, lse_is_base_e=True)
         torch.cuda.synchronize()
-        programs = min(-(-rows // 4), 64)
+        programs = min(-(-rows // 4), merge.exchange.programs)
         expected = [epoch + (pid < programs) for pid, epoch in enumerate(before)]
         assert merge.exchange.epochs.tolist() == expected
 

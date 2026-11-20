@@ -17,13 +17,14 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.franky_reader_merge import PACK_COLUMNS
 
-# Query rows one program handles at a time, and the most programs a merge runs:
-# block b of rows always belongs to program b % MAX_PROGRAMS, and the signal
-# pad keeps one flag a program and rank.
+# Query rows one program handles at a time. An exchange runs at most a fixed
+# number of programs: block b of rows always belongs to program b % programs,
+# and the signal pad keeps one flag a program and rank.
 BLOCK_ROWS = 4
-MAX_PROGRAMS = 64
-SIGNAL_PAD_BYTES_PER_RANK = MAX_PROGRAMS * 4
-MAX_PROGRAMS_CONSTEXPR = tl.constexpr(MAX_PROGRAMS)
+
+
+def signal_pad_bytes(*, world_size: int, programs: int) -> int:
+    return programs * world_size * 4
 
 
 @triton.jit
@@ -321,6 +322,7 @@ def _exchange_merge_kernel(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     RANKS: tl.constexpr,
+    PROGRAMS: tl.constexpr,
     LSE_IS_BASE_E: tl.constexpr,
 ):
     # epochs[pid]: the merges this program ran on this rank; every rank runs the
@@ -342,7 +344,7 @@ def _exchange_merge_kernel(
         ROW_SIZE,
         BLOCK,
         WORLD_SIZE,
-        MAX_PROGRAMS_CONSTEXPR,
+        PROGRAMS,
     )
     _sync_threads()
     _meet(signal_pad_ptrs, epoch, RANK, WORLD_SIZE, RANKS)
@@ -361,7 +363,7 @@ def _exchange_merge_kernel(
         BLOCK,
         RANK,
         WORLD_SIZE,
-        MAX_PROGRAMS_CONSTEXPR,
+        PROGRAMS,
         LSE_IS_BASE_E,
     )
     tl.store(epochs + pid, epoch)
@@ -381,6 +383,7 @@ def franky_reader_exchange_merge(
     slot_rows: int,
     rank: int,
     world_size: int,
+    programs: int,
     lse_is_base_e: bool,
 ) -> None:
     """Merge the attention-TP ranks' reader results by their log-sum-exp; every
@@ -397,14 +400,15 @@ def franky_reader_exchange_merge(
         buffer_ptrs: every rank's buffer of two halves of ``world_size`` slots
             of ``slot_rows`` packed query rows, as int64 device pointers.
         signal_pad_ptrs: every rank's buffer signal pad, zeroed at allocation,
-            of at least ``SIGNAL_PAD_BYTES_PER_RANK * world_size`` bytes.
-        epochs: [MAX_PROGRAMS] int32 on this rank's device, zeroed before the
+            of at least ``signal_pad_bytes(world_size, programs)`` bytes.
+        epochs: [programs] int32 on this rank's device, zeroed before the
             first merge.
         slot_rows: at least ``rows * queries``.
+        programs: the exchange's most programs, the same for all its merges.
     """
     rows, queries, tap_size = local_out.shape
     num_query_rows = rows * queries
-    grid = (min(triton.cdiv(num_query_rows, BLOCK_ROWS), MAX_PROGRAMS),)
+    grid = (min(triton.cdiv(num_query_rows, BLOCK_ROWS), programs),)
     _exchange_merge_kernel[grid](
         local_out,
         lse,
@@ -425,6 +429,7 @@ def franky_reader_exchange_merge(
         RANK=rank,
         WORLD_SIZE=world_size,
         RANKS=triton.next_power_of_2(world_size),
+        PROGRAMS=programs,
         LSE_IS_BASE_E=lse_is_base_e,
         num_warps=4,
     )

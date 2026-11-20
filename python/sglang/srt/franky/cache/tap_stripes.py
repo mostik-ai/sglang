@@ -37,7 +37,7 @@ class TapStripes(msgspec.Struct, frozen=True, kw_only=True):
         """The stripe of each page."""
         return pages // self.num_ranks
 
-    def local_taps(self, taps: torch.Tensor, *, page_size: int) -> torch.Tensor:
+    def local_taps(self, taps: Pages, *, page_size: int) -> Pages:
         """
         Args:
             taps: per row, how many taps it reads, from the first one on.
@@ -46,7 +46,5 @@ class TapStripes(msgspec.Struct, frozen=True, kw_only=True):
             stripe, then its part of the last stripe.
         """
         stripe_taps = self.num_ranks * page_size
-        last_stripe = (taps % stripe_taps - self.rank * page_size).clamp(
-            min=0, max=page_size
-        )
+        last_stripe = (taps % stripe_taps - self.rank * page_size).clip(0, page_size)
         return taps // stripe_taps * page_size + last_stripe

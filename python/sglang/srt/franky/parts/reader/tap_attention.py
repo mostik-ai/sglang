@@ -105,6 +105,8 @@ class TapAttention:
         self.builds_reading = builds_reading
         self.merge = merge
         self.workspace = workspace
+        num_pages, page_size, _, tap_size = pages.shape
+        self._prefill_pages = pages.view(num_pages, page_size, tap_size)
 
     @eager_on_graph
     def attend(
@@ -132,19 +134,19 @@ class TapAttention:
             if self.builds_reading
             else self.reading.get()
         )
-        if rows is not None:
+        if reading is not None and rows is not None:
             reading = reading.select(rows)
-        num_rows = reading.num_rows
-        has_taps[num_rows:].zero_()
-        attended[num_rows:].zero_()
-        if num_rows == 0:
-            return
-        self._attend_rows(
-            queries[:num_rows],
-            reading,
-            out=attended[:num_rows],
-            has_taps=has_taps[:num_rows],
-        )
+        num_rows = 0 if reading is None else reading.num_rows
+        if num_rows < attended.shape[0]:
+            # Rows a CUDA graph pads after the real ones read nothing.
+            has_taps[num_rows:].zero_()
+            attended[num_rows:].zero_()
+            if num_rows == 0:
+                return
+            queries = queries[:num_rows]
+            attended = attended[:num_rows]
+            has_taps = has_taps[:num_rows]
+        self._attend_rows(queries, reading, out=attended, has_taps=has_taps)
 
     def _attend_rows(
         self,
@@ -164,14 +166,13 @@ class TapAttention:
             self._attend_locally(kernel, queries, reading, out=out, lse=None)
             out.masked_fill_(reading.no_taps[:num_rows, None, None], 0)
             return
-        local_out = torch.empty_like(queries)
-        lse = torch.empty(queries.shape[:2], dtype=torch.float32, device=queries.device)
+        local_out, lse = self.reading.scratch(queries)
         self._attend_locally(kernel, queries, reading, out=local_out, lse=lse)
         self.merge.merge(
             local_out,
             lse,
-            reading.local_taps[:num_rows],
-            reading.no_taps[:num_rows],
+            reading.local_taps,
+            reading.no_taps,
             out=out,
             has_taps=has_taps,
             lse_is_base_e=kernel.lse_is_base_e,
@@ -194,7 +195,7 @@ class TapAttention:
         lse: Optional[torch.Tensor],
     ) -> None:
         if kernel is LocalKernel.PREFILL:
-            _prefill_attend(queries, self.pages, reading, out=out, lse=lse)
+            _prefill_attend(queries, self._prefill_pages, reading, out=out, lse=lse)
         elif kernel is LocalKernel.FA3:
             _fa3_attend(queries, self.pages, reading, out=out, lse=lse)
         else:
@@ -211,10 +212,14 @@ def _prefill_attend(
     out: torch.Tensor,
     lse: Optional[torch.Tensor],
 ) -> None:
-    num_pages, page_size, _, tap_size = pages.shape
+    """
+    Args:
+        pages: [pages, page_size, tap_size].
+    """
+    tap_size = pages.shape[-1]
     franky_reader_prefill(
         queries.view(-1, tap_size),
-        pages.view(num_pages, page_size, tap_size),
+        pages,
         reading.request_pages,
         reading.local_taps,
         reading.row_blocks,

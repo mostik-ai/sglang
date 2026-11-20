@@ -1,7 +1,7 @@
 import sys
 import unittest
 
-import torch
+import numpy as np
 
 from sglang.srt.franky.cache.generated_spans import (
     FrankyGeneratedSpans,
@@ -32,7 +32,7 @@ class TestFrankyGeneratedSpans(CustomTestCase):
     ):
         spans = FrankyGeneratedSpans(spans=_ANSWERS_5_TO_10_AND_FROM_14, block_size=4)
 
-        taps = spans.taps_to_read(torch.arange(18))
+        taps = spans.taps_to_read(np.arange(18))
 
         self.assertEqual(
             taps.tolist(), [0, 0, 0, 0, 0, 5, 5, 5, 5, 9, 9, 0, 0, 0, 14, 14, 14, 14]
@@ -41,14 +41,14 @@ class TestFrankyGeneratedSpans(CustomTestCase):
     def test_without_a_block_size_each_answer_is_one_block(self):
         spans = FrankyGeneratedSpans(spans=_ANSWERS_5_TO_10_AND_FROM_14)
 
-        taps = spans.taps_to_read(torch.arange(18))
+        taps = spans.taps_to_read(np.arange(18))
 
         self.assertEqual(taps.tolist(), [0] * 5 + [5] * 6 + [0] * 3 + [14] * 4)
 
     def test_an_answer_token_reads_sandys_tokens_before_its_copy_of_the_answer(self):
         spans = FrankyGeneratedSpans(spans=_SANDY_ANSWERS_FROM_3_AND_FROM_12)
 
-        taps = spans.taps_to_read(torch.arange(18))
+        taps = spans.taps_to_read(np.arange(18))
 
         self.assertEqual(taps.tolist(), [0] * 5 + [3] * 6 + [0] * 3 + [12] * 4)
 
@@ -63,7 +63,7 @@ class TestFrankyGeneratedSpans(CustomTestCase):
 
     def test_rows_reading_at_most_stops_at_the_first_block_past_the_taps(self):
         spans = FrankyGeneratedSpans(spans=_ANSWERS_5_TO_10_AND_FROM_14, block_size=4)
-        reads = spans.taps_to_read(torch.arange(1, 40))
+        reads = spans.taps_to_read(np.arange(1, 40))
 
         for num_taps in range(16):
             with self.subTest(num_taps=num_taps):
@@ -111,7 +111,7 @@ class TestFrankyGeneratedSpans(CustomTestCase):
                 GeneratedSpan(start=22, sandy_start=20, sandy_block_starts=(23, 27)),
             ),
         )
-        taps = spans.taps_to_read(torch.arange(36))
+        taps = spans.taps_to_read(np.arange(36))
         self.assertEqual(
             taps.tolist(),
             [0] * 5 + [3] * 6 + [0] * 11 + [20] * 4 + [23] * 4 + [27] * 6,
@@ -127,7 +127,7 @@ class TestFrankyGeneratedSpans(CustomTestCase):
             chain=chain,
             sandy_input_len=29,
         )
-        reads = spans.taps_to_read(torch.arange(1, 60))
+        reads = spans.taps_to_read(np.arange(1, 60))
 
         for num_taps in range(29):
             with self.subTest(num_taps=num_taps):

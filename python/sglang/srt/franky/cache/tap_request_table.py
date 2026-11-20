@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
@@ -89,4 +90,4 @@ class TapRequestTable:
 def _decode_taps(spans: Optional[FrankyGeneratedSpans], first_decoded: int) -> int:
     if spans is None:
         return 0
-    return int(spans.taps_to_read(torch.tensor([first_decoded]))[0])
+    return int(spans.taps_to_read(np.array([first_decoded]))[0])

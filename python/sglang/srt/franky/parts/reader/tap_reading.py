@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.kernels.ops.attention.franky_reader_blocks import (
@@ -50,10 +51,14 @@ class TapReading(msgspec.Struct, frozen=True, kw_only=True):
         stripes: TapStripes,
         page_size: int,
         mask_dtype: torch.dtype,
-    ) -> TapReading:
+    ) -> Optional[TapReading]:
         """
         Args:
             mask_dtype: the dtype of ``has_taps``.
+        Returns:
+            The reading; None for an extend forward none of whose rows reads a
+            tap, which the host knows. A decode forward's taps live on the
+            device, so it always has one.
         """
         reading = (
             _decode_reading
@@ -104,7 +109,7 @@ def _extend_reading(
     stripes: TapStripes,
     page_size: int,
     mask_dtype: torch.dtype,
-) -> TapReading:
+) -> Optional[TapReading]:
     req_pool_indices = _on_host(
         forward_batch.req_pool_indices_cpu, forward_batch.req_pool_indices
     )
@@ -112,40 +117,54 @@ def _extend_reading(
         forward_batch.extend_prefix_lens_cpu, forward_batch.extend_prefix_lens
     )
     num_rows = list(forward_batch.extend_seq_lens_cpu)
-    taps = torch.cat(
+    request_taps = [
+        _taps_of_tokens(request_table, slot, first_token=first, num_tokens=count)
+        for slot, first, count in zip(req_pool_indices, first_tokens, num_rows)
+    ]
+    if all(taps is None for taps in request_taps):
+        return None
+    taps = np.concatenate(
         [
-            _taps_of_tokens(request_table, slot, first_token=first, num_tokens=count)
-            for slot, first, count in zip(req_pool_indices, first_tokens, num_rows)
+            np.zeros(count, dtype=np.int64) if taps is None else taps
+            for taps, count in zip(request_taps, num_rows)
         ]
-        + [torch.zeros(1, dtype=torch.int64)]
+        + [np.zeros(1, dtype=np.int64)]
+    )
+    max_taps = int(taps.max())
+    if max_taps == 0:
+        return None
+    # One host-to-device copy: each row's request, its local taps, whether it
+    # reads any, then the prefill kernel's row blocks.
+    num_entries = taps.shape[0]
+    host = torch.from_numpy(
+        np.concatenate(
+            [
+                np.repeat(np.arange(len(num_rows) + 1, dtype=np.int32), num_rows + [1]),
+                stripes.local_taps(taps, page_size=page_size).astype(np.int32),
+                (taps > 0).astype(np.int32),
+                franky_reader_row_blocks(num_rows, device=torch.device("cpu"))
+                .numpy()
+                .reshape(-1),
+            ]
+        )
     )
     device = request_table.stripe_pages.device
-    total_rows = sum(num_rows)
-    num_stripes = max(1, ceil_div(int(taps.max()), stripes.num_ranks * page_size))
+    values = _to_device(host, device=device)
+    reads = values[2 * num_entries : 3 * num_entries]
+    num_stripes = ceil_div(max_taps, stripes.num_ranks * page_size)
     request_pages = request_table.stripe_pages[
         forward_batch.req_pool_indices, :num_stripes
     ]
-    reads = taps > 0
-    reads_on_device = _to_device(reads, device=device)
     return TapReading(
         request_pages=torch.cat(
             [request_pages, request_pages.new_zeros((1, num_stripes))]
         ),
-        row_requests=_to_device(
-            torch.repeat_interleave(
-                torch.arange(len(num_rows) + 1, dtype=torch.int32),
-                torch.tensor(num_rows + [1], dtype=torch.int64),
-            ),
-            device=device,
-        ),
-        local_taps=_to_device(
-            stripes.local_taps(taps, page_size=page_size).to(torch.int32),
-            device=device,
-        ),
-        no_taps=~reads_on_device,
-        has_taps=reads_on_device.to(mask_dtype)[:, None],
-        num_rows=total_rows,
-        row_blocks=franky_reader_row_blocks(num_rows, device=device),
+        row_requests=values[:num_entries],
+        local_taps=values[num_entries : 2 * num_entries],
+        no_taps=reads == 0,
+        has_taps=reads.to(mask_dtype)[:, None],
+        num_rows=sum(num_rows),
+        row_blocks=values[3 * num_entries :].view(-1, 3),
     )
 
 
@@ -178,12 +197,18 @@ def _decode_reading(
 
 def _taps_of_tokens(
     request_table: TapRequestTable, slot: int, *, first_token: int, num_tokens: int
-) -> torch.Tensor:
+) -> Optional[np.ndarray]:
+    """
+    Returns:
+        int64, per token the forward makes, how many taps it reads; None for a
+        request that reads none.
+    """
     spans = request_table.spans_of(slot)
-    made_tokens = torch.arange(first_token + 1, first_token + num_tokens + 1)
     if spans is None:
-        return torch.zeros_like(made_tokens)
-    return spans.taps_to_read(made_tokens)
+        return None
+    return spans.taps_to_read(
+        np.arange(first_token + 1, first_token + num_tokens + 1, dtype=np.int64)
+    )
 
 
 def _to_device(host: torch.Tensor, *, device: torch.device) -> torch.Tensor:
