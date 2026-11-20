@@ -69,7 +69,7 @@ class FrankyChainHolds:
             hold_seconds=get_franky().franky_chain_hold_seconds,
         )
 
-    def hold_for_next_block(
+    def hold_for_next_request(
         self, req: Req, *, tap_lock: Optional[TreeLock] = None
     ) -> None:
         """``req`` ended well: lock what it left for its chain's next request,

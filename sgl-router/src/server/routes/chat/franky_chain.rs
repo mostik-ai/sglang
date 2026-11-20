@@ -2,36 +2,38 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod answer_limits;
+mod checks;
 mod end;
+mod events;
 mod output;
 mod ricky_leg;
 mod sandy_call;
 mod trace;
 
-use super::forward::{forward_request, RequestDurationGuard, SelectedWorkers};
-use super::openai::sse_data;
+use super::forward::{RequestDurationGuard, SelectedWorkers};
 use super::preparation::{
-    generate_room_id, model_openai_settings, FrankyRoom, PreparedRequest, TapSource, GENERATE_PATH,
+    model_openai_settings, FrankyRoom, PreparedRequest, TapSource, GENERATE_PATH,
 };
 use super::tap_runs::wire;
-use super::{back_off, pick_sandy, serves_franky, ModelRouting};
+use super::{forward_with_retries, reads_taps, serves_franky, ModelRouting, SandyPicker};
 use crate::config::FrankyChainConfig;
-use crate::discovery::{ModelId, WorkerId};
-use crate::policies_reorg::cache_aware::PrefixMemo;
+use crate::discovery::ModelId;
 use crate::proxy::AbortOnDrop;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::workers::Worker;
 use answer_limits::AnswerLimits;
 use axum::body::Body;
 use axum::http::response::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
+use checks::{check_chains_can_serve, refused};
 use end::ChainEnd;
+use events::{data_event, done_event, error_event_from_response, fail_stream, json_event, Events};
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use output::ChainOutput;
-use ricky_leg::{ricky_leg_body, RickyLegFields};
-use sandy_call::{read_sandy_text, sandy_call_body, SandyText};
+use ricky_leg::{leg_frames, ricky_leg_body, Leg, LegEnd, LegFrame, RickyLegFields};
+use sandy_call::{read_sandy_text, sandy_call_body, SandyLimit, SandyText, SandyTokenizer};
 use serde_json::{json, Map, Value};
 use sglang_processor::openai::Responder;
 use std::sync::Arc;
@@ -39,16 +41,6 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use trace::ChainTrace;
 
-const CONSTRAINED_DECODING_FIELDS: [&str; 4] = ["json_schema", "regex", "ebnf", "structural_tag"];
-const FIELDS_CHAINS_CANNOT_JOIN: [&str; 4] = [
-    "return_hidden_states",
-    "return_routed_experts",
-    "return_flat_raw_top_logprobs",
-    "session_params",
-];
-/// Per-token output, which Sandy's text has none of in Ricky's terms.
-const PER_TOKEN_OUTPUT_FIELDS: [&str; 3] =
-    ["return_logprob", "top_logprobs_num", "token_ids_logprob"];
 /// The fields the chain sets on each of its requests.
 const CHAIN_FIELDS: [&str; 6] = [
     "input_ids",
@@ -58,11 +50,9 @@ const CHAIN_FIELDS: [&str; 6] = [
     "franky_sandy_input_ids",
     "franky_chain",
 ];
-const DONE_EVENT: &[u8] = b"data: [DONE]\n\n";
 const EVENT_BUFFER: usize = 64;
 
-type Events = mpsc::Sender<Result<Bytes, axum::Error>>;
-type Duration = Option<Arc<RequestDurationGuard>>;
+type DurationGuard = Option<Arc<RequestDurationGuard>>;
 
 /// What one request of a chain answered.
 enum Answer {
@@ -85,12 +75,35 @@ struct SandyRoom {
     unread: AbortOnDrop,
 }
 
-/// How a streamed Ricky leg ended.
-enum FramesEnd {
-    CallsSandy,
-    AnswerEnded,
-    Failed,
-    StreamClosed,
+/// Where a chain is between two of its events.
+enum Next {
+    /// The answer of the chain's last request.
+    Answer(Answer),
+    /// The Ricky leg after a Sandy call, which reads its room.
+    RickyLeg(Option<Box<SandyRoom>>),
+    /// A Ricky leg's frames, and how the leg ends once a frame says it.
+    Frames {
+        head: Parts,
+        frames: BoxStream<'static, Result<LegFrame, axum::Error>>,
+        end: Option<LegEnd>,
+    },
+    /// The answer ended with the last frame, in the response of `head`.
+    Ended(Parts),
+}
+
+/// What a chain gives its client next.
+enum ChainEvent {
+    /// A frame of the answer: the answer so far, or with an incremental
+    /// stream, what it adds.
+    Frame(Value),
+    /// The answer ended with the last frame, in the response of `head`.
+    Ended(Parts),
+    /// A request failed; the client gets its response.
+    Failed(Response<Body>),
+    /// A streamed leg sent this error frame, which ends the answer.
+    LegError(Bytes),
+    /// A leg's response broke off.
+    Broken(axum::Error),
 }
 
 /// A Franky request served as a chain (`--franky-chain`): Sandy calls that
@@ -101,6 +114,8 @@ pub(super) struct FrankyChain {
     id: String,
     model: ModelId,
     config: FrankyChainConfig,
+    /// Whether the chain's requests read taps.
+    taps: bool,
     limits: AnswerLimits,
     body_without_prompt: Map<String, Value>,
     client_stop_ids: Vec<u64>,
@@ -109,8 +124,9 @@ pub(super) struct FrankyChain {
     responder: Option<Responder>,
     output: ChainOutput,
     ricky: Option<SelectedWorkers>,
-    sandy: Option<Arc<Worker>>,
+    sandy: Option<SelectedWorkers>,
     end: Option<ChainEnd>,
+    next: Option<Next>,
     block: u64,
     requests_sent: u32,
 }
@@ -143,14 +159,11 @@ impl FrankyChain {
         let Ok(Value::Object(mut body)) = serde_json::from_slice(&request.body) else {
             return Err(refused("a body that is not a JSON object"));
         };
-        check_chains_can_serve(&body, config.sandy_call_tokens > 0)?;
-        let prompt_ids = match body.remove("input_ids") {
-            Some(Value::Array(ids)) if ids.iter().all(Value::is_u64) => ids,
-            _ => {
-                return Err(refused(
-                    "a prompt without token ids; send input_ids or text the router tokenizes",
-                ))
-            }
+        check_chains_can_serve(&body, config)?;
+        let Some(prompt_ids) = body.remove("input_ids").as_ref().and_then(token_ids) else {
+            return Err(refused(
+                "a prompt without token ids; send input_ids or text the router tokenizes",
+            ));
         };
         let client_rid = body.remove("rid");
         for field in CHAIN_FIELDS {
@@ -176,14 +189,11 @@ impl FrankyChain {
             .as_ref()
             .and_then(Value::as_str)
             .map_or_else(|| id.clone(), str::to_owned);
-        let incremental_streaming_output = model_openai_settings(ctx, &request.model)
-            .is_some_and(|settings| settings.incremental_streaming_output);
+        let incremental = request.streaming
+            && model_openai_settings(ctx, &request.model)
+                .is_some_and(|settings| settings.incremental_streaming_output);
         Ok(Some(Self {
-            output: ChainOutput::new(
-                reported_id,
-                incremental_streaming_output,
-                prompt_ids.len() as u64,
-            ),
+            output: ChainOutput::new(reported_id, incremental, prompt_ids.len() as u64),
             end: config
                 .blocks
                 .is_some()
@@ -192,6 +202,7 @@ impl FrankyChain {
             id,
             model: request.model.clone(),
             config: config.clone(),
+            taps: reads_taps(ctx, &request.model),
             limits,
             body_without_prompt: body,
             client_stop_ids,
@@ -199,6 +210,7 @@ impl FrankyChain {
             responder: request.responder.take(),
             ricky: None,
             sandy: None,
+            next: None,
             block: 1,
             requests_sent: 0,
         }))
@@ -208,7 +220,6 @@ impl FrankyChain {
     pub(super) async fn serve(
         mut self,
         ctx: &Arc<AppContext>,
-        routing: &ModelRouting<'_>,
         headers: HeaderMap,
         start: Instant,
     ) -> Result<Response<Body>, ApiError> {
@@ -216,14 +227,14 @@ impl FrankyChain {
         let streaming = self.streaming;
         let mut duration = None;
         let first = self
-            .next_answer(ctx, routing, &headers, start, &mut duration)
+            .next_answer(ctx, &headers, start, &mut duration)
             .await?;
         let response = match first {
             Answer::Failed(response) => response,
             first if streaming => self.stream(Arc::clone(ctx), first, headers, start, duration),
             first => {
-                self.collect(ctx, routing, first, &headers, start, &mut duration)
-                    .await?
+                self.next = Some(Next::Answer(first));
+                self.collect(ctx, &headers, start, &mut duration).await?
             }
         };
         Ok(match responder {
@@ -232,87 +243,57 @@ impl FrankyChain {
         })
     }
 
-    /// The chain's next request: a Sandy call when Sandy writes, else a Ricky
-    /// leg.
-    async fn next_answer(
-        &mut self,
-        ctx: &AppContext,
-        routing: &ModelRouting<'_>,
-        headers: &HeaderMap,
-        start: Instant,
-        duration: &mut Duration,
-    ) -> Result<Answer, ApiError> {
-        if self.config.sandy_call_tokens > 0 {
-            self.call_sandy(ctx, headers, start, duration).await
-        } else {
-            self.send_ricky_leg(ctx, routing, headers, start, duration, None)
-                .await
-        }
-    }
-
+    /// The unary response: the last frame, which holds the whole answer.
     async fn collect(
         &mut self,
         ctx: &AppContext,
-        routing: &ModelRouting<'_>,
-        mut answer: Answer,
         headers: &HeaderMap,
         start: Instant,
-        duration: &mut Duration,
+        duration: &mut DurationGuard,
     ) -> Result<Response<Body>, ApiError> {
+        let mut last = Value::Null;
         loop {
-            let (head, body) = match answer {
-                Answer::Failed(response) => return Ok(response),
-                Answer::SandyText { head, text, room } => {
-                    self.add_sandy_text(&text);
-                    if text.ends_answer {
-                        let whole = self.output.whole_answer(&text.finish_reason);
-                        return Ok(unary_response(head, &whole));
-                    }
-                    answer = self
-                        .send_ricky_leg(ctx, routing, headers, start, duration, room)
-                        .await?;
-                    continue;
+            match self.next_event(ctx, headers, start, duration).await? {
+                ChainEvent::Frame(frame) => last = frame,
+                ChainEvent::Ended(mut head) => {
+                    head.headers.remove(header::CONTENT_LENGTH);
+                    return Ok(Response::from_parts(head, Body::from(last.to_string())));
                 }
-                Answer::Leg { head, body } => (head, body),
-            };
-            let bytes = axum::body::to_bytes(body, usize::MAX)
-                .await
-                .map_err(|error| ApiError::Internal(error.into()))?;
-            let frame =
-                serde_json::from_slice(&bytes).map_err(|error| ApiError::Internal(error.into()))?;
-            let chain_frame = self.output.whole_leg_frame(frame);
-            if !self.output.calls_sandy() {
-                self.log_leg();
-                return Ok(unary_response(head, &chain_frame));
+                ChainEvent::Failed(response) => return Ok(response),
+                ChainEvent::LegError(data) => {
+                    return Err(ApiError::Internal(anyhow::anyhow!(
+                        "a unary Franky leg sent an error frame: {}",
+                        String::from_utf8_lossy(&data)
+                    )))
+                }
+                ChainEvent::Broken(error) => return Err(ApiError::Internal(error.into())),
             }
-            self.finish_leg()?;
-            answer = self
-                .next_answer(ctx, routing, headers, start, duration)
-                .await?;
         }
     }
 
+    /// The streamed response, whose head is that of the chain's `first` answer.
     fn stream(
-        self,
+        mut self,
         ctx: Arc<AppContext>,
         mut first: Answer,
         headers: HeaderMap,
         start: Instant,
-        duration: Duration,
+        duration: DurationGuard,
     ) -> Response<Body> {
         let mut head = match &mut first {
             Answer::SandyText { head, .. } | Answer::Leg { head, .. } => {
-                std::mem::replace(head, empty_head())
+                std::mem::replace(head, Response::new(()).into_parts().0)
             }
-            Answer::Failed(_) => empty_head(),
+            Answer::Failed(_) => Response::new(()).into_parts().0,
         };
         head.headers.remove(header::CONTENT_LENGTH);
         head.headers.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
         );
+        self.next = Some(Next::Answer(first));
         let (events, receiver) = mpsc::channel(EVENT_BUFFER);
-        tokio::spawn(self.pump(ctx, first, events, headers, start, duration));
+        tokio::spawn(self.pump(ctx, events, headers, start, duration));
         let stream = futures::stream::unfold(receiver, |mut receiver| async move {
             let event = receiver.recv().await?;
             Some((event, receiver))
@@ -323,241 +304,203 @@ impl FrankyChain {
     async fn pump(
         mut self,
         ctx: Arc<AppContext>,
-        mut answer: Answer,
         events: Events,
         headers: HeaderMap,
         start: Instant,
-        mut duration: Duration,
+        mut duration: DurationGuard,
     ) {
         loop {
-            let body = match answer {
-                Answer::Failed(response) => {
-                    let _ = events
-                        .send(Ok(error_event_from_response(response).await))
-                        .await;
-                    let _ = events.send(Ok(Bytes::from_static(DONE_EVENT))).await;
+            let event = self.next_event(&ctx, &headers, start, &mut duration).await;
+            let sent = match event {
+                Ok(ChainEvent::Frame(frame)) => events.send(Ok(json_event(&frame))).await,
+                Ok(ChainEvent::Ended(_)) => {
+                    let _ = events.send(Ok(done_event())).await;
                     return;
                 }
-                Answer::SandyText { text, room, .. } => {
-                    let frame = self.add_sandy_text(&text);
-                    if events.send(Ok(json_event(&frame))).await.is_err() {
-                        return;
-                    }
-                    if text.ends_answer {
-                        let _ = events.send(Ok(Bytes::from_static(DONE_EVENT))).await;
-                        return;
-                    }
-                    let next = match ModelRouting::lookup(&ctx, &self.model) {
-                        Ok(routing) => {
-                            self.send_ricky_leg(
-                                &ctx,
-                                &routing,
-                                &headers,
-                                start,
-                                &mut duration,
-                                room,
-                            )
-                            .await
-                        }
-                        Err(error) => Err(error),
-                    };
-                    answer = match next {
-                        Ok(answer) => answer,
-                        Err(error) => return fail_stream(&events, &error.to_string()).await,
-                    };
-                    continue;
-                }
-                Answer::Leg { body, .. } => body,
-            };
-            match self.forward_frames(body, &events).await {
-                FramesEnd::CallsSandy => {}
-                FramesEnd::AnswerEnded => {
-                    self.log_leg();
-                    let _ = events.send(Ok(Bytes::from_static(DONE_EVENT))).await;
+                Ok(ChainEvent::Failed(response)) => {
+                    let event = error_event_from_response(response).await;
+                    let _ = events.send(Ok(event)).await;
+                    let _ = events.send(Ok(done_event())).await;
                     return;
                 }
-                FramesEnd::Failed => {
-                    let _ = events.send(Ok(Bytes::from_static(DONE_EVENT))).await;
+                Ok(ChainEvent::LegError(data)) => {
+                    let _ = events.send(Ok(data_event(&data))).await;
+                    let _ = events.send(Ok(done_event())).await;
                     return;
                 }
-                FramesEnd::StreamClosed => return,
-            }
-            if let Err(error) = self.finish_leg() {
-                return fail_stream(&events, &error.to_string()).await;
-            }
-            let next = match ModelRouting::lookup(&ctx, &self.model) {
-                Ok(routing) => {
-                    self.next_answer(&ctx, &routing, &headers, start, &mut duration)
-                        .await
+                Ok(ChainEvent::Broken(error)) => {
+                    let _ = events.send(Err(error)).await;
+                    return;
                 }
-                Err(error) => Err(error),
-            };
-            answer = match next {
-                Ok(answer) => answer,
                 Err(error) => return fail_stream(&events, &error.to_string()).await,
+            };
+            if sent.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Runs the chain up to what its client gets next.
+    async fn next_event(
+        &mut self,
+        ctx: &AppContext,
+        headers: &HeaderMap,
+        start: Instant,
+        duration: &mut DurationGuard,
+    ) -> Result<ChainEvent, ApiError> {
+        loop {
+            let next = self.next.take().expect("a chain runs until it ends");
+            self.next = match next {
+                Next::Answer(Answer::Failed(response)) => return Ok(ChainEvent::Failed(response)),
+                Next::Answer(Answer::SandyText { head, text, room }) => {
+                    let frame = self.add_sandy_text(&text);
+                    self.next = Some(if text.ends_answer {
+                        Next::Ended(head)
+                    } else {
+                        Next::RickyLeg(room)
+                    });
+                    return Ok(ChainEvent::Frame(frame));
+                }
+                Next::Answer(Answer::Leg { head, body }) => Some(Next::Frames {
+                    head,
+                    frames: leg_frames(body, self.streaming),
+                    end: None,
+                }),
+                Next::RickyLeg(room) => {
+                    let answer = self
+                        .send_ricky_leg(ctx, headers, start, duration, room)
+                        .await?;
+                    Some(Next::Answer(answer))
+                }
+                Next::Frames {
+                    head,
+                    mut frames,
+                    mut end,
+                } => match frames.next().await {
+                    Some(Ok(LegFrame::Frame(frame))) => {
+                        end = LegEnd::of_frame(&frame).or(end);
+                        let frame = self.output.leg_frame(frame, end.as_ref());
+                        self.next = Some(Next::Frames { head, frames, end });
+                        return Ok(ChainEvent::Frame(frame));
+                    }
+                    Some(Ok(LegFrame::Error(data))) => return Ok(ChainEvent::LegError(data)),
+                    Some(Err(error)) => return Ok(ChainEvent::Broken(error)),
+                    None => {
+                        self.log_leg();
+                        match end {
+                            Some(LegEnd::CallsSandy { next_block }) => {
+                                self.finish_leg(next_block)?;
+                                let answer =
+                                    self.next_answer(ctx, headers, start, duration).await?;
+                                Some(Next::Answer(answer))
+                            }
+                            Some(LegEnd::AnswerEnds) | None => Some(Next::Ended(head)),
+                        }
+                    }
+                },
+                Next::Ended(head) => return Ok(ChainEvent::Ended(head)),
             };
         }
     }
 
-    async fn forward_frames(&mut self, body: Body, events: &Events) -> FramesEnd {
-        let mut frames = std::pin::pin!(sse_data(body));
-        while let Some(data) = frames.next().await {
-            let data = match data {
-                Ok(data) => data,
-                Err(error) => {
-                    let _ = events.send(Err(error)).await;
-                    return FramesEnd::StreamClosed;
-                }
-            };
-            if data.as_ref() == b"[DONE]" {
-                continue;
-            }
-            let frame = match serde_json::from_slice::<Value>(&data) {
-                Ok(frame) if frame.get("error").is_none() => frame,
-                _ => {
-                    let _ = events.send(Ok(data_event(&data))).await;
-                    return FramesEnd::Failed;
-                }
-            };
-            let event = json_event(&self.output.streamed_frame(frame));
-            if events.send(Ok(event)).await.is_err() {
-                return FramesEnd::StreamClosed;
-            }
-        }
-        if self.output.calls_sandy() {
-            FramesEnd::CallsSandy
+    /// The chain's next request: a Sandy call when Sandy writes, else a Ricky
+    /// leg.
+    async fn next_answer(
+        &mut self,
+        ctx: &AppContext,
+        headers: &HeaderMap,
+        start: Instant,
+        duration: &mut DurationGuard,
+    ) -> Result<Answer, ApiError> {
+        if self.config.sandy_call_tokens > 0 {
+            self.call_sandy(ctx, headers, start, duration).await
         } else {
-            FramesEnd::AnswerEnded
+            self.send_ricky_leg(ctx, headers, start, duration, None)
+                .await
         }
     }
 
     /// One Sandy call: the chain's Sandy writes at most `sandy_call_tokens` of
     /// the answer and, with taps, sends the taps of the trace and its text to a
-    /// new room at its engine. A call that fails before any of it reached the
-    /// client tries another Sandy, up to `--retry-max-attempts`.
+    /// room at its engine.
     async fn call_sandy(
         &mut self,
         ctx: &AppContext,
         headers: &HeaderMap,
         start: Instant,
-        duration: &mut Duration,
+        duration: &mut DurationGuard,
     ) -> Result<Answer, ApiError> {
-        let written = self.trace.num_written() as u64;
+        let written = self.trace.num_written();
         let call_tokens = u64::from(self.config.sandy_call_tokens);
-        let limits = self.limits.of_request(written, Some(call_tokens));
-        let limit_is_the_answers = self
-            .limits
-            .left(written)
-            .is_some_and(|left| left <= call_tokens);
-        let sandy_ids = self.trace.sandy_ids();
-        let own_tokenizer = sandy_ids.is_some();
-        let input_ids = match sandy_ids {
-            Some(ids) => json!(ids),
-            None => Value::Array(self.trace.ricky_ids()),
+        let limit = match self.limits.left(written) {
+            Some(left) if left <= call_tokens => SandyLimit::Answer,
+            _ => SandyLimit::Call,
         };
-        let mut body = sandy_call_body(&self.body_without_prompt, input_ids, limits, own_tokenizer);
+        let (input_ids, tokenizer) = match self.trace.sandy_ids() {
+            Some(ids) => (json!(ids), SandyTokenizer::Own),
+            None => (json!(self.trace.ricky_ids()), SandyTokenizer::Ricky),
+        };
+        let limits = self.limits.of_request(written, Some(call_tokens));
+        let mut body = sandy_call_body(&self.body_without_prompt, input_ids, limits, tokenizer);
         let rid = self.next_rid("s");
         body.insert("rid".into(), rid.clone().into());
-        if let Some(chain) = self.chain_field(false) {
+        if let Some(chain) = self.sandy_call_chain() {
             body.insert("franky_chain".into(), chain);
         }
         let mut request =
             PreparedRequest::generate_value(ctx, self.model.clone(), Value::Object(body), None)?;
-        let duration = duration
-            .get_or_insert_with(|| RequestDurationGuard::new(ctx, &self.model, start))
-            .clone();
-        let mut excluded: Vec<WorkerId> = Vec::new();
-        let mut failed = None;
-        for attempt in 0..ctx.config.proxy.max_attempts.get() {
-            if attempt > 0 && !back_off(ctx, start, attempt).await {
-                break;
-            }
-            let sandy = match self.sandy.clone() {
-                Some(sandy) if !excluded.contains(&sandy.id) => sandy,
-                _ => {
-                    let prefix = PrefixMemo::default();
-                    match pick_sandy(ctx, &request, headers, &excluded, &prefix).await {
-                        Ok(sandy) => sandy,
-                        Err(error) => return failed.map(Answer::Failed).ok_or(error),
-                    }
-                }
-            };
-            if failed.is_some() {
-                ctx.metrics.record_retry(&request.model.0);
-            }
-            let room = self.config.taps.then(|| room_at(&sandy));
-            request.tap_source = room.clone().map_or(TapSource::None, TapSource::Room);
-            let workers = SelectedWorkers {
-                prefill: Arc::clone(&sandy),
-                decode: None,
-                sandy: None,
-                track_dispatch_timestamps: false,
-            };
-            let dispatched = forward_request(
-                ctx,
-                &mut request,
-                workers.clone(),
-                headers.clone(),
-                start,
-                &duration,
-            )
-            .await?;
-            if !dispatched.retry_excluding.is_empty() {
-                self.sandy = None;
-                excluded.extend(dispatched.retry_excluding);
-                failed = Some(dispatched.response);
-                continue;
-            }
-            if dispatched.response.status() != StatusCode::OK {
-                return Ok(Answer::Failed(dispatched.response));
-            }
-            if let Some(end) = &mut self.end {
-                end.remember_engines(&workers);
-            }
-            let room = room.map(|room| {
-                Box::new(SandyRoom {
-                    room,
-                    unread: ctx.proxy.abort_on_drop(
-                        &sandy.url,
-                        sandy.protocol(),
-                        headers,
-                        Some(&rid),
-                    ),
-                })
-            });
-            self.sandy = Some(sandy);
-            let (head, body) = dispatched.response.into_parts();
-            let text = self
-                .read_sandy_call(ctx, body, limit_is_the_answers)
-                .await?;
-            return Ok(Answer::SandyText { head, text, room });
+        if self.taps {
+            request.franky.tap_source = TapSource::SandyCall;
         }
-        Ok(Answer::Failed(failed.expect("at least one attempt")))
-    }
-
-    async fn read_sandy_call(
-        &self,
-        ctx: &AppContext,
-        body: Body,
-        limit_is_the_answers: bool,
-    ) -> Result<SandyText, ApiError> {
+        let (response, answered) = forward_with_retries(
+            ctx,
+            &SandyPicker,
+            &mut request,
+            headers,
+            start,
+            duration,
+            self.sandy.clone(),
+        )
+        .await?;
+        let Some(answered) = answered.filter(|_| response.status() == StatusCode::OK) else {
+            return Ok(Answer::Failed(response));
+        };
+        if let Some(end) = &mut self.end {
+            end.remember_engines(&answered.workers);
+        }
+        let sandy = &answered.workers.prefill;
+        let room = answered.franky_room.map(|room| {
+            Box::new(SandyRoom {
+                room,
+                unread: ctx
+                    .proxy
+                    .abort_on_drop(&sandy.url, sandy.protocol(), headers, Some(&rid)),
+            })
+        });
+        self.sandy = Some(answered.workers);
+        let (head, body) = response.into_parts();
         let bytes = axum::body::to_bytes(body, usize::MAX)
             .await
             .map_err(|error| ApiError::Internal(error.into()))?;
+        let text = self.read_sandy_call(ctx, &bytes, limit, tokenizer)?;
+        Ok(Answer::SandyText { head, text, room })
+    }
+
+    fn read_sandy_call(
+        &self,
+        ctx: &AppContext,
+        bytes: &[u8],
+        limit: SandyLimit,
+        tokenizer: SandyTokenizer,
+    ) -> Result<SandyText, ApiError> {
         let frame: Value =
-            serde_json::from_slice(&bytes).map_err(|error| ApiError::Internal(error.into()))?;
-        let mut text = read_sandy_text(&frame, limit_is_the_answers, &self.client_stop_ids);
-        if self.trace.sandy_ids().is_some() {
-            let ricky_ids = ctx
+            serde_json::from_slice(bytes).map_err(|error| ApiError::Internal(error.into()))?;
+        let mut text = read_sandy_text(&frame, limit, tokenizer, &self.client_stop_ids);
+        if tokenizer == SandyTokenizer::Own {
+            text.ricky_ids = ctx
                 .tokenizers
                 .encode_answer_text(&self.model.0, &text.text)
-                .ok_or_else(|| {
-                    ApiError::Internal(anyhow::anyhow!(
-                        "Ricky's tokenizer of model {} is not loaded",
-                        self.model.0
-                    ))
-                })?;
-            text.ricky_ids = ricky_ids.into_iter().map(Value::from).collect();
+                .map_err(|error| ApiError::Internal(error.context("tokenize Sandy's text")))?;
         }
         Ok(text)
     }
@@ -568,60 +511,59 @@ impl FrankyChain {
     async fn send_ricky_leg(
         &mut self,
         ctx: &AppContext,
-        routing: &ModelRouting<'_>,
         headers: &HeaderMap,
         start: Instant,
-        duration: &mut Duration,
+        duration: &mut DurationGuard,
         mut room: Option<Box<SandyRoom>>,
     ) -> Result<Answer, ApiError> {
-        let tap_source = match (self.config.taps, &room) {
+        let tap_source = match (self.taps, &room) {
             (false, _) => TapSource::None,
             (true, Some(room)) => TapSource::Room(room.room.clone()),
             (true, None) => {
-                self.trace.add_sandy_text(Vec::new(), Vec::new());
+                self.trace.start_tap_leg();
                 TapSource::SandyLeg
             }
         };
         let franky = RickyLegFields {
-            chain: self.chain_field(true),
-            tap_runs: self.config.taps.then(|| wire(&self.trace.tap_runs())),
+            chain: self.ricky_leg_chain(),
+            tap_runs: self.taps.then(|| wire(&self.trace.tap_runs())),
             sandy_input_ids: self
                 .trace
                 .sandy_ids()
-                .filter(|_| self.config.taps)
+                .filter(|_| self.taps)
                 .map(|ids| json!(ids)),
         };
-        let written = self.trace.num_written() as u64;
-        let mut body = ricky_leg_body(
-            &self.body_without_prompt,
-            Value::Array(self.trace.ricky_ids()),
-            self.limits.of_request(written, None),
-            self.ricky.is_none(),
-            franky,
-        );
+        let leg = if self.ricky.is_none() {
+            Leg::First
+        } else {
+            Leg::Later
+        };
+        let limits = self.limits.of_request(self.trace.num_written(), None);
+        let input_ids = json!(self.trace.ricky_ids());
+        let mut body = ricky_leg_body(&self.body_without_prompt, input_ids, limits, leg, franky);
         body.insert("rid".into(), self.next_rid("r").into());
         let mut request =
             PreparedRequest::generate_value(ctx, self.model.clone(), Value::Object(body), None)?;
         if let (TapSource::SandyLeg, Some(sandy_ids)) = (&tap_source, self.trace.sandy_ids()) {
             request.set_franky_sandy_ids(sandy_ids);
         }
-        request.tap_source = tap_source;
-        self.output.start_leg();
-        let (response, answered) = routing
-            .forward_with_retries(
-                ctx,
-                &mut request,
-                headers,
-                start,
-                duration,
-                self.ricky.clone(),
-            )
-            .await?;
-        if let Some(workers) = answered {
+        request.franky.tap_source = tap_source;
+        let routing = ModelRouting::lookup(ctx, &self.model)?;
+        let (response, answered) = forward_with_retries(
+            ctx,
+            &routing,
+            &mut request,
+            headers,
+            start,
+            duration,
+            self.ricky.clone(),
+        )
+        .await?;
+        if let Some(answered) = answered {
             if let Some(end) = &mut self.end {
-                end.remember_engines(&workers);
+                end.remember_engines(&answered.workers);
             }
-            self.ricky = Some(workers);
+            self.ricky = Some(answered.workers);
         }
         if response.status() != StatusCode::OK {
             return Ok(Answer::Failed(response));
@@ -635,7 +577,7 @@ impl FrankyChain {
 
     /// Sandy's call wrote `text`: it joins the trace and the answer.
     ///
-    /// Returns: the chain's streamed frame of the text.
+    /// Returns: the chain's frame of the text.
     fn add_sandy_text(&mut self, text: &SandyText) -> Value {
         tracing::debug!(
             chain = %self.id,
@@ -644,44 +586,40 @@ impl FrankyChain {
             finish_reason = %text.finish_reason,
             "franky sandy call ended"
         );
-        self.trace
-            .add_sandy_text(text.ricky_ids.clone(), text.sandy_ids.clone());
+        self.trace.add_sandy_text(&text.ricky_ids, &text.sandy_ids);
         let finish_reason = if text.ends_answer {
             &text.finish_reason
         } else {
             &Value::Null
         };
         self.output
-            .add_sandy_text(&text.text, text.ricky_ids.clone(), finish_reason)
+            .add_sandy_text(&text.text, &text.ricky_ids, finish_reason)
     }
 
-    /// The current leg ended for a Sandy call: its text joins the trace and
-    /// the chain moves to the block Ricky writes after the call.
-    fn finish_leg(&mut self) -> Result<(), ApiError> {
-        self.log_leg();
-        let (ids, text) = self.output.current_leg();
-        let (ids, text) = (ids.to_vec(), text.to_owned());
+    /// The current leg ended for a Sandy call: its text joins the trace, and
+    /// Ricky writes block `next_block` after the call.
+    fn finish_leg(&mut self, next_block: u64) -> Result<(), ApiError> {
+        let (ids, text) = self.output.finish_leg();
         self.trace
             .add_ricky_text(&ids, &text)
             .map_err(|error| ApiError::Internal(error.context("tokenize a Ricky leg for Sandy")))?;
-        self.output.finish_leg();
-        if let Some(next_block) = self.output.next_block() {
-            self.block = next_block;
-        }
+        self.block = next_block;
         Ok(())
     }
 
-    /// `franky_chain` of the chain's next request, whose engine holds the
-    /// chain's cache for the request after; a Ricky leg's also names Ricky's
-    /// blocks. `None` for a chain without blocks: no Sandy call follows a
-    /// Ricky leg, so nothing comes back for a held cache.
-    fn chain_field(&self, ricky_leg: bool) -> Option<Value> {
+    /// `franky_chain` of a Sandy call, whose engine holds the chain's cache
+    /// for its next call. `None` for a chain without blocks, which makes no
+    /// Sandy call after a Ricky leg.
+    fn sandy_call_chain(&self) -> Option<Value> {
+        self.config.blocks.as_ref()?;
+        Some(json!({"id": self.id, "block": self.block}))
+    }
+
+    /// `franky_chain` of a Ricky leg, which also names Ricky's blocks; `None`
+    /// for a chain without blocks.
+    fn ricky_leg_chain(&self) -> Option<Value> {
         let blocks = self.config.blocks.as_ref()?;
-        let mut chain = json!({"id": self.id, "block": self.block});
-        if ricky_leg {
-            chain["blocks"] = Value::Object(blocks.clone());
-        }
-        Some(chain)
+        Some(json!({"id": self.id, "block": self.block, "blocks": blocks}))
     }
 
     fn next_rid(&mut self, kind: &str) -> String {
@@ -702,121 +640,9 @@ impl FrankyChain {
     }
 }
 
-/// A new room at `sandy`'s tap bootstrap server.
-fn room_at(sandy: &Worker) -> FrankyRoom {
-    FrankyRoom {
-        host: sandy.bootstrap_host().to_string(),
-        port: sandy.bootstrap_port(),
-        room: generate_room_id(),
-    }
-}
-
-fn check_chains_can_serve(body: &Map<String, Value>, sandy_writes: bool) -> Result<(), ApiError> {
-    let sampling = body.get("sampling_params");
-    let constrained = CONSTRAINED_DECODING_FIELDS.iter().any(|field| {
-        sampling
-            .and_then(|params| params.get(field))
-            .is_some_and(is_set)
-    });
-    if constrained {
-        return Err(refused(
-            "constrained decoding, whose state each request of a chain would restart",
-        ));
-    }
-    if let Some(field) = FIELDS_CHAINS_CANNOT_JOIN
-        .iter()
-        .find(|field| body.get(**field).is_some_and(is_set))
-    {
-        return Err(refused(&format!("`{field}`")));
-    }
-    match PER_TOKEN_OUTPUT_FIELDS
-        .iter()
-        .find(|field| sandy_writes && body.get(**field).is_some_and(is_set))
-    {
-        Some(field) => Err(refused(&format!("`{field}` while Sandy writes"))),
-        None => Ok(()),
-    }
-}
-
-fn is_set(value: &Value) -> bool {
-    !matches!(value, Value::Null | Value::Bool(false))
-}
-
-fn refused(what: &str) -> ApiError {
-    ApiError::BadRequest(format!(
-        "Franky chains (--franky-chain) cannot serve {what}"
-    ))
-}
-
-fn empty_head() -> Parts {
-    Response::new(()).into_parts().0
-}
-
-fn unary_response(mut head: Parts, frame: &Value) -> Response<Body> {
-    head.headers.remove(header::CONTENT_LENGTH);
-    Response::from_parts(head, Body::from(frame.to_string()))
-}
-
-async fn fail_stream(events: &Events, message: &str) {
-    let _ = events.send(Ok(error_event(message))).await;
-    let _ = events.send(Ok(Bytes::from_static(DONE_EVENT))).await;
-}
-
-fn json_event(frame: &Value) -> Bytes {
-    data_event(frame.to_string().as_bytes())
-}
-
-fn data_event(data: &[u8]) -> Bytes {
-    [b"data: ".as_slice(), data, b"\n\n"].concat().into()
-}
-
-fn error_event(message: &str) -> Bytes {
-    json_event(&json!({"error": {"message": message}}))
-}
-
-async fn error_event_from_response(response: Response<Body>) -> Bytes {
-    let status = response.status();
-    let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
-        Ok(body) => body,
-        Err(error) => {
-            return error_event(&format!(
-            "a Franky chain's request failed with {status}, and reading its body failed: {error}"
-        ))
-        }
-    };
-    match serde_json::from_slice::<Value>(&body) {
-        Ok(error) if error.get("error").is_some() => data_event(&body),
-        _ => error_event(&format!(
-            "a Franky chain's request failed with {status}: {}",
-            String::from_utf8_lossy(&body)
-        )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn object(value: Value) -> Map<String, Value> {
-        match value {
-            Value::Object(fields) => fields,
-            _ => panic!("not an object"),
-        }
-    }
-
-    #[test]
-    fn chains_refuse_what_their_requests_cannot_carry() {
-        for (body, sandy_writes) in [
-            (json!({"sampling_params": {"regex": "a+"}}), false),
-            (json!({"return_hidden_states": true}), false),
-            (json!({"return_logprob": true}), true),
-        ] {
-            assert!(
-                check_chains_can_serve(&object(body.clone()), sandy_writes).is_err(),
-                "{body}"
-            );
-        }
-        let logprobs = object(json!({"return_logprob": true, "stream": true}));
-        assert!(check_chains_can_serve(&logprobs, false).is_ok());
-    }
+/// `ids` as token ids, when every one is one.
+fn token_ids(ids: &Value) -> Option<Vec<u32>> {
+    (ids.as_array()?.iter())
+        .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+        .collect()
 }

@@ -17,6 +17,7 @@ use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
 use crate::state::kv_events::CacheNamespace;
 use crate::tokenizer::franky_sandy::SandyChat;
 use crate::tokenizer::ForwardingScope;
+use crate::workers::Worker;
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
@@ -117,11 +118,18 @@ pub(super) struct PreparedRequest {
     sampling_defaults: Vec<(SamplingField, Number)>,
     /// Turns the engine's `/generate` response back into the OpenAI one.
     pub(super) responder: Option<Responder>,
-    /// The ids of a Franky Sandy that tokenizes on its own, for its leg.
-    franky_sandy_ids: Option<Vec<u32>>,
-    /// Franky: the tap runs of the request's earlier answers.
-    franky_earlier_runs: Vec<TapRun>,
-    /// Franky: where a Ricky request's taps come from.
+    /// What the request carries for Franky workers.
+    pub(super) franky: FrankyPart,
+}
+
+/// What a request carries for Franky workers.
+#[derive(Debug, Default)]
+pub(super) struct FrankyPart {
+    /// The ids of a Sandy that tokenizes on its own, for its leg.
+    sandy_ids: Option<Vec<u32>>,
+    /// The tap runs of the request's earlier answers.
+    earlier_runs: Vec<TapRun>,
+    /// Where the request's taps come from.
     pub(super) tap_source: TapSource,
 }
 
@@ -265,9 +273,7 @@ impl PreparedRequest {
             parsed_body,
             sampling_defaults,
             responder: None,
-            franky_sandy_ids: None,
-            franky_earlier_runs: Vec::new(),
-            tap_source: TapSource::None,
+            franky: FrankyPart::default(),
         };
         if fields.franky_generated_spans.is_some() && serves_franky(ctx, &request.model) {
             request.convert_client_spans()?;
@@ -333,9 +339,7 @@ impl PreparedRequest {
             cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
             sampling_defaults,
-            franky_sandy_ids: None,
-            franky_earlier_runs: Vec::new(),
-            tap_source: TapSource::None,
+            franky: FrankyPart::default(),
         })
     }
 
@@ -434,9 +438,10 @@ impl PreparedRequest {
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
             responder: None,
-            franky_sandy_ids: None,
-            franky_earlier_runs,
-            tap_source: TapSource::None,
+            franky: FrankyPart {
+                earlier_runs: franky_earlier_runs,
+                ..FrankyPart::default()
+            },
         })
     }
 
@@ -558,9 +563,7 @@ impl PreparedRequest {
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
             sampling_defaults,
-            franky_sandy_ids: None,
-            franky_earlier_runs: Vec::new(),
-            tap_source: TapSource::None,
+            franky: FrankyPart::default(),
         })
     }
 
@@ -594,9 +597,7 @@ impl PreparedRequest {
             parsed_body: None,
             sampling_defaults: Vec::new(),
             responder: None,
-            franky_sandy_ids: None,
-            franky_earlier_runs: Vec::new(),
-            tap_source: TapSource::None,
+            franky: FrankyPart::default(),
         }
     }
 
@@ -628,25 +629,25 @@ impl PreparedRequest {
     /// The ids of a Sandy that tokenizes on its own, which a chain takes to
     /// send Sandy its own ids for every call.
     pub(super) fn take_franky_sandy_ids(&mut self) -> Option<Vec<u32>> {
-        self.franky_sandy_ids.take()
+        self.franky.sandy_ids.take()
     }
 
     /// Sends a Sandy that tokenizes on its own `ids` in place of Ricky's.
     pub(super) fn set_franky_sandy_ids(&mut self, ids: Vec<u32>) {
-        self.franky_sandy_ids = Some(ids);
+        self.franky.sandy_ids = Some(ids);
     }
 
     fn convert_client_spans(&mut self) -> Result<(), ApiError> {
         let mut runs = Ok(Vec::new());
         self.edit_body(|body| runs = client_spans_to_tap_runs(body))?;
-        self.franky_earlier_runs = runs?;
+        self.franky.earlier_runs = runs?;
         Ok(())
     }
 
     /// The tap runs of the request's earlier answers, which a chain extends
     /// with its own.
     pub(super) fn franky_earlier_runs(&self) -> &[TapRun] {
-        &self.franky_earlier_runs
+        &self.franky.earlier_runs
     }
 
     /// Marks the earlier answers at `spans` of an input of `input_len` tokens:
@@ -656,8 +657,8 @@ impl PreparedRequest {
         spans: &[Range<usize>],
         input_len: usize,
     ) -> Result<(), ApiError> {
-        self.franky_earlier_runs = earlier_answer_runs(spans, None);
-        let runs = answer_runs(&self.franky_earlier_runs, input_len, input_len);
+        self.franky.earlier_runs = earlier_answer_runs(spans, None);
+        let runs = answer_runs(&self.franky.earlier_runs, input_len, input_len);
         self.edit_body(|body| body["franky_tap_runs"] = runs)
     }
 
@@ -670,16 +671,16 @@ impl PreparedRequest {
         input_len: usize,
         sandy: SandyChat,
     ) -> Result<(), ApiError> {
-        self.franky_earlier_runs =
+        self.franky.earlier_runs =
             earlier_answer_runs(generated_spans, Some(&sandy.generated_spans));
-        let runs = answer_runs(&self.franky_earlier_runs, input_len, sandy.input_ids.len());
+        let runs = answer_runs(&self.franky.earlier_runs, input_len, sandy.input_ids.len());
         self.edit_body(|body| {
             body["franky_sandy_input_ids"] = json!(sandy.input_ids);
             if !generated_spans.is_empty() {
                 body["franky_tap_runs"] = runs;
             }
         })?;
-        self.franky_sandy_ids = Some(sandy.input_ids);
+        self.franky.sandy_ids = Some(sandy.input_ids);
         Ok(())
     }
 
@@ -718,7 +719,7 @@ impl PreparedRequest {
             chain.remove("blocks");
         }
         fields.insert("franky_taps_only".into(), true.into());
-        let input_ids = match &self.franky_sandy_ids {
+        let input_ids = match &self.franky.sandy_ids {
             Some(sandy_ids) => Some(sandy_ids.as_slice()),
             None => self.forwarded_input_ids(),
         };
@@ -1413,16 +1414,31 @@ pub(super) struct FrankyRoom {
     pub(super) room: u64,
 }
 
-/// Where a Ricky request's taps come from.
-#[derive(Clone, Debug)]
+impl FrankyRoom {
+    /// A new room at `sandy`'s tap bootstrap server.
+    pub(super) fn at(sandy: &Worker) -> Self {
+        Self {
+            host: sandy.bootstrap_host().to_string(),
+            port: sandy.bootstrap_port(),
+            room: generate_room_id(),
+        }
+    }
+}
+
+/// Where a request's taps come from, or for a Sandy call, where they go.
+#[derive(Clone, Debug, Default)]
 pub(super) enum TapSource {
     /// It reads none.
+    #[default]
     None,
     /// A Sandy leg beside it, in a room each dispatch opens, sends the taps of
     /// its prompt.
     SandyLeg,
     /// A Sandy call already ran; its room holds the taps.
     Room(FrankyRoom),
+    /// The request is a Sandy call: its Sandy sends the taps of all it runs to
+    /// a room each dispatch opens there.
+    SandyCall,
 }
 
 /// The tap runs of a request whose answer starts after its `input_len`

@@ -40,7 +40,7 @@ class FrankyChainBatchResultProcessor(SchedulerBatchResultProcessor):
         if is_aborted(req):
             self.franky_chain_holds.release_chain_of(req)
         else:
-            self.franky_chain_holds.hold_for_next_block(req)
+            self.franky_chain_holds.hold_for_next_request(req)
 
 
 def fields_of(processor: SchedulerBatchResultProcessor) -> dict[str, Any]:

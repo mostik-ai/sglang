@@ -108,7 +108,6 @@ class SandyScheduler(FrankyChainScheduler):
             mm_input_error = "--franky-side sandy takes token ids only in a room."
         if recv_req.franky is not None and recv_req.franky.taps_only:
             recv_req.sampling_params.max_new_tokens = 0
-        # Sandy writes plain text; Ricky reads it, and its taps.
         recv_req.sampling_params.json_schema = None
         recv_req.sampling_params.regex = None
         recv_req.sampling_params.ebnf = None
@@ -122,7 +121,7 @@ class SandyScheduler(FrankyChainScheduler):
             FrankyRequest.of(req).room is not None
             and req.sampling_params.max_new_tokens
         ):
-            req.franky_finish_rule = TapStep.take(req.sampling_params)
+            TapStep.attach(req)
         super().init_req_max_new_tokens(req)
 
     @override

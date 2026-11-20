@@ -16,13 +16,13 @@ from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional
 
-from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE
 from sglang.srt.franky.parts.franky_mixin import FrankyMixin
 from sglang.srt.franky.parts.franky_parts import FrankyParts
 from sglang.srt.franky.parts.injector.residual.output import StreamOutput
 from sglang.srt.franky.parts.reader import tap_attention
+from sglang.srt.franky.tap_runs import FrankyTapRuns
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -145,7 +145,7 @@ def _spans(tap_len, *, block_size=None):
         return None
     step = block_size or 1
     starts = range(tap_len, tap_len + 3 * step, step) if block_size else (tap_len,)
-    return FrankyGeneratedSpans(starts=tuple(starts), taps=tuple(starts))
+    return FrankyTapRuns(starts=tuple(starts), taps=tuple(starts))
 
 
 class _Files(CustomTestCase):
@@ -248,7 +248,7 @@ class _Files(CustomTestCase):
         parts.request_table.bind(
             req_pool_indices=[row],
             pages=[pages],
-            spans=[spans],
+            tap_runs=[spans],
             num_input_tokens=[first],
         )
 
@@ -339,7 +339,7 @@ class TestReaders(_Files):
         parts.request_table.bind(
             req_pool_indices=[4],
             pages=[None],
-            spans=[_spans(5, block_size=4)],
+            tap_runs=[_spans(5, block_size=4)],
             num_input_tokens=[13],
         )
         layer_output = torch.randn(10, _HIDDEN_SIZE)

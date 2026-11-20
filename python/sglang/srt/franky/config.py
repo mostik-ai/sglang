@@ -16,6 +16,26 @@ class FrankySide(str, Enum):
     RICKY = "ricky"
 
 
+class FrankyTapRole(Enum):
+    """What an engine does with taps: a side with Franky parts sends them
+    (Sandy) or reads them (Ricky); one without only writes a chain's text."""
+
+    SENDS = "sends"
+    READS = "reads"
+    NONE = "none"
+
+    @staticmethod
+    def of_engine(*, side: str, has_config: bool) -> FrankyTapRole:
+        """
+        Args:
+            side: ``--franky-side``.
+            has_config: whether the engine runs a ``--franky-config``.
+        """
+        if not has_config:
+            return FrankyTapRole.NONE
+        return FrankyTapRole.SENDS if side == FrankySide.SANDY else FrankyTapRole.READS
+
+
 class FrankyConfig(
     msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
 ):

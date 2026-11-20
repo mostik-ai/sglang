@@ -11,7 +11,6 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.franky_reader_merge import PACK_COLUMNS
-from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE, TapBuffers
 from sglang.srt.franky.cache.tap_request_table import TapRequestTable
 from sglang.srt.franky.cache.tap_stripes import TapStripes
@@ -20,6 +19,7 @@ from sglang.srt.franky.parts.reader.current_tap_reading import CurrentTapReading
 from sglang.srt.franky.parts.reader.tap_attention import TapAttention
 from sglang.srt.franky.parts.reader.tap_merge import TapMerge
 from sglang.srt.franky.parts.reader.tap_reading import TapReading
+from sglang.srt.franky.tap_runs import FrankyTapRuns
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -35,10 +35,10 @@ _FREE_PAGES = {1: [3, 1, 4, 5], 2: [2, 6], 3: []}
 # Row 1's earlier answer, tokens 2 and 3, reads 5 taps; its new answer reads 13.
 # Row 2 reads 3 taps, all of them in rank 0's first page; row 3 reads none.
 _SPANS = {
-    1: FrankyGeneratedSpans.of_runs(
+    1: FrankyTapRuns.of_runs(
         [[2, 5], [4, 0], [6, 13]], num_input_tokens=6, num_taps=13
     ),
-    2: FrankyGeneratedSpans.after_input(num_input_tokens=3, num_taps=3),
+    2: FrankyTapRuns.after_input(num_input_tokens=3, num_taps=3),
     3: None,
 }
 _NUM_INPUT_TOKENS = {1: 6, 2: 3, 3: 4}
@@ -174,7 +174,7 @@ def _request_table(*, num_ranks):
             None if row_pages is None else torch.tensor(row_pages)
             for row_pages in pages
         ],
-        spans=[_SPANS[row] for row in rows],
+        tap_runs=[_SPANS[row] for row in rows],
         num_input_tokens=[_NUM_INPUT_TOKENS[row] for row in rows],
     )
     return request_table

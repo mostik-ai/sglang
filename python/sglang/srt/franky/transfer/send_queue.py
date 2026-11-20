@@ -170,7 +170,7 @@ class FrankySendQueue:
             )
             self._chain_holds.release_chain_of(send.req)
         else:
-            self._chain_holds.hold_for_next_block(send.req)
+            self._chain_holds.hold_for_next_request(send.req)
         send.sender.close()
 
     def forget(self, *, req: Req) -> None:

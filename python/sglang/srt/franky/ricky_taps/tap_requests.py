@@ -47,8 +47,8 @@ class RickyTapRequests:
     may release other chains' holds for room. When it joins a batch its tokens
     are set for the readers and its chain's hold may go. At its end a request
     whose taps all landed leaves its whole stripes in the prefix tree, held for
-    its chain's next block unless it ended its chain; a request aborted before
-    that ends its chain's hold. Every rank decides at the same
+    its chain's next request; a request aborted before that ends its chain's
+    hold. Every rank decides at the same
     steps, so stripe pages stay the same on every rank.
 
     Where the engine has a mamba state pool, the chains' holds stay within its
@@ -114,7 +114,7 @@ class RickyTapRequests:
         req.franky_taps = TapProgress(
             tap_len=len(sandy_tokens),
             taps_ready=0,
-            spans=request.tap_runs,
+            tap_runs=request.tap_runs,
         )
         self._waiting[req.rid] = _Waiting(req=req, sandy_tokens=sandy_tokens)
         return None
@@ -158,8 +158,8 @@ class RickyTapRequests:
         self._request_table.bind(
             req_pool_indices=[req.kv.req_pool_idx for req in reqs],
             pages=pages,
-            spans=[
-                None if req.franky_taps is None else req.franky_taps.spans
+            tap_runs=[
+                None if req.franky_taps is None else req.franky_taps.tap_runs
                 for req in reqs
             ],
             num_input_tokens=[len(req.origin_input_ids) for req in reqs],
@@ -178,7 +178,7 @@ class RickyTapRequests:
             self._tap_cache.drop(reservation)
             self._chain_holds.release_chain_of(req)
             return
-        self._chain_holds.hold_for_next_block(
+        self._chain_holds.hold_for_next_request(
             req, tap_lock=self._tap_cache.cache(reservation)
         )
 

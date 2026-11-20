@@ -14,9 +14,12 @@ from sglang.srt.environ import envs
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
-from sglang.srt.franky.finish_rules.request_blocks import start_blocks
+from sglang.srt.franky.finish_rules.request_blocks import attach_blocks
 from sglang.srt.franky.ricky_taps.prefill_tap_limit import PrefillTapLimit
 from sglang.srt.franky.ricky_taps.taps import RickyTaps
+from sglang.srt.franky.schedulers.chain_batch_result_processor import (
+    FrankyChainBatchResultProcessor,
+)
 from sglang.srt.franky.schedulers.parked_chunks import FrankyParkedChunks
 from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder
 from sglang.srt.franky.transfer.manager import FrankyTapManager
@@ -70,6 +73,17 @@ class RickyScheduler(Scheduler):
         self.init_franky_receiving()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.init_franky_relay()
+
+    @override
+    def init_batch_result_processor(self) -> None:
+        """A chain's leg that reads no taps is held as on any chain engine; one
+        that reads taps is held again, with its taps, once they are released.
+        """
+        super().init_batch_result_processor()
+        self.batch_result_processor = FrankyChainBatchResultProcessor.extend(
+            self.batch_result_processor,
+            franky_chain_holds=self.franky_taps.chain_holds,
+        )
 
     def init_franky_taps(self) -> None:
         """This rank's taps, whose chain holds stay within the mamba state pool's
@@ -187,7 +201,7 @@ class RickyScheduler(Scheduler):
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False) -> None:
         self.franky_receive_queue.add(req=req)
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
-            start_blocks(req)
+            attach_blocks(req)
         super()._add_request_to_queue(req, is_retracted=is_retracted)
 
     @override

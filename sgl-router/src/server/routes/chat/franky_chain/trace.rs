@@ -4,7 +4,6 @@
 use super::super::tap_runs::{joined, TapRun};
 use crate::tokenizer::franky_sandy::FrankySandyTokens;
 use anyhow::Result;
-use serde_json::Value;
 use std::sync::Arc;
 
 /// A chain's trace as the engines read it: the prompt and every token written
@@ -12,11 +11,13 @@ use std::sync::Arc;
 /// that tokenizes on its own, in Sandy's ids too; and the tap runs that say
 /// which taps each Ricky token reads.
 pub(super) struct ChainTrace {
-    prompt_ids: Vec<Value>,
-    answer_ids: Vec<Value>,
+    prompt_ids: Vec<u32>,
+    answer_ids: Vec<u32>,
     sandy: Option<SandyTrace>,
     earlier_runs: Vec<TapRun>,
-    segments: Vec<TapRun>,
+    /// One run per Sandy call or tap leg, from where Ricky's tokens read what
+    /// Sandy had run until then.
+    sandy_runs: Vec<TapRun>,
 }
 
 /// Sandy's ids of a chain whose Sandy tokenizes on its own: its rendering of
@@ -35,7 +36,7 @@ impl ChainTrace {
     /// `sandy` is a Sandy that tokenizes on its own with its ids of the prompt;
     /// `earlier_runs` are the tap runs of the prompt's earlier answers.
     pub(super) fn of_prompt(
-        prompt_ids: Vec<Value>,
+        prompt_ids: Vec<u32>,
         sandy: Option<(Arc<FrankySandyTokens>, Vec<u32>)>,
         earlier_runs: Vec<TapRun>,
     ) -> Self {
@@ -48,12 +49,12 @@ impl ChainTrace {
                 answer_ids: Vec::new(),
             }),
             earlier_runs,
-            segments: Vec::new(),
+            sandy_runs: Vec::new(),
         }
     }
 
     /// Ricky's ids of the whole trace.
-    pub(super) fn ricky_ids(&self) -> Vec<Value> {
+    pub(super) fn ricky_ids(&self) -> Vec<u32> {
         [self.prompt_ids.as_slice(), self.answer_ids.as_slice()].concat()
     }
 
@@ -64,36 +65,42 @@ impl ChainTrace {
     }
 
     /// How many tokens the chain wrote, in Ricky's ids.
-    pub(super) fn num_written(&self) -> usize {
-        self.answer_ids.len()
+    pub(super) fn num_written(&self) -> u64 {
+        self.answer_ids.len() as u64
     }
 
     /// The tap runs of a Ricky leg that starts now: the earlier answers', then
-    /// one segment per Sandy call.
+    /// one per Sandy call or tap leg.
     pub(super) fn tap_runs(&self) -> Vec<TapRun> {
-        joined(self.earlier_runs.iter().chain(&self.segments).copied())
+        joined(self.earlier_runs.iter().chain(&self.sandy_runs).copied())
     }
 
     /// A Sandy call wrote `ricky_ids`, its text in Ricky's ids, and with a Sandy
-    /// that tokenizes on its own `sandy_ids`, the same text in Sandy's. Its
-    /// segment starts where its text does and reads every tap Sandy has then.
-    pub(super) fn add_sandy_text(&mut self, ricky_ids: Vec<Value>, sandy_ids: Vec<u32>) {
+    /// that tokenizes on its own `sandy_ids`, the same text in Sandy's. Its run
+    /// starts where its text does and reads every token Sandy has then.
+    pub(super) fn add_sandy_text(&mut self, ricky_ids: &[u32], sandy_ids: &[u32]) {
         let start = self.prompt_ids.len() + self.answer_ids.len();
-        self.answer_ids.extend(ricky_ids);
+        self.answer_ids.extend_from_slice(ricky_ids);
         if let Some(sandy) = &mut self.sandy {
-            sandy.answer_ids.extend(sandy_ids);
+            sandy.answer_ids.extend_from_slice(sandy_ids);
         }
-        self.segments.push(TapRun {
+        self.sandy_runs.push(TapRun {
             start,
             taps: self.num_sandy_tokens(),
         });
     }
 
+    /// A Sandy leg that writes nothing runs the trace beside the next Ricky
+    /// leg, whose tokens read every token Sandy has from here on.
+    pub(super) fn start_tap_leg(&mut self) {
+        self.add_sandy_text(&[], &[]);
+    }
+
     /// A Ricky leg wrote `ricky_ids`, whose text is `text`.
     ///
     /// Errors: Sandy's tokenizer fails on the text.
-    pub(super) fn add_ricky_text(&mut self, ricky_ids: &[Value], text: &str) -> Result<()> {
-        self.answer_ids.extend(ricky_ids.iter().cloned());
+    pub(super) fn add_ricky_text(&mut self, ricky_ids: &[u32], text: &str) -> Result<()> {
+        self.answer_ids.extend_from_slice(ricky_ids);
         if let Some(sandy) = &mut self.sandy {
             sandy
                 .answer_ids
@@ -113,22 +120,17 @@ impl ChainTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn ids(values: &[u64]) -> Vec<Value> {
-        values.iter().map(|value| json!(value)).collect()
-    }
 
     #[test]
-    fn each_sandy_call_starts_a_segment_reading_every_tap_sandy_has() {
+    fn each_sandy_call_starts_a_run_reading_every_token_sandy_has() {
         let earlier = vec![TapRun { start: 1, taps: 1 }, TapRun { start: 2, taps: 0 }];
-        let mut trace = ChainTrace::of_prompt(ids(&[1, 2, 3]), None, earlier.clone());
+        let mut trace = ChainTrace::of_prompt(vec![1, 2, 3], None, earlier.clone());
 
-        trace.add_sandy_text(ids(&[4, 5]), Vec::new());
-        trace.add_ricky_text(&ids(&[6, 7, 8]), "").unwrap();
-        trace.add_sandy_text(Vec::new(), Vec::new());
+        trace.add_sandy_text(&[4, 5], &[]);
+        trace.add_ricky_text(&[6, 7, 8], "").unwrap();
+        trace.start_tap_leg();
 
-        assert_eq!(trace.ricky_ids(), ids(&[1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(trace.ricky_ids(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(trace.num_written(), 5);
         assert_eq!(
             trace.tap_runs(),

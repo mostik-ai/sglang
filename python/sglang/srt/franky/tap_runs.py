@@ -6,7 +6,7 @@ import msgspec
 import numpy as np
 
 
-class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
+class FrankyTapRuns(msgspec.Struct, frozen=True, kw_only=True):
     """Which taps the forward that makes each token of a request reads, as runs
     the router sets: a token from ``starts[i]`` on, up to the next run, reads
     ``taps[i]`` taps. Tokens before the first run read none. The router makes a
@@ -24,7 +24,7 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
     @staticmethod
     def of_runs(
         runs: list[list[int]], *, num_input_tokens: int, num_taps: int
-    ) -> FrankyGeneratedSpans:
+    ) -> FrankyTapRuns:
         """
         Args:
             runs: ``franky_tap_runs``, ``[start, taps]`` pairs.
@@ -48,12 +48,12 @@ class FrankyGeneratedSpans(msgspec.Struct, frozen=True, kw_only=True):
                 f"all {num_taps} taps of the input and all of them last, got {runs}."
             )
         starts, taps = zip(*runs)
-        return FrankyGeneratedSpans(starts=starts, taps=taps)
+        return FrankyTapRuns(starts=starts, taps=taps)
 
     @staticmethod
-    def after_input(*, num_input_tokens: int, num_taps: int) -> FrankyGeneratedSpans:
+    def after_input(*, num_input_tokens: int, num_taps: int) -> FrankyTapRuns:
         """One answer after the input, whose tokens read all of its taps."""
-        return FrankyGeneratedSpans(starts=(num_input_tokens,), taps=(num_taps,))
+        return FrankyTapRuns(starts=(num_input_tokens,), taps=(num_taps,))
 
     def taps_to_read(self, tokens: np.ndarray) -> np.ndarray:
         """

@@ -12,7 +12,6 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.nixl.conn import NixlKVReceiver, NixlKVSender
-from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
 from sglang.srt.franky.cache.tap_buffers import TapBuffers
 from sglang.srt.franky.cache.tap_request_table import TapRequestTable
@@ -22,6 +21,7 @@ from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.franky.ricky_taps.tap_requests import RickyTapRequests
+from sglang.srt.franky.tap_runs import FrankyTapRuns
 from sglang.srt.franky.transfer import receiver as receiver_module
 from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.franky.transfer.relay import sender as relay_sender_module
@@ -95,7 +95,7 @@ def _request(
                 tap_runs=(
                     None
                     if room is None
-                    else FrankyGeneratedSpans.after_input(
+                    else FrankyTapRuns.after_input(
                         num_input_tokens=len(input_ids),
                         num_taps=len(sandy_input_ids or input_ids),
                     )
@@ -277,7 +277,7 @@ class TestRickyTapRequests(_Requests):
         self.assertEqual(plain.extra_key, "user|franky=no-taps")
         self.assertEqual(bare.extra_key, "franky=no-taps")
         self.assertEqual(
-            (plain.franky_taps.tap_len, plain.franky_taps.spans), (0, None)
+            (plain.franky_taps.tap_len, plain.franky_taps.tap_runs), (0, None)
         )
         self.assertEqual(self.requests.poll(), [])
         self.assertTrue(self.requests.is_empty())
@@ -358,8 +358,8 @@ class TestRickyTapRequests(_Requests):
         )
         self.assertEqual(request_table.stripe_pages[1].tolist(), [0] * _MAX_STRIPES)
         self.assertEqual(request_table.decode_taps.tolist(), [0, 0, 20, 0])
-        self.assertIs(request_table.spans_of(2), reading.franky_taps.spans)
-        self.assertIsNone(request_table.spans_of(1))
+        self.assertIs(request_table.tap_runs_of(2), reading.franky_taps.tap_runs)
+        self.assertIsNone(request_table.tap_runs_of(1))
         self.assertEqual(reservation.num_taps, reading.franky_taps.tap_len)
 
 

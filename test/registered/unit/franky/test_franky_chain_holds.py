@@ -54,8 +54,8 @@ class TestFrankyChainHolds(CustomTestCase):
     def test_a_chains_next_hold_replaces_its_last(self):
         holds = self._holds()
 
-        holds.hold_for_next_block(_block("c", node="block-1", num_tokens=10))
-        holds.hold_for_next_block(_block("c", node="block-2", num_tokens=20))
+        holds.hold_for_next_request(_block("c", node="block-1", num_tokens=10))
+        holds.hold_for_next_request(_block("c", node="block-2", num_tokens=20))
 
         self.assertEqual(self.tree.locked, ["block-2"])
 
@@ -66,7 +66,7 @@ class TestFrankyChainHolds(CustomTestCase):
             ("stop", FINISH_MATCHED_TOKEN(matched=2)),
             ("limit", FINISH_LENGTH(length=9)),
         ):
-            holds.hold_for_next_block(
+            holds.hold_for_next_request(
                 _block(chain_id, node=chain_id, finished_reason=reason)
             )
 
@@ -78,7 +78,7 @@ class TestFrankyChainHolds(CustomTestCase):
         holds = self._holds()
         plain = SimpleNamespace(franky=None, last_node="n", origin_input_ids=[0])
 
-        holds.hold_for_next_block(plain)
+        holds.hold_for_next_request(plain)
         holds.release_chain_of(plain)
 
         self.assertEqual(self.tree.locked, [])
@@ -87,7 +87,7 @@ class TestFrankyChainHolds(CustomTestCase):
         holds = self._holds()
 
         for chain_id in "abcdefgh":
-            holds.hold_for_next_block(
+            holds.hold_for_next_request(
                 _block(chain_id, node=chain_id, num_tokens=1_000_000)
             )
 
@@ -95,10 +95,10 @@ class TestFrankyChainHolds(CustomTestCase):
 
     def test_least_progress_goes_first_then_the_most_tokens_but_not_the_asker(self):
         holds = self._holds()
-        holds.hold_for_next_block(_block("far", node="far", num_tokens=90, block=5))
-        holds.hold_for_next_block(_block("small", node="small", num_tokens=10))
-        holds.hold_for_next_block(_block("big", node="big", num_tokens=50))
-        holds.hold_for_next_block(_block("asker", node="asker", num_tokens=99))
+        holds.hold_for_next_request(_block("far", node="far", num_tokens=90, block=5))
+        holds.hold_for_next_request(_block("small", node="small", num_tokens=10))
+        holds.hold_for_next_request(_block("big", node="big", num_tokens=50))
+        holds.hold_for_next_request(_block("asker", node="asker", num_tokens=99))
 
         released = [
             holds.release_least_progress(sparing_chain_id="asker") for _ in range(4)
@@ -109,9 +109,9 @@ class TestFrankyChainHolds(CustomTestCase):
 
     def test_the_first_release_frees_the_biggest_chain_of_the_fewest_blocks(self):
         holds = self._holds()
-        holds.hold_for_next_block(_block("far", node="far", num_tokens=90, block=5))
-        holds.hold_for_next_block(_block("small", node="small", num_tokens=10))
-        holds.hold_for_next_block(_block("big", node="big", num_tokens=50))
+        holds.hold_for_next_request(_block("far", node="far", num_tokens=90, block=5))
+        holds.hold_for_next_request(_block("small", node="small", num_tokens=10))
+        holds.hold_for_next_request(_block("big", node="big", num_tokens=50))
 
         holds.release_least_progress(sparing_chain_id=None)
 
@@ -119,8 +119,8 @@ class TestFrankyChainHolds(CustomTestCase):
 
     def test_held_chains_go_first_and_keep_their_order(self):
         holds = self._holds()
-        holds.hold_for_next_block(_block("held-1", node="h1"))
-        holds.hold_for_next_block(_block("held-2", node="h2"))
+        holds.hold_for_next_request(_block("held-1", node="h1"))
+        holds.hold_for_next_request(_block("held-2", node="h2"))
         requests = [
             _block("new", node="n"),
             _block("held-2", node="h2", block=2),
@@ -136,16 +136,16 @@ class TestFrankyChainHolds(CustomTestCase):
 
     def test_locked_nodes_name_each_held_node_once(self):
         holds = self._holds()
-        holds.hold_for_next_block(_block("a", node="shared"))
-        holds.hold_for_next_block(_block("b", node="shared"))
-        holds.hold_for_next_block(_block("c", node="c"))
+        holds.hold_for_next_request(_block("a", node="shared"))
+        holds.hold_for_next_request(_block("b", node="shared"))
+        holds.hold_for_next_request(_block("c", node="c"))
 
         self.assertEqual(holds.locked_nodes(), {"shared", "c"})
 
     def test_release_all_leaves_nothing_locked(self):
         holds = self._holds()
-        holds.hold_for_next_block(_block("a", node="a", num_tokens=3))
-        holds.hold_for_next_block(_block("b", node="b", num_tokens=4))
+        holds.hold_for_next_request(_block("a", node="a", num_tokens=3))
+        holds.hold_for_next_request(_block("b", node="b", num_tokens=4))
 
         holds.release_all()
 
@@ -153,7 +153,7 @@ class TestFrankyChainHolds(CustomTestCase):
 
     def test_releasing_a_chain_without_a_hold_does_nothing(self):
         holds = self._holds()
-        holds.hold_for_next_block(_block("a", node="a"))
+        holds.hold_for_next_request(_block("a", node="a"))
 
         holds.release(chain_id="other")
         holds.release_chain_of(_block("other", node="o"))
@@ -162,7 +162,7 @@ class TestFrankyChainHolds(CustomTestCase):
 
     def test_an_expired_hold_is_announced_once_and_released_on_every_rank(self):
         leader = self._holds(hold_seconds=0)
-        leader.hold_for_next_block(_block("a", node="a"))
+        leader.hold_for_next_request(_block("a", node="a"))
 
         messages = leader.expired_messages()
 
@@ -173,14 +173,14 @@ class TestFrankyChainHolds(CustomTestCase):
 
     def test_a_live_hold_is_not_announced(self):
         holds = self._holds(hold_seconds=3600)
-        holds.hold_for_next_block(_block("a", node="a"))
+        holds.hold_for_next_request(_block("a", node="a"))
 
         self.assertEqual(holds.expired_messages(), [])
 
     def test_an_expiry_of_an_older_hold_keeps_the_newer_one(self):
         holds = self._holds()
-        holds.hold_for_next_block(_block("a", node="block-1"))
-        holds.hold_for_next_block(_block("a", node="block-2"))
+        holds.hold_for_next_request(_block("a", node="block-1"))
+        holds.hold_for_next_request(_block("a", node="block-2"))
 
         holds.on_hold_expired(message=FrankyHoldExpired(chain_id="a", order=0))
 
@@ -210,7 +210,7 @@ class TestFrankyChainHoldsOfTaps(CustomTestCase):
         )
 
     def test_a_hold_keeps_its_blocks_tap_lock_beside_its_kv_lock(self):
-        self.holds.hold_for_next_block(_block("c", node="c"), tap_lock="taps-c")
+        self.holds.hold_for_next_request(_block("c", node="c"), tap_lock="taps-c")
 
         self.assertTrue(self.holds.holds_chain_of(_block("c", node="c", block=2)))
         self.assertEqual(self.tree.locked, ["c"])
@@ -226,7 +226,7 @@ class TestFrankyChainHoldsOfTaps(CustomTestCase):
             "expiry": lambda holds: holds.on_hold_expired(
                 message=FrankyHoldExpired(chain_id="c", order=0)
             ),
-            "next hold": lambda holds: holds.hold_for_next_block(
+            "next hold": lambda holds: holds.hold_for_next_request(
                 _block("c", node="c-2")
             ),
         }
@@ -234,7 +234,7 @@ class TestFrankyChainHoldsOfTaps(CustomTestCase):
             with self.subTest(name):
                 self.tap_cache.released.clear()
                 holds = self._holds()
-                holds.hold_for_next_block(_block("c", node="c"), tap_lock="taps-c")
+                holds.hold_for_next_request(_block("c", node="c"), tap_lock="taps-c")
 
                 end(holds)
 
@@ -246,7 +246,7 @@ class TestFrankyChainHoldsOfTaps(CustomTestCase):
             franky=None, last_node="n", origin_input_ids=[0], finished_reason=None
         )
 
-        self.holds.hold_for_next_block(plain, tap_lock="taps-plain")
+        self.holds.hold_for_next_request(plain, tap_lock="taps-plain")
 
         self.assertEqual(self.tap_cache.released, ["taps-plain"])
         self.assertEqual(self.tree.locked, [])
@@ -255,10 +255,10 @@ class TestFrankyChainHoldsOfTaps(CustomTestCase):
         holds = FrankyChainHolds(
             tree_cache=None, tap_cache=self.tap_cache, hold_seconds=60.0
         )
-        holds.hold_for_next_block(
+        holds.hold_for_next_request(
             _block("few", node=None, num_tokens=20), tap_lock="taps-few"
         )
-        holds.hold_for_next_block(
+        holds.hold_for_next_request(
             _block("many", node=None, num_tokens=40), tap_lock="taps-many"
         )
 
@@ -270,7 +270,7 @@ class TestFrankyChainHoldsOfTaps(CustomTestCase):
         self.assertEqual(self.tree.locked, [])
 
     def test_a_hold_without_taps_releases_no_tap_lock(self):
-        self.holds.hold_for_next_block(_block("c", node="c"))
+        self.holds.hold_for_next_request(_block("c", node="c"))
 
         self.holds.release(chain_id="c")
 

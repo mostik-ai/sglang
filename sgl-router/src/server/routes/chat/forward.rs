@@ -57,6 +57,8 @@ pub(super) struct HttpDispatched {
     /// The workers to avoid on a retry, set only when nothing beyond a
     /// failure status reached the client, so another worker may serve it.
     pub(super) retry_excluding: Vec<WorkerId>,
+    /// The Franky room of this attempt's taps, if any.
+    pub(super) franky_room: Option<FrankyRoom>,
 }
 
 pub(super) async fn forward_request(
@@ -90,6 +92,7 @@ pub(super) async fn forward_request(
     Ok(HttpDispatched {
         response,
         retry_excluding: dispatched.retry_excluding,
+        franky_room: dispatched.franky_room,
     })
 }
 
@@ -163,6 +166,7 @@ struct Dispatched<R> {
     log_context: RequestLogContext,
     decode_url_header: Option<HeaderValue>,
     retry_excluding: Vec<WorkerId>,
+    franky_room: Option<FrankyRoom>,
 }
 
 async fn dispatch<T: Transport>(
@@ -219,15 +223,13 @@ async fn dispatch<T: Transport>(
     );
     let pd_prefill = decode.is_some().then(|| prefill.id.clone());
     // The Sandy and every Ricky leg receive the same Franky room for the taps:
-    // a Sandy leg's, opened per attempt, or the room of a Sandy call that ran.
-    let franky_room = match &request.tap_source {
+    // a Sandy leg's or a Sandy call's, opened per attempt, or the room of a Sandy
+    // call that ran.
+    let franky_room = match &request.franky.tap_source {
         TapSource::None => None,
-        TapSource::SandyLeg => sandy.as_ref().map(|sandy| FrankyRoom {
-            host: sandy.bootstrap_host().to_string(),
-            port: sandy.bootstrap_port(),
-            room: generate_room_id(),
-        }),
+        TapSource::SandyLeg => sandy.as_deref().map(FrankyRoom::at),
         TapSource::Room(room) => Some(room.clone()),
+        TapSource::SandyCall => Some(FrankyRoom::at(decode.as_deref().unwrap_or(&prefill))),
     };
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
     let pd = decode.map(|decode| {
@@ -443,6 +445,7 @@ async fn dispatch<T: Transport>(
         log_context,
         decode_url_header,
         retry_excluding,
+        franky_room,
     })
 }
 

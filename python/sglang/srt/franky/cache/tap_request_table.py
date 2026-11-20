@@ -5,13 +5,13 @@ from typing import Optional
 import numpy as np
 import torch
 
-from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
+from sglang.srt.franky.tap_runs import FrankyTapRuns
 from sglang.srt.utils.common import async_h2d, async_h2d_stack
 
 
 class TapRequestTable:
     """Per request slot of Ricky's ``req_to_token`` pool, what its readers read:
-    the local pages of the request's stripes, its generated spans, and, once it
+    the local pages of the request's stripes, its tap runs, and, once it
     decodes, how many taps the forward of its next token reads. A request's slot
     is set when it joins a batch.
 
@@ -27,14 +27,14 @@ class TapRequestTable:
             (num_slots, max_stripes), dtype=torch.int32, device=device
         )
         self.decode_taps = torch.zeros(num_slots, dtype=torch.int32, device=device)
-        self._spans: list[Optional[FrankyGeneratedSpans]] = [None] * num_slots
+        self._tap_runs: list[Optional[FrankyTapRuns]] = [None] * num_slots
 
     def bind(
         self,
         *,
         req_pool_indices: list[int],
         pages: list[Optional[torch.Tensor]],
-        spans: list[Optional[FrankyGeneratedSpans]],
+        tap_runs: list[Optional[FrankyTapRuns]],
         num_input_tokens: list[int],
     ) -> None:
         """Set the slots of requests that join a batch; a request without pages
@@ -49,14 +49,14 @@ class TapRequestTable:
         slots = async_h2d(req_pool_indices, dtype=torch.int64, device=device)
         self.decode_taps[slots] = async_h2d(
             [
-                _decode_taps(request_spans, first)
-                for request_spans, first in zip(spans, num_input_tokens)
+                _decode_taps(request_tap_runs, first)
+                for request_tap_runs, first in zip(tap_runs, num_input_tokens)
             ],
             dtype=torch.int32,
             device=device,
         )
-        for slot, slot_spans in zip(req_pool_indices, spans):
-            self._spans[slot] = slot_spans
+        for slot, slot_tap_runs in zip(req_pool_indices, tap_runs):
+            self._tap_runs[slot] = slot_tap_runs
         reading = [
             (slot, slot_pages)
             for slot, slot_pages in zip(req_pool_indices, pages)
@@ -65,8 +65,8 @@ class TapRequestTable:
         if reading:
             self._bind_pages(reading)
 
-    def spans_of(self, slot: int) -> Optional[FrankyGeneratedSpans]:
-        return self._spans[slot]
+    def tap_runs_of(self, slot: int) -> Optional[FrankyTapRuns]:
+        return self._tap_runs[slot]
 
     def _bind_pages(self, reading: list[tuple[int, torch.Tensor]]) -> None:
         width = max(len(slot_pages) for _, slot_pages in reading)
@@ -87,7 +87,7 @@ class TapRequestTable:
         return self.stripe_pages.shape[1]
 
 
-def _decode_taps(spans: Optional[FrankyGeneratedSpans], first_decoded: int) -> int:
-    if spans is None:
+def _decode_taps(tap_runs: Optional[FrankyTapRuns], first_decoded: int) -> int:
+    if tap_runs is None:
         return 0
-    return int(spans.taps_to_read(np.array([first_decoded]))[0])
+    return int(tap_runs.taps_to_read(np.array([first_decoded]))[0])

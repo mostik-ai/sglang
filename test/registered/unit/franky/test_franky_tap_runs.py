@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
+from sglang.srt.franky.tap_runs import FrankyTapRuns
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,12 +16,12 @@ _RUNS = [[5, 5], [11, 0], [14, 14], [18, 22]]
 
 
 def _spans(runs=_RUNS, *, num_input_tokens=22, num_taps=22):
-    return FrankyGeneratedSpans.of_runs(
+    return FrankyTapRuns.of_runs(
         runs, num_input_tokens=num_input_tokens, num_taps=num_taps
     )
 
 
-class TestFrankyGeneratedSpans(CustomTestCase):
+class TestFrankyTapRuns(CustomTestCase):
     def test_a_token_reads_the_taps_of_its_run_and_tokens_before_any_none(self):
         taps = _spans().taps_to_read(np.arange(26))
 
@@ -30,9 +30,9 @@ class TestFrankyGeneratedSpans(CustomTestCase):
         )
 
     def test_an_answer_after_the_input_reads_all_of_its_taps(self):
-        spans = FrankyGeneratedSpans.after_input(num_input_tokens=356, num_taps=340)
+        spans = FrankyTapRuns.after_input(num_input_tokens=356, num_taps=340)
 
-        self.assertEqual(spans, FrankyGeneratedSpans(starts=(356,), taps=(340,)))
+        self.assertEqual(spans, FrankyTapRuns(starts=(356,), taps=(340,)))
         self.assertEqual(
             spans.taps_to_read(np.array([355, 356, 400])).tolist(), [0, 340, 340]
         )

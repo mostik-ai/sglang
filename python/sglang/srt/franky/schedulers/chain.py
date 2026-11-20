@@ -9,7 +9,7 @@ from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.franky.config import FrankySide
-from sglang.srt.franky.finish_rules.request_blocks import start_blocks
+from sglang.srt.franky.finish_rules.request_blocks import attach_blocks
 from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.franky.schedulers.chain_batch_result_processor import (
     FrankyChainBatchResultProcessor,
@@ -74,7 +74,7 @@ class FrankyChainScheduler(Scheduler):
     @override
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False) -> None:
         if self._writes_blocks:
-            start_blocks(req)
+            attach_blocks(req)
         super()._add_request_to_queue(req, is_retracted=is_retracted)
 
     @override

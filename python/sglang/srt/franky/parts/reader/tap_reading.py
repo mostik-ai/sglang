@@ -203,10 +203,10 @@ def _taps_of_tokens(
         int64, per token the forward makes, how many taps it reads; None for a
         request that reads none.
     """
-    spans = request_table.spans_of(slot)
-    if spans is None:
+    tap_runs = request_table.tap_runs_of(slot)
+    if tap_runs is None:
         return None
-    return spans.taps_to_read(
+    return tap_runs.taps_to_read(
         np.arange(first_token + 1, first_token + num_tokens + 1, dtype=np.int64)
     )
 

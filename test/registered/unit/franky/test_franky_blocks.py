@@ -4,7 +4,7 @@ import msgspec
 
 from sglang.srt.franky.chains.blocks.sandy_call import FrankySandyCall
 from sglang.srt.franky.chains.chain import FrankyChain
-from sglang.srt.franky.finish_rules.request_blocks import start_blocks
+from sglang.srt.franky.finish_rules.request_blocks import attach_blocks
 from sglang.srt.franky.finish_rules.tap_step import TapStep
 from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.managers.schedule_batch import (
@@ -38,7 +38,7 @@ def _request(*, chain=None, max_new_tokens=100):
 
 def _leg(blocks, *, block=1, max_new_tokens=100):
     req = _request(chain=_chain(blocks, block=block), max_new_tokens=max_new_tokens)
-    start_blocks(req)
+    attach_blocks(req)
     return req
 
 
@@ -122,7 +122,7 @@ class TestRequestBlocks(CustomTestCase):
         req = _leg({"block_size": 3})
         _write(req, [10, 11])
 
-        start_blocks(req)
+        attach_blocks(req)
         written = _write(req, [12, 13])
 
         self.assertEqual(written, 1)
@@ -133,7 +133,7 @@ class TestRequestBlocks(CustomTestCase):
         without_blocks = _request(chain=FrankyChain(id="c"))
 
         for req in (outside, without_blocks):
-            start_blocks(req)
+            attach_blocks(req)
             _write(req, [10, 11, 12])
             self.assertIsNone(req.franky_finish_rule)
             self.assertFalse(req.finished())
@@ -159,7 +159,7 @@ class TestRequestBlocks(CustomTestCase):
 class TestTapStep(CustomTestCase):
     def _write_with_tap_step(self, tokens, *, max_new_tokens):
         req = _request(max_new_tokens=max_new_tokens)
-        req.franky_finish_rule = TapStep.take(req.sampling_params)
+        TapStep.attach(req)
         _write(req, tokens)
         return req
 
@@ -176,9 +176,15 @@ class TestTapStep(CustomTestCase):
         self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
         self.assertEqual(list(req.output_ids_through_stop), [10, _EOS])
 
+    def test_a_write_that_stops_on_its_extra_token_ends_at_the_tokens_it_asked(self):
+        req = self._write_with_tap_step([10, 11, 12, _EOS], max_new_tokens=3)
+
+        self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12])
+        self.assertEqual(req.finished_reason.to_json()["length"], 3)
+
     def test_an_aborted_write_keeps_its_abort(self):
         req = _request(max_new_tokens=3)
-        req.franky_finish_rule = TapStep.take(req.sampling_params)
+        TapStep.attach(req)
         req.to_finish = FINISH_ABORT("gone")
 
         req.update_finish_state(0)

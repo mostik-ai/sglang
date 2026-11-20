@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 class Reader(nn.Module, ABC):
     """Runs on Ricky: turns one encoder's taps into what the injector adds.
 
-    A row reads the taps that its request's ``FrankyGeneratedSpans`` give the
+    A row reads the taps that its request's ``FrankyTapRuns`` give the
     token it makes; a row that reads none must get exactly zero.
 
     To add an implementation: make a folder here with its reader and its

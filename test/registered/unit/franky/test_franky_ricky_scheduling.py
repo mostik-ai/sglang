@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.franky.cache.generated_spans import FrankyGeneratedSpans
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache
 from sglang.srt.franky.cache.tap_buffers import TapBuffers
@@ -26,6 +25,7 @@ from sglang.srt.franky.schedulers.parked_chunks import FrankyParkedChunks
 from sglang.srt.franky.schedulers.prefill_adder import FrankyPrefillAdder
 from sglang.srt.franky.schedulers.ricky import RickyScheduler
 from sglang.srt.franky.schedulers.sandy import SandyScheduler
+from sglang.srt.franky.tap_runs import FrankyTapRuns
 from sglang.srt.franky.transfer import receiver as receiver_module
 from sglang.srt.franky.transfer.messages import (
     FrankyRoom,
@@ -132,7 +132,7 @@ class _Req:
                 tap_runs=(
                     None
                     if not room
-                    else FrankyGeneratedSpans.of_runs(
+                    else FrankyTapRuns.of_runs(
                         tap_runs or [[prompt_len, num_taps]],
                         num_input_tokens=prompt_len,
                         num_taps=num_taps,
@@ -189,7 +189,7 @@ def _held(chain_id, *, node, num_tokens, block=1):
 
 
 def _single_turn(prompt_len):
-    return FrankyGeneratedSpans(starts=(prompt_len,), taps=(prompt_len,))
+    return FrankyTapRuns(starts=(prompt_len,), taps=(prompt_len,))
 
 
 def _tap_cache(*, num_ranks=1, rank=0, num_stripes=_NUM_STRIPES):
@@ -430,7 +430,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
         [receiver] = self.receivers
         self.assertEqual(len(receiver.tap_pages), 4)
         self.assertEqual(receiver.num_tokens, 50)
-        self.assertEqual(req.franky_taps.spans.taps[-1], 50)
+        self.assertEqual(req.franky_taps.tap_runs.taps[-1], 50)
 
     def test_sandys_own_tokens_key_the_cached_taps(self):
         self.queue = self._queue(shared_tokenizer=False)
@@ -752,7 +752,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
     def test_holds_past_the_mamba_room_go_least_progress_first(self):
         self._with_mamba_room(num_states=7)
         for chain_id, block in (("a", 3), ("b", 1), ("c", 2)):
-            self.holds.hold_for_next_block(
+            self.holds.hold_for_next_request(
                 _held(chain_id, node=f"held-{chain_id}", num_tokens=16, block=block)
             )
 
@@ -762,7 +762,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
     def test_only_chain_holds_pin_mamba_states(self):
         self._with_mamba_room(num_states=22)
-        self.holds.hold_for_next_block(_held("c", node="held-c", num_tokens=16))
+        self.holds.hold_for_next_request(_held("c", node="held-c", num_tokens=16))
         for rid in ("a", "b"):
             self._arrive(_Req(rid, prompt_len=64, first_id=1000))
 
@@ -827,8 +827,8 @@ class TestRickySchedulerTaps(CustomTestCase):
         self.assertEqual(self.request_table.stripe_pages[2, :4].tolist(), pages)
         self.assertEqual(self.request_table.stripe_pages[1].tolist(), [0] * 8)
         self.assertEqual(self.request_table.decode_taps.tolist(), [0, 0, 100, 0])
-        self.assertIs(self.request_table.spans_of(2), reading.franky_taps.spans)
-        self.assertIsNone(self.request_table.spans_of(1))
+        self.assertIs(self.request_table.tap_runs_of(2), reading.franky_taps.tap_runs)
+        self.assertIsNone(self.request_table.tap_runs_of(1))
 
     def test_pd_prefill_relays_the_taps_once_they_all_landed(self):
         req = self._reserved("r", row=0, num_taps=100)
@@ -886,9 +886,11 @@ class TestSandyHeldChains(CustomTestCase):
         self.holds = FrankyChainHolds(
             tree_cache=self.tree, tap_cache=None, hold_seconds=60
         )
-        self.holds.hold_for_next_block(_held("asker", node="asker", num_tokens=16))
-        self.holds.hold_for_next_block(_held("far", node="far", num_tokens=16, block=4))
-        self.holds.hold_for_next_block(_held("near", node="near", num_tokens=16))
+        self.holds.hold_for_next_request(_held("asker", node="asker", num_tokens=16))
+        self.holds.hold_for_next_request(
+            _held("far", node="far", num_tokens=16, block=4)
+        )
+        self.holds.hold_for_next_request(_held("near", node="near", num_tokens=16))
         self.new = SimpleNamespace(franky=None)
         self.block = SimpleNamespace(
             franky=FrankyRequest(chain=FrankyChain(id="asker", block=2))
@@ -955,7 +957,7 @@ class TestFrankyPrefillAdder(CustomTestCase):
             rem_chunk_tokens=rem_chunk_tokens,
         )
 
-    def _req(self, rid, *, prompt_len, prefix_len=0, taps_ready, spans=None):
+    def _req(self, rid, *, prompt_len, prefix_len=0, taps_ready, tap_runs=None):
         req = MagicMock(spec=Req)
         type(req).extend_len = Req.extend_len
         req.rid = rid
@@ -984,7 +986,7 @@ class TestFrankyPrefillAdder(CustomTestCase):
         req.franky_taps = TapProgress(
             tap_len=prompt_len,
             taps_ready=taps_ready,
-            spans=spans or _single_turn(prompt_len),
+            tap_runs=tap_runs or _single_turn(prompt_len),
         )
         return req
 
@@ -1071,7 +1073,7 @@ class TestFrankyPrefillAdder(CustomTestCase):
             prompt_len=100,
             prefix_len=prefix_len,
             taps_ready=taps_ready,
-            spans=FrankyGeneratedSpans.of_runs(
+            tap_runs=FrankyTapRuns.of_runs(
                 [[40, 30], [60, 0], [100, 80]], num_input_tokens=100, num_taps=80
             ),
         )
@@ -1107,14 +1109,14 @@ class TestFrankyPrefillAdder(CustomTestCase):
         scheduler.waiting_queue = [
             SimpleNamespace(
                 franky_taps=TapProgress(
-                    tap_len=64, taps_ready=0, spans=_single_turn(64)
+                    tap_len=64, taps_ready=0, tap_runs=_single_turn(64)
                 ),
                 prefix_len=0,
                 **rows,
             ),
             SimpleNamespace(
                 franky_taps=TapProgress(
-                    tap_len=64, taps_ready=32, spans=_single_turn(64)
+                    tap_len=64, taps_ready=32, tap_runs=_single_turn(64)
                 ),
                 prefix_len=63,
                 **rows,
