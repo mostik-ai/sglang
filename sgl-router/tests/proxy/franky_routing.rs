@@ -26,6 +26,7 @@ use sgl_router::server::app_context::{AppContext, ChatRouting};
 use sgl_router::state::kv_events::KvEventIndex;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
+use sglang_processor::openai::OpenAiSettings;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -99,6 +100,26 @@ fn franky_ctx_with_chain(
     reorg: bool,
     franky_chain: FrankyChainConfig,
 ) -> Arc<AppContext> {
+    let sandy_settings = Some(OpenAiSettings::default());
+    franky_ctx_with_sandy_settings(
+        ricky,
+        sandy,
+        max_attempts,
+        reorg,
+        franky_chain,
+        sandy_settings,
+    )
+}
+
+/// `franky_ctx_with_chain` whose Sandy workers report `sandy_settings`.
+fn franky_ctx_with_sandy_settings(
+    ricky: &[(&str, &str, WorkerMode)],
+    sandy: &[(&str, &str)],
+    max_attempts: u32,
+    reorg: bool,
+    franky_chain: FrankyChainConfig,
+    sandy_settings: Option<OpenAiSettings>,
+) -> Arc<AppContext> {
     let policy = if reorg {
         PolicyKind::PowerOfTwo
     } else {
@@ -130,7 +151,11 @@ fn franky_ctx_with_chain(
             bootstrap_port: Some(SANDY_PORT),
             ..Default::default()
         };
-        registry.add(spec).unwrap();
+        let profile = EngineProfile {
+            openai: sandy_settings.clone().map(Arc::new),
+            ..EngineProfile::from(WireProtocol::default())
+        };
+        registry.add_with_cb(spec, None, profile).unwrap();
     }
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
@@ -725,6 +750,38 @@ async fn text_only_chains_send_no_rooms_or_tap_runs() {
             assert!(request.get(field).is_none(), "{field} in {request}");
         }
     }
+}
+
+/// A Sandy that does not say how it streams gets unary calls, each one frame
+/// of the client's stream.
+#[tokio::test]
+async fn a_sandy_that_does_not_say_how_it_streams_gets_unary_calls() {
+    let (_ricky, ricky_url, _ricky_stop) = ChainEngine::start(12).await;
+    let (sandy, sandy_url, _sandy_stop) = ChainEngine::start(usize::MAX).await;
+    let ctx = franky_ctx_with_sandy_settings(
+        &[("r", &ricky_url, WorkerMode::Plain)],
+        &[("s", &sandy_url)],
+        1,
+        false,
+        chain_config(2, true, 4),
+        None,
+    );
+    let body = json!({
+        "input_ids": PROMPT,
+        "stream": true,
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    let (frames, done) = streamed_frames(res).await;
+    assert_eq!(done, 1);
+    let lengths: Vec<_> = frames
+        .iter()
+        .map(|frame| frame["output_ids"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(lengths, [2, 3, 4, 5, 6, 8, 9, 10, 11, 12]);
+    assert!(sandy.requests().iter().all(|call| call["stream"] == false));
 }
 
 /// A streamed chain is one stream: Sandy's calls stream too, every frame

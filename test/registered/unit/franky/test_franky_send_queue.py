@@ -110,7 +110,11 @@ def _req(rid="r", prompt_len=10, chain=None, max_new_tokens=0, room=True, kept=N
     """A Sandy request; one that writes keeps the KV of ``kept`` tokens."""
     return SimpleNamespace(
         rid=rid,
-        franky=FrankyRequest(room=_ROOM if room else None, chain=chain),
+        franky=FrankyRequest(
+            room=_ROOM if room else None,
+            chain=chain,
+            taps_only=room and not max_new_tokens,
+        ),
         last_node=f"node-{rid}",
         origin_input_ids=list(range(prompt_len)),
         prefix_len=0,

@@ -6316,12 +6316,11 @@ def configure_scheduler_process(
 
 
 def get_scheduler_class() -> type[Scheduler]:
-    franky_side = get_franky().franky_side
-    if franky_side == "null":
+    if get_franky().franky_side == "null":
         return Scheduler
     from sglang.srt.franky.schedulers import franky_scheduler_class
 
-    return franky_scheduler_class(franky_side)
+    return franky_scheduler_class()
 
 
 def run_scheduler_process(

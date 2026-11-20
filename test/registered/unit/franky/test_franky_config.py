@@ -17,12 +17,22 @@ from sglang.srt.arg_groups import resolution_hooks as hooks_module
 from sglang.srt.arg_groups.franky_hook import handle_franky
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
+from sglang.srt.disaggregation.utils import KVClassType, TransferBackend, get_kv_class
+from sglang.srt.franky import config as franky_config_module
+from sglang.srt.franky import schedulers as franky_schedulers_module
 from sglang.srt.franky.config import FrankyConfig
 from sglang.srt.franky.parts.encoder.all.encoder import AllEncoder
 from sglang.srt.franky.parts.encoder.masked.encoder import MaskedEncoder
 from sglang.srt.franky.parts.encoder.singular.encoder import SingularEncoder
 from sglang.srt.franky.parts.injector.residual.config import ResidualInjectorConfig
 from sglang.srt.franky.parts.reader.residual_query.reader import ResidualQueryReader
+from sglang.srt.franky.schedulers import (
+    FrankyChainScheduler,
+    RickyDecodeScheduler,
+    RickyScheduler,
+    SandyScheduler,
+    franky_scheduler_class,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -232,6 +242,18 @@ class TestHandleFranky(_WithFiles):
                     handle_franky(server_args)
                 handle_franky(self._server_args(side="sandy", **fields))
 
+    def test_sandy_runs_outside_pd_with_or_without_parts(self):
+        text_only_pd = {
+            "franky_config": None,
+            "franky_weights": None,
+            "disaggregation_mode": "prefill",
+            "disaggregation_transfer_backend": "mooncake",
+        }
+
+        handle_franky(self._server_args(side="ricky", **text_only_pd))
+        with self.assertRaisesRegex(ValueError, "--disaggregation-mode prefill"):
+            handle_franky(self._server_args(side="sandy", **text_only_pd))
+
     def test_a_side_without_parts_writes_text_only_and_refuses_only_chain_rules(self):
         for side in ("sandy", "ricky"):
             with self.subTest(side=side):
@@ -239,8 +261,6 @@ class TestHandleFranky(_WithFiles):
                     side=side,
                     franky_config=None,
                     franky_weights=None,
-                    disaggregation_mode="prefill",
-                    disaggregation_transfer_backend="mooncake",
                     enable_mixed_chunk=True,
                 )
 
@@ -427,6 +447,30 @@ class TestThroughThePipeline(_WithFiles):
 
         with self.assertRaisesRegex(ValueError, "page size 16"):
             self._server_args(side="sandy").resolve_once()
+
+
+class TestTapRole(CustomTestCase):
+    def test_an_engine_gets_the_scheduler_and_pd_classes_of_its_tap_role(self):
+        for side, config, mode, scheduler, pd_manager in [
+            ("sandy", "c.json", "null", SandyScheduler, "NixlKVManager"),
+            ("ricky", "c.json", "null", RickyScheduler, "FrankyRelayManager"),
+            ("ricky", "c.json", "decode", RickyDecodeScheduler, "FrankyRelayManager"),
+            ("sandy", None, "null", FrankyChainScheduler, "NixlKVManager"),
+            ("ricky", None, "decode", FrankyChainScheduler, "NixlKVManager"),
+        ]:
+            franky = SimpleNamespace(franky_side=side, franky_config=config)
+            disagg = SimpleNamespace(disaggregation_mode=mode)
+            with (
+                self.subTest(side=side, config=config, mode=mode),
+                patch.object(franky_config_module, "get_franky", return_value=franky),
+                patch.object(
+                    franky_schedulers_module, "get_disagg", return_value=disagg
+                ),
+            ):
+                manager = get_kv_class(TransferBackend.NIXL, KVClassType.MANAGER)
+
+                self.assertIs(franky_scheduler_class(), scheduler)
+                self.assertEqual(manager.__name__, pd_manager)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,6 @@ pub(super) enum SandyLimit {
 /// What a Sandy call wrote, and whether it ended the answer.
 #[derive(Debug, PartialEq)]
 pub(super) struct SandyText {
-    pub(super) text: String,
     /// The text in Ricky's ids.
     pub(super) ricky_ids: Vec<u32>,
     /// The text in Sandy's ids.
@@ -35,6 +34,22 @@ pub(super) struct SandyText {
     /// The call stopped at a client stop rule or the answer's token limit.
     pub(super) ends_answer: bool,
     pub(super) finish_reason: Value,
+}
+
+/// Text of a Sandy call that the answer gets, and Ricky's ids of it.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct SandyDelta {
+    pub(super) text: String,
+    pub(super) ids: Vec<u32>,
+}
+
+/// What a frame of a Sandy call brings.
+#[derive(Debug, PartialEq)]
+pub(super) enum SandyRead {
+    /// Text the answer gets now.
+    Adds(SandyDelta),
+    /// The call ended with `text`, of which the answer gets `adds` now.
+    Ends { text: SandyText, adds: SandyDelta },
 }
 
 /// The `/generate` body of a Sandy call that writes the answer after
@@ -62,47 +77,74 @@ pub(super) fn sandy_call_body(
     body
 }
 
-/// Reads a Sandy call's unary `/generate` frame, its text in Sandy's ids and,
-/// for a Sandy that shares Ricky's tokenizer, in Ricky's too; a Sandy with its
-/// own tokenizer leaves `ricky_ids` to the caller.
-///
-/// `client_stop_ids` are the client's stop token ids that went to Sandy.
-/// Sandy's own EOS ends only its text and is dropped.
-pub(super) fn read_sandy_text(
-    frame: &Value,
-    limit: SandyLimit,
-    tokenizer: SandyTokenizer,
-    client_stop_ids: &[u64],
-) -> SandyText {
-    let mut stream = SandyStream::default();
-    stream.add(frame, client_stop_ids);
-    let mut text = stream.finish(&frame["meta_info"]["finish_reason"], limit, client_stop_ids);
-    if tokenizer == SandyTokenizer::Own {
-        text.ricky_ids.clear();
-    }
-    text
-}
-
-/// A Sandy call's text as its frames bring it, for a Sandy that shares
-/// Ricky's tokenizer: a frame holds either the text so far or only what it
-/// adds, which its ids tell, since the text so far has all the call's
-/// `completion_tokens`.
-#[derive(Debug, Default)]
+/// A Sandy call's text as the frames of its response bring it, unary or
+/// streamed.
+#[derive(Debug)]
 pub(super) struct SandyStream {
+    tokenizer: SandyTokenizer,
+    limit: SandyLimit,
+    increments: bool,
     text: String,
     ids: Vec<u32>,
 }
 
-/// What one frame of a Sandy call adds to its text.
-#[derive(Debug, PartialEq)]
-pub(super) struct SandyDelta {
-    pub(super) text: String,
-    pub(super) ids: Vec<u32>,
-}
-
 impl SandyStream {
-    /// What `frame` adds to the call's text, without Sandy's own EOS.
-    pub(super) fn add(&mut self, frame: &Value, client_stop_ids: &[u64]) -> SandyDelta {
+    /// Args:
+    ///     increments: each frame holds only what it adds, not the text so
+    ///         far, as in a streamed call to a Sandy with incremental output.
+    pub(super) fn new(tokenizer: SandyTokenizer, limit: SandyLimit, increments: bool) -> Self {
+        Self {
+            tokenizer,
+            limit,
+            increments,
+            text: String::new(),
+            ids: Vec::new(),
+        }
+    }
+
+    /// Reads the call's next `frame`. Sandy's own EOS ends only its text and
+    /// is dropped. A Sandy that shares Ricky's tokenizer adds its text as it
+    /// comes; one with its own adds it all once the call ends, in the ids
+    /// `ricky_ids_of` gives.
+    ///
+    /// Args:
+    ///     client_stop_ids: the client's stop token ids that went to Sandy.
+    /// Errors: those of `ricky_ids_of`.
+    pub(super) fn read(
+        &mut self,
+        frame: &Value,
+        client_stop_ids: &[u64],
+        ricky_ids_of: impl FnOnce(&str) -> anyhow::Result<Vec<u32>>,
+    ) -> anyhow::Result<SandyRead> {
+        let finish_reason = &frame["meta_info"]["finish_reason"];
+        let added = self.add(frame, finish_reason, client_stop_ids);
+        if finish_reason.is_null() {
+            return Ok(SandyRead::Adds(match self.tokenizer {
+                SandyTokenizer::Ricky => added,
+                SandyTokenizer::Own => SandyDelta::default(),
+            }));
+        }
+        let adds = match self.tokenizer {
+            SandyTokenizer::Ricky => added,
+            SandyTokenizer::Own => SandyDelta {
+                ids: ricky_ids_of(&self.text)?,
+                text: std::mem::take(&mut self.text),
+            },
+        };
+        let ricky_ids = match self.tokenizer {
+            SandyTokenizer::Ricky => self.ids.clone(),
+            SandyTokenizer::Own => adds.ids.clone(),
+        };
+        let text = SandyText {
+            ricky_ids,
+            sandy_ids: std::mem::take(&mut self.ids),
+            ends_answer: self.ends_answer(finish_reason, client_stop_ids),
+            finish_reason: finish_reason.clone(),
+        };
+        Ok(SandyRead::Ends { text, adds })
+    }
+
+    fn add(&mut self, frame: &Value, finish_reason: &Value, client_stop_ids: &[u64]) -> SandyDelta {
         let mut ids: Vec<u32> = (frame["output_ids"].as_array())
             .map(|ids| {
                 (ids.iter())
@@ -111,15 +153,14 @@ impl SandyStream {
             })
             .unwrap_or_default();
         let text = frame["text"].as_str().unwrap_or_default();
-        let whole = frame["meta_info"]["completion_tokens"].as_u64() == Some(ids.len() as u64);
-        let (mut new_ids, new_text) = if whole {
+        let (mut new_ids, new_text) = if self.increments {
+            (ids, text.to_owned())
+        } else {
             let seen = self.ids.len().min(ids.len());
             let new_text = text.strip_prefix(self.text.as_str()).unwrap_or_default();
             (ids.split_off(seen), new_text.to_owned())
-        } else {
-            (ids, text.to_owned())
         };
-        if stopped_at_eos(&frame["meta_info"]["finish_reason"], client_stop_ids)
+        if stopped_at_eos(finish_reason, client_stop_ids)
             .is_some_and(|eos| new_ids.last().map(|&id| u64::from(id)) == Some(eos))
         {
             new_ids.pop();
@@ -132,23 +173,11 @@ impl SandyStream {
         }
     }
 
-    /// The call's whole text, once a frame ended it with `finish_reason`.
-    pub(super) fn finish(
-        self,
-        finish_reason: &Value,
-        limit: SandyLimit,
-        client_stop_ids: &[u64],
-    ) -> SandyText {
+    fn ends_answer(&self, finish_reason: &Value, client_stop_ids: &[u64]) -> bool {
         let at_eos = stopped_at_eos(finish_reason, client_stop_ids).is_some();
-        let at_answer_limit = finish_reason["type"] == "length" && limit == SandyLimit::Answer;
+        let at_answer_limit = finish_reason["type"] == "length" && self.limit == SandyLimit::Answer;
         let at_client_stop = finish_reason["type"] == "stop" && !at_eos;
-        SandyText {
-            text: self.text,
-            ricky_ids: self.ids.clone(),
-            sandy_ids: self.ids,
-            ends_answer: at_answer_limit || at_client_stop,
-            finish_reason: finish_reason.clone(),
-        }
+        at_answer_limit || at_client_stop
     }
 }
 
@@ -165,6 +194,15 @@ mod tests {
 
     fn frame(text: &str, ids: &[u64], finish: Value) -> Value {
         json!({"text": text, "output_ids": ids, "meta_info": {"finish_reason": finish}})
+    }
+
+    fn no_ricky_ids(_: &str) -> anyhow::Result<Vec<u32>> {
+        unreachable!("a Sandy that shares Ricky's tokenizer gives Ricky's ids")
+    }
+
+    fn read_unary(frame: &Value, limit: SandyLimit, client_stop_ids: &[u64]) -> SandyRead {
+        let mut stream = SandyStream::new(SandyTokenizer::Ricky, limit, false);
+        stream.read(frame, client_stop_ids, no_ricky_ids).unwrap()
     }
 
     #[test]
@@ -199,17 +237,22 @@ mod tests {
     fn sandys_eos_ends_only_its_text_and_leaves_the_trace() {
         let eos = json!({"type": "stop", "matched": 2});
 
-        let text = read_sandy_text(
-            &frame("ab", &[5, 6, 2], eos.clone()),
-            SandyLimit::Call,
-            SandyTokenizer::Ricky,
-            &[],
-        );
+        let read = read_unary(&frame("ab", &[5, 6, 2], eos.clone()), SandyLimit::Call, &[]);
 
+        let SandyRead::Ends { text, adds } = read else {
+            panic!("a finished frame ends the call");
+        };
         assert_eq!(text.ricky_ids, vec![5, 6]);
         assert_eq!(text.sandy_ids, vec![5, 6]);
         assert!(!text.ends_answer);
         assert_eq!(text.finish_reason, eos);
+        assert_eq!(
+            adds,
+            SandyDelta {
+                text: "ab".into(),
+                ids: vec![5, 6]
+            }
+        );
     }
 
     #[test]
@@ -236,73 +279,85 @@ mod tests {
                 false,
             ),
         ] {
-            let text = read_sandy_text(
-                &frame("ab", &[5, 7], finish.clone()),
-                limit,
-                SandyTokenizer::Ricky,
-                &[7],
-            );
+            let read = read_unary(&frame("ab", &[5, 7], finish.clone()), limit, &[7]);
 
+            let SandyRead::Ends { text, .. } = read else {
+                panic!("a finished frame ends the call");
+            };
             assert_eq!(text.ends_answer, ends, "{finish}");
             assert_eq!(text.ricky_ids.len(), 2, "{finish}");
         }
     }
 
     #[test]
-    fn a_stream_adds_what_each_frame_adds_whole_or_not() {
+    fn a_stream_adds_what_each_frame_adds_whole_or_incremental() {
         let eos = json!({"type": "stop", "matched": 2});
-        let frame = |text: &str, ids: &[u64], completion: u64, finish: Value| {
-            json!({"text": text, "output_ids": ids,
-                   "meta_info": {"completion_tokens": completion, "finish_reason": finish}})
-        };
-        for frames in [
-            vec![
-                frame("a", &[5], 1, Value::Null),
-                frame("ab", &[5, 6], 2, Value::Null),
-                frame("ab", &[5, 6, 2], 3, eos.clone()),
-            ],
-            vec![
-                frame("a", &[5], 1, Value::Null),
-                frame("b", &[6], 2, Value::Null),
-                frame("", &[2], 3, eos.clone()),
-            ],
-        ] {
-            let mut stream = SandyStream::default();
-            let deltas: Vec<_> = frames.iter().map(|frame| stream.add(frame, &[])).collect();
-            let text = stream.finish(&eos, SandyLimit::Call, &[]);
-
-            assert_eq!(
-                deltas,
+        for (increments, frames) in [
+            (
+                false,
                 [
-                    SandyDelta {
-                        text: "a".into(),
-                        ids: vec![5]
-                    },
-                    SandyDelta {
-                        text: "b".into(),
-                        ids: vec![6]
-                    },
-                    SandyDelta {
-                        text: "".into(),
-                        ids: vec![]
-                    },
-                ]
-            );
-            assert_eq!((text.text.as_str(), text.sandy_ids), ("ab", vec![5, 6]));
+                    frame("a", &[5], Value::Null),
+                    frame("ab", &[5, 6], Value::Null),
+                    frame("ab", &[5, 6, 2], eos.clone()),
+                ],
+            ),
+            (
+                true,
+                [
+                    frame("a", &[5], Value::Null),
+                    frame("b", &[6], Value::Null),
+                    frame("", &[2], eos.clone()),
+                ],
+            ),
+        ] {
+            let mut stream = SandyStream::new(SandyTokenizer::Ricky, SandyLimit::Call, increments);
+
+            let reads: Vec<_> = (frames.iter())
+                .map(|frame| stream.read(frame, &[], no_ricky_ids).unwrap())
+                .collect();
+
+            let delta = |text: &str, ids: Vec<u32>| SandyDelta {
+                text: text.into(),
+                ids,
+            };
+            assert_eq!(reads[0], SandyRead::Adds(delta("a", vec![5])));
+            assert_eq!(reads[1], SandyRead::Adds(delta("b", vec![6])));
+            let SandyRead::Ends { text, adds } = &reads[2] else {
+                panic!("the last frame ends the call");
+            };
+            assert_eq!(adds, &delta("", vec![]));
+            assert_eq!(text.sandy_ids, vec![5, 6]);
             assert!(!text.ends_answer);
         }
     }
 
     #[test]
-    fn a_sandy_with_its_own_tokenizer_leaves_rickys_ids_to_the_caller() {
-        let text = read_sandy_text(
-            &frame("ab", &[5, 6], json!({"type": "length", "length": 2})),
-            SandyLimit::Call,
-            SandyTokenizer::Own,
+    fn a_sandy_with_its_own_tokenizer_adds_its_text_once_the_call_ends() {
+        let mut stream = SandyStream::new(SandyTokenizer::Own, SandyLimit::Call, true);
+        let ricky_ids_of = |text: &str| {
+            assert_eq!(text, "ab");
+            Ok(vec![40, 41, 42])
+        };
+
+        let first = stream.read(&frame("a", &[5], Value::Null), &[], no_ricky_ids);
+        let last = stream.read(
+            &frame("b", &[6], json!({"type": "length", "length": 2})),
             &[],
+            ricky_ids_of,
         );
 
+        assert_eq!(first.unwrap(), SandyRead::Adds(SandyDelta::default()));
+        let SandyRead::Ends { text, adds } = last.unwrap() else {
+            panic!("the last frame ends the call");
+        };
         assert_eq!(text.sandy_ids, vec![5, 6]);
-        assert!(text.ricky_ids.is_empty());
+        assert_eq!(text.ricky_ids, vec![40, 41, 42]);
+        assert_eq!(
+            adds,
+            SandyDelta {
+                text: "ab".into(),
+                ids: vec![40, 41, 42]
+            }
+        );
     }
 }

@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The frames of an engine's `/generate` response.
-
 use super::super::openai::sse_data;
 use axum::body::Body;
 use bytes::Bytes;

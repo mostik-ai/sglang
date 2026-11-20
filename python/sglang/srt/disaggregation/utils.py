@@ -28,7 +28,6 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_franky,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -782,7 +781,9 @@ def get_kv_class(
             KVClassType.RECEIVER: NixlKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
-        if get_franky().franky_side == "ricky":
+        from sglang.srt.franky.config import FrankyTapRole
+
+        if FrankyTapRole.of_running_engine() == FrankyTapRole.READS:
             # Ricky relays its taps to its decode in each KV room.
             from sglang.srt.franky.transfer.relay.manager import FrankyRelayManager
             from sglang.srt.franky.transfer.relay.receiver import FrankyRelayReceiver

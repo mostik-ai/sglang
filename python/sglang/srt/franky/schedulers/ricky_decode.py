@@ -7,7 +7,7 @@ from typing_extensions import override
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
-from sglang.srt.franky.finish_rules.request_blocks import attach_blocks
+from sglang.srt.franky.finish_rules.request_blocks import RequestBlocks
 from sglang.srt.franky.ricky_taps.taps import RickyTaps
 from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
@@ -104,7 +104,7 @@ class RickyDecodeScheduler(Scheduler):
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False) -> None:
         # The relay receiver of a refused request fails its room.
         self.franky_taps.requests.arrive(req)
-        attach_blocks(req)
+        RequestBlocks.attach(req)
         super()._add_request_to_queue(req, is_retracted=is_retracted)
 
     @override

@@ -12,7 +12,6 @@ from sglang.srt.franky.request import FrankyRequest
 
 if TYPE_CHECKING:
     from sglang.srt.franky.chains.blocks.config import FrankyBlocksConfig
-    from sglang.srt.franky.chains.chain import FrankyChain
     from sglang.srt.franky.chains.deciders.decider import SandyCallDecider
     from sglang.srt.managers.schedule_batch import Req
 
@@ -38,11 +37,14 @@ class RequestBlocks(FinishRule):
         self._num_tokens = 0
 
     @staticmethod
-    def of(chain: FrankyChain) -> Optional[RequestBlocks]:
-        """The blocks of a leg of ``chain``; None when the chain has no blocks."""
-        if chain.blocks is None:
-            return None
-        return RequestBlocks(
+    def attach(req: Req) -> None:
+        """On an engine that writes a chain's blocks: set the rule on a leg whose
+        chain has blocks. A request back from a retraction keeps its count.
+        """
+        chain = FrankyRequest.of(req).chain
+        if chain is None or chain.blocks is None or req.franky_finish_rule is not None:
+            return
+        req.franky_finish_rule = RequestBlocks(
             config=chain.blocks,
             decider=chain.blocks.decider.build(),
             block=chain.block,
@@ -73,13 +75,3 @@ class RequestBlocks(FinishRule):
     def _end_for_sandy(self, req: Req, *, num_unread: int) -> None:
         req.finished_reason = FrankySandyCall(next_block=self._block)
         req.finished_len = len(req.output_ids) - num_unread
-
-
-def attach_blocks(req: Req) -> None:
-    """On an engine that writes a chain's blocks: set the blocks rule on a leg
-    whose chain has blocks. A request back from a retraction keeps its count.
-    """
-    chain = FrankyRequest.of(req).chain
-    if chain is None or req.franky_finish_rule is not None:
-        return
-    req.franky_finish_rule = RequestBlocks.of(chain)

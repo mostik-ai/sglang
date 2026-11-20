@@ -44,7 +44,6 @@ class FrankyChainBatchResultProcessor(SchedulerBatchResultProcessor):
 
 
 def fields_of(processor: SchedulerBatchResultProcessor) -> dict[str, Any]:
-    """The fields of ``processor``, for a subclass that adds its own."""
     return {
         field.name: getattr(processor, field.name)
         for field in dataclasses.fields(processor)

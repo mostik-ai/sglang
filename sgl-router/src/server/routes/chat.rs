@@ -4,6 +4,7 @@
 mod earlier_answers;
 mod forward;
 mod franky_chain;
+mod franky_request;
 mod openai;
 mod preparation;
 mod reorg;
@@ -32,10 +33,10 @@ use bytes::Bytes;
 use earlier_answers::prepare_franky_chat;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use franky_chain::FrankyChain;
+use franky_request::TapSource;
 use preparation::{
-    forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, FrankyRoom,
-    PreparedRequest, TapSource, CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH,
-    GENERATE_PATH, RERANK_PATH,
+    forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
+    CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -346,20 +347,13 @@ trait WorkerPicker {
     ) -> impl Future<Output = Result<SelectedWorkers, ApiError>> + Send;
 }
 
-/// How an attempt that reached the client was answered.
-struct Answered {
-    workers: SelectedWorkers,
-    /// The Franky room of the attempt's taps, if any.
-    franky_room: Option<FrankyRoom>,
-}
-
 /// Forward `request` to the workers `picker` picks, or to `pinned` for the
 /// first attempt. An attempt that fails before any response reaches the client
 /// is retried, after a backoff, on workers it has not tried, up to
-/// `--retry-max-attempts`; a request reading the room of a Sandy call gets one
-/// attempt, since the room sends its taps once.
+/// `--retry-max-attempts` or the attempts its taps allow.
 ///
-/// Returns: the response, and how it was answered unless every attempt failed.
+/// Returns: the response, and the workers that answered it unless every
+/// attempt failed.
 async fn forward_with_retries(
     ctx: &AppContext,
     picker: &impl WorkerPicker,
@@ -368,15 +362,10 @@ async fn forward_with_retries(
     start: Instant,
     duration: &mut Option<Arc<RequestDurationGuard>>,
     mut pinned: Option<SelectedWorkers>,
-) -> Result<(Response<Body>, Option<Answered>), ApiError> {
+) -> Result<(Response<Body>, Option<SelectedWorkers>), ApiError> {
     let mut excluded = Vec::new();
     let mut failed = None;
-    let attempts = match request.franky.tap_source {
-        TapSource::Room(_) => 1,
-        TapSource::None | TapSource::SandyLeg | TapSource::SandyCall => {
-            ctx.config.proxy.max_attempts.get()
-        }
-    };
+    let attempts = (request.franky.tap_source).attempts(ctx.config.proxy.max_attempts.get());
     for attempt in 0..attempts {
         if attempt > 0 && !back_off(ctx, start, attempt).await {
             break;
@@ -398,11 +387,7 @@ async fn forward_with_retries(
         let attempt =
             forward_request(ctx, request, workers, headers.clone(), start, duration).await?;
         if attempt.retry_excluding.is_empty() {
-            let answered = Answered {
-                workers: answering,
-                franky_room: attempt.franky_room,
-            };
-            return Ok((attempt.response, Some(answered)));
+            return Ok((attempt.response, Some(answering)));
         }
         excluded.extend(attempt.retry_excluding);
         failed = Some(attempt.response);
@@ -515,7 +500,7 @@ impl<'a> ModelRouting<'a> {
                 reorg::select_workers(ctx, resolver, request, headers, excluded, &prefix).await?
             }
         };
-        if matches!(request.franky.tap_source, TapSource::SandyLeg) {
+        if request.franky.tap_source.needs_sandy_leg() {
             workers.sandy = Some(pick_sandy(ctx, request, headers, excluded, &prefix).await?);
         }
         Ok(workers)

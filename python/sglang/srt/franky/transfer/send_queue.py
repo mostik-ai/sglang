@@ -87,7 +87,8 @@ class FrankySendQueue:
 
     def add(self, *, req: Req) -> None:
         """A new request: open the room of one that writes no tokens."""
-        if FrankyRequest.of(req).room is None or req.sampling_params.max_new_tokens:
+        franky = FrankyRequest.of(req)
+        if franky.room is None or not franky.taps_only:
             return
         self._sends[req.rid] = _Send(
             req=req, sender=self._open_room(req, len(req.origin_input_ids))

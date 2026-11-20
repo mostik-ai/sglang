@@ -439,8 +439,10 @@ Without Sandy's text and blocks (the default) a request runs as one Ricky
 request beside a Sandy leg that sends the prompt's taps.
 
 - A Sandy call (rid `{chain}-s{n}`) gets the trace as `input_ids` and writes at
-  most `sandy_call_tokens` of the answer, unary; with taps it gets a new
-  `franky_room` at its tap port. Its text joins the trace and the answer. Its
+  most `sandy_call_tokens` of the answer; with taps it gets a new
+  `franky_room` at its tap port. It streams to a streaming client when Sandy
+  reads Ricky's tokens and all Sandy workers report the same
+  `incremental_streaming_output`; otherwise it is unary. Its text joins the trace and the answer. Its
   EOS ends only its text; a client stop rule or the answer's token limit ends
   the answer.
 - A Ricky leg (rid `{chain}-r{n}`) gets the trace, the client's sampling with
@@ -456,7 +458,7 @@ request beside a Sandy leg that sends the prompt's taps.
   Sandy call adds a run that starts where its text starts and reads all Sandy
   has then, its text included.
 - The client gets one response: frames continue across calls and legs, Sandy's
-  text comes as one frame, `meta_info` has the client's prompt length, the
+  text comes as Sandy writes it (as one frame from a unary call), `meta_info` has the client's prompt length, the
   first leg's other prompt fields with its cache hits counted within the
   prompt, the counts added up, and the chain's id.
 - With blocks, each engine holds the chain's cached prefix between its
@@ -473,7 +475,8 @@ request beside a Sandy leg that sends the prompt's taps.
   (see [Chat rendering](#chat-rendering)).
 - A stop string across two requests is not matched; each checks its own output.
 - Engines started with `--franky-side` and without `--franky-config` write text
-  only; run them with `"taps": false`.
+  only; run them with `"taps": false`. Such a Ricky may run prefill-decode
+  disaggregation; a Sandy never does.
 
 ### Earlier answers
 

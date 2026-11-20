@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The SSE events of a chain's stream.
-
 use axum::body::Body;
 use axum::http::Response;
 use bytes::Bytes;

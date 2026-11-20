@@ -5,8 +5,7 @@
 
 use super::nonempty_header;
 use super::preparation::{
-    append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, FrankyRoom,
-    PreparedRequest, TapSource,
+    append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
@@ -57,8 +56,6 @@ pub(super) struct HttpDispatched {
     /// The workers to avoid on a retry, set only when nothing beyond a
     /// failure status reached the client, so another worker may serve it.
     pub(super) retry_excluding: Vec<WorkerId>,
-    /// The Franky room of this attempt's taps, if any.
-    pub(super) franky_room: Option<FrankyRoom>,
 }
 
 pub(super) async fn forward_request(
@@ -92,7 +89,6 @@ pub(super) async fn forward_request(
     Ok(HttpDispatched {
         response,
         retry_excluding: dispatched.retry_excluding,
-        franky_room: dispatched.franky_room,
     })
 }
 
@@ -166,7 +162,6 @@ struct Dispatched<R> {
     log_context: RequestLogContext,
     decode_url_header: Option<HeaderValue>,
     retry_excluding: Vec<WorkerId>,
-    franky_room: Option<FrankyRoom>,
 }
 
 async fn dispatch<T: Transport>(
@@ -178,6 +173,7 @@ async fn dispatch<T: Transport>(
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<Dispatched<T::Response>, ApiError> {
+    request.franky.open_room(&workers);
     let SelectedWorkers {
         prefill,
         decode,
@@ -222,15 +218,6 @@ async fn dispatch<T: Transport>(
         duration,
     );
     let pd_prefill = decode.is_some().then(|| prefill.id.clone());
-    // The Sandy and every Ricky leg receive the same Franky room for the taps:
-    // a Sandy leg's or a Sandy call's, opened per attempt, or the room of a Sandy
-    // call that ran.
-    let franky_room = match &request.franky.tap_source {
-        TapSource::None => None,
-        TapSource::SandyLeg => sandy.as_deref().map(FrankyRoom::at),
-        TapSource::Room(room) => Some(room.clone()),
-        TapSource::SandyCall => Some(FrankyRoom::at(decode.as_deref().unwrap_or(&prefill))),
-    };
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
     let pd = decode.map(|decode| {
         let bootstrap = BootstrapFields {
@@ -258,13 +245,13 @@ async fn dispatch<T: Transport>(
     let body = request.outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
-        franky_room.as_ref(),
         engine_rid.as_deref(),
     )?;
     // Sandy computes the same prompt, outside PD.
-    let sandy_leg = match (sandy, &franky_room) {
+    let sandy_room = request.franky.room().map(|room| room.room);
+    let sandy_leg = match (sandy, sandy_room) {
         (Some(sandy), Some(room)) => {
-            let body = request.sandy_outgoing_body(room, engine_rid.as_deref())?;
+            let body = request.sandy_outgoing_body(engine_rid.as_deref())?;
             let rank = dp_aware
                 .then(|| prompt_dp_rank(ctx, request, &headers, &sandy))
                 .flatten();
@@ -280,7 +267,7 @@ async fn dispatch<T: Transport>(
                 ),
                 rank.map(|rank| sandy.dp_rank_guard(rank)),
             );
-            Some((sandy, leg, load_guards, room.room))
+            Some((sandy, leg, load_guards, room))
         }
         _ => None,
     };
@@ -445,7 +432,6 @@ async fn dispatch<T: Transport>(
         log_context,
         decode_url_header,
         retry_excluding,
-        franky_room,
     })
 }
 

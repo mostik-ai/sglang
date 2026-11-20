@@ -14,7 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
 from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
-from sglang.srt.franky.finish_rules.request_blocks import attach_blocks
+from sglang.srt.franky.finish_rules.request_blocks import RequestBlocks
 from sglang.srt.franky.ricky_taps.prefill_tap_limit import PrefillTapLimit
 from sglang.srt.franky.ricky_taps.taps import RickyTaps
 from sglang.srt.franky.schedulers.chain_batch_result_processor import (
@@ -201,7 +201,7 @@ class RickyScheduler(Scheduler):
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False) -> None:
         self.franky_receive_queue.add(req=req)
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
-            attach_blocks(req)
+            RequestBlocks.attach(req)
         super()._add_request_to_queue(req, is_retracted=is_retracted)
 
     @override

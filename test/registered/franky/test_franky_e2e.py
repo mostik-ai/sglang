@@ -664,5 +664,90 @@ class TestFrankyOwnSandyTokensPdEndToEnd(TestFrankyPdEndToEnd):
     shared_tokenizer = False
 
 
+@unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")
+class TestFrankyTextOnlyPdEndToEnd(CustomTestCase):
+    """A Ricky without Franky parts under PD, as a chain without taps runs it:
+    its legs go from prefill to decode over NIXL's own classes, and decode ends
+    a leg where its blocks call Sandy."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pd_port = find_available_port(19296)
+        cls.prefill_url = f"http://127.0.0.1:{find_available_port(31500)}"
+        cls.decode_url = f"http://127.0.0.1:{find_available_port(31600)}"
+        ricky = [
+            "--franky-side", "ricky",
+            "--disaggregation-transfer-backend", "nixl",
+            "--mem-fraction-static", "0.6",
+        ]  # fmt: skip
+        if torch.cuda.get_device_capability()[0] >= 10:
+            ricky += ["--attention-backend", "trtllm_mha"]
+        prefill = [
+            "--base-gpu-id", "0",
+            "--disaggregation-mode", "prefill",
+            "--disaggregation-bootstrap-port", str(cls.pd_port),
+        ]  # fmt: skip
+        decode = ["--base-gpu-id", "1", "--disaggregation-mode", "decode"]
+        cls.processes = [
+            popen_launch_server(
+                _MODEL,
+                url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[*ricky, *stage],
+            )
+            for url, stage in ((cls.prefill_url, prefill), (cls.decode_url, decode))
+        ]
+
+    @classmethod
+    def tearDownClass(cls):
+        for process in cls.processes:
+            kill_process_tree(process.pid)
+
+    def test_a_leg_ends_on_decode_where_its_blocks_call_sandy(self):
+        leg = {
+            "rid": "text-only-r1",
+            "input_ids": AutoTokenizer.from_pretrained(_MODEL).encode(_TEXT),
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 64,
+                "ignore_eos": True,
+            },
+            "franky_chain": {
+                "id": "text-only",
+                "block": 1,
+                "blocks": {
+                    "block_size": 8,
+                    "decider": {
+                        "type": "call_token_or_every_blocks",
+                        "every_blocks": 2,
+                    },
+                },
+            },
+            "bootstrap_host": "127.0.0.1",
+            "bootstrap_port": self.pd_port,
+            "bootstrap_room": 6100,
+        }
+        answers = {}
+
+        def post(url):
+            answers[url] = requests.post(
+                f"{url}/generate", json=leg, timeout=600
+            ).json()
+
+        threads = [
+            threading.Thread(target=post, args=(url,))
+            for url in (self.prefill_url, self.decode_url)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        meta_info = answers[self.decode_url]["meta_info"]
+        self.assertEqual(meta_info["finish_reason"]["type"], "franky_sandy_call")
+        self.assertEqual(meta_info["finish_reason"]["next_block"], 3)
+        self.assertEqual(meta_info["completion_tokens"], 16)
+
+
 if __name__ == "__main__":
     unittest.main()

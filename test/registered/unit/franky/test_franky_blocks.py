@@ -4,7 +4,7 @@ import msgspec
 
 from sglang.srt.franky.chains.blocks.sandy_call import FrankySandyCall
 from sglang.srt.franky.chains.chain import FrankyChain
-from sglang.srt.franky.finish_rules.request_blocks import attach_blocks
+from sglang.srt.franky.finish_rules.request_blocks import RequestBlocks
 from sglang.srt.franky.finish_rules.tap_step import TapStep
 from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.managers.schedule_batch import (
@@ -38,7 +38,7 @@ def _request(*, chain=None, max_new_tokens=100):
 
 def _leg(blocks, *, block=1, max_new_tokens=100):
     req = _request(chain=_chain(blocks, block=block), max_new_tokens=max_new_tokens)
-    attach_blocks(req)
+    RequestBlocks.attach(req)
     return req
 
 
@@ -122,7 +122,7 @@ class TestRequestBlocks(CustomTestCase):
         req = _leg({"block_size": 3})
         _write(req, [10, 11])
 
-        attach_blocks(req)
+        RequestBlocks.attach(req)
         written = _write(req, [12, 13])
 
         self.assertEqual(written, 1)
@@ -133,7 +133,7 @@ class TestRequestBlocks(CustomTestCase):
         without_blocks = _request(chain=FrankyChain(id="c"))
 
         for req in (outside, without_blocks):
-            attach_blocks(req)
+            RequestBlocks.attach(req)
             _write(req, [10, 11, 12])
             self.assertIsNone(req.franky_finish_rule)
             self.assertFalse(req.finished())
@@ -157,8 +157,11 @@ class TestRequestBlocks(CustomTestCase):
 
 
 class TestTapStep(CustomTestCase):
-    def _write_with_tap_step(self, tokens, *, max_new_tokens):
+    def _write_with_tap_step(self, tokens, *, max_new_tokens, clamped_to=None):
         req = _request(max_new_tokens=max_new_tokens)
+        TapStep.ask_extra_token(req)
+        if clamped_to is not None:
+            req.sampling_params.max_new_tokens = clamped_to
         TapStep.attach(req)
         _write(req, tokens)
         return req
@@ -169,6 +172,18 @@ class TestTapStep(CustomTestCase):
         self.assertEqual(len(req.output_ids), 4)
         self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12])
         self.assertEqual(req.finished_reason.to_json()["length"], 3)
+
+    def test_a_write_clamped_by_sglang_returns_one_token_less_than_its_limit(self):
+        req = self._write_with_tap_step([10, 11, 12], max_new_tokens=3, clamped_to=2)
+
+        self.assertEqual(list(req.output_ids_through_stop), [10])
+        self.assertEqual(req.finished_reason.to_json()["length"], 1)
+
+    def test_a_write_without_a_limit_ends_one_token_before_sglangs_clamp(self):
+        req = self._write_with_tap_step([10, 11, 12], max_new_tokens=None, clamped_to=2)
+
+        self.assertEqual(list(req.output_ids_through_stop), [10])
+        self.assertEqual(req.finished_reason.to_json()["length"], 1)
 
     def test_a_write_that_stops_returns_its_stop_token(self):
         req = self._write_with_tap_step([10, _EOS, 12], max_new_tokens=3)
@@ -184,6 +199,7 @@ class TestTapStep(CustomTestCase):
 
     def test_an_aborted_write_keeps_its_abort(self):
         req = _request(max_new_tokens=3)
+        TapStep.ask_extra_token(req)
         TapStep.attach(req)
         req.to_finish = FINISH_ABORT("gone")
 

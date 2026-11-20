@@ -1589,10 +1589,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             franky = FrankyRequest.of_input(
                 obj,
                 prompt_len=len(input_ids_arr or ()),
-                tap_role=FrankyTapRole.of_engine(
-                    side=get_franky().franky_side,
-                    has_config=get_franky().franky_config is not None,
-                ),
+                tap_role=FrankyTapRole.of_running_engine(),
             )
 
             tokenized_obj = self.tokenized_generate_req_type(

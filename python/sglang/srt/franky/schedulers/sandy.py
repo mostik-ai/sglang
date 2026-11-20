@@ -117,12 +117,13 @@ class SandyScheduler(FrankyChainScheduler):
 
     @override
     def init_req_max_new_tokens(self, req: Req) -> None:
-        if (
-            FrankyRequest.of(req).room is not None
-            and req.sampling_params.max_new_tokens
-        ):
-            TapStep.attach(req)
+        franky = FrankyRequest.of(req)
+        writes_taps = franky.room is not None and not franky.taps_only
+        if writes_taps:
+            TapStep.ask_extra_token(req)
         super().init_req_max_new_tokens(req)
+        if writes_taps:
+            TapStep.attach(req)
 
     @override
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False) -> None:

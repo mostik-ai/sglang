@@ -8,6 +8,7 @@ import msgspec
 from sglang.srt.franky.parts.encoder.config import EncoderConfig
 from sglang.srt.franky.parts.injector.config import InjectorsConfig
 from sglang.srt.franky.parts.reader.config import ReaderConfig
+from sglang.srt.runtime_context import get_franky
 
 
 class FrankySide(str, Enum):
@@ -34,6 +35,13 @@ class FrankyTapRole(Enum):
         if not has_config:
             return FrankyTapRole.NONE
         return FrankyTapRole.SENDS if side == FrankySide.SANDY else FrankyTapRole.READS
+
+    @staticmethod
+    def of_running_engine() -> FrankyTapRole:
+        franky = get_franky()
+        return FrankyTapRole.of_engine(
+            side=franky.franky_side, has_config=franky.franky_config is not None
+        )
 
 
 class FrankyConfig(

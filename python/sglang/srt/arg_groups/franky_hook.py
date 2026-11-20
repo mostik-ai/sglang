@@ -7,7 +7,7 @@ from sglang.srt.arg_groups.overrides import (
     model_config_of,
     resolving_view,
 )
-from sglang.srt.franky.config import FrankyConfig
+from sglang.srt.franky.config import FrankyConfig, FrankyTapRole
 from sglang.srt.model_executor.cuda_graph_config import Backend
 
 if TYPE_CHECKING:
@@ -30,11 +30,16 @@ def handle_franky(server_args: ServerArgs) -> None:
             f"--franky-side {cfg.franky_side} takes --franky-config and "
             "--franky-weights together, or neither for text only."
         )
+    tap_role = FrankyTapRole.of_engine(
+        side=cfg.franky_side, has_config=cfg.franky_config is not None
+    )
     model_config = model_config_of(cfg)
     checks = _chain_checks(cfg=cfg)
-    if cfg.franky_config is not None:
+    if tap_role != FrankyTapRole.NONE:
         config = FrankyConfig.load(cfg.franky_config)
-        side_checks = _sandy_checks if cfg.franky_side == "sandy" else _ricky_checks
+        side_checks = (
+            _sandy_checks if tap_role == FrankyTapRole.SENDS else _ricky_checks
+        )
         checks.update(_tap_checks(cfg=cfg))
         checks.update(_kv_pool_checks(cfg=cfg))
         checks.update(side_checks(cfg=cfg, config=config, model_config=model_config))
@@ -43,7 +48,7 @@ def handle_franky(server_args: ServerArgs) -> None:
         raise ValueError(
             f"--franky-side {cfg.franky_side} does not support: {'; '.join(refusals)}."
         )
-    if cfg.franky_config is not None:
+    if tap_role != FrankyTapRole.NONE:
         _resolve_for_taps(server_args=server_args, cfg=cfg)
 
 
@@ -63,6 +68,9 @@ def _resolve_for_taps(*, server_args: ServerArgs, cfg: Any) -> None:
 
 def _chain_checks(*, cfg: Any) -> dict[str, bool]:
     return {
+        f"--disaggregation-mode {cfg.disaggregation_mode}": (
+            cfg.franky_side == "sandy" and cfg.disaggregation_mode != "null"
+        ),
         "speculative decoding": cfg.speculative_algorithm is not None,
         "LoRA": cfg.enable_lora,
         # A chain's requests go to one engine, whose holds keep its prefix.
@@ -108,9 +116,6 @@ def _sandy_checks(
     last_layer = config.encoder.layers[-1]
     num_layers = model_config.num_hidden_layers
     return {
-        f"--disaggregation-mode {cfg.disaggregation_mode}": (
-            cfg.disaggregation_mode != "null"
-        ),
         # Sandy's prefill results take no decoding requests.
         "--enable-mixed-chunk": cfg.enable_mixed_chunk,
         f"encoder layer {last_layer}, the model has {num_layers} layers": (

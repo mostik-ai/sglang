@@ -24,10 +24,17 @@ class TapStep(FinishRule):
         self._asked = asked
 
     @staticmethod
+    def ask_extra_token(req: Req) -> None:
+        """Raise ``req``'s limit by the extra token, before SGLang clamps it. A
+        write without a limit runs to the clamp, which ends it as well.
+        """
+        if req.sampling_params.max_new_tokens is not None:
+            req.sampling_params.max_new_tokens += 1
+
+    @staticmethod
     def attach(req: Req) -> None:
-        """Ask for the extra token of ``req``'s write and set the rule on it."""
-        asked = req.sampling_params.max_new_tokens
-        req.sampling_params.max_new_tokens = asked + 1
+        """Set the rule on ``req``, whose clamped limit ends at the extra token."""
+        asked = max(req.sampling_params.max_new_tokens - 1, 0)
         req.franky_finish_rule = TapStep(asked=asked)
 
     @override

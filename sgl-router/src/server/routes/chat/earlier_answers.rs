@@ -72,7 +72,7 @@ pub(super) fn prepare_franky_chat(
     let spans = adapter.generated_spans(rendered_ids);
     if !spans.is_empty() {
         let input_len = rendered_ids.len();
-        request.add_franky_earlier_answers(&spans, input_len)?;
+        request.franky.add_earlier_answers(&spans, input_len);
     }
     Ok(request)
 }
@@ -137,7 +137,7 @@ fn prepare_chat_for_both_tokenizers(
         )));
     }
     let input_len = rendered_ids.len();
-    request.add_franky_sandy_chat(&generated_spans, input_len, sandy_chat)?;
+    (request.franky).add_sandy_chat(&generated_spans, input_len, sandy_chat);
     Ok(request)
 }
 
