@@ -115,7 +115,9 @@
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
 use crate::config::PolicyKind;
+use crate::discovery::WorkerMode;
 use crate::proxy::sse::{StreamEnd, StreamEndReason};
+use crate::workers::Worker;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -294,24 +296,38 @@ impl StreamOutcome {
     }
 }
 
-/// Worker dispatch mode label — narrowed to the three modes the policy
-/// resolver distinguishes, plus a Franky request's Sandy. The `Plain` variant
-/// covers the non-PD case.
+/// Worker mode label: a worker's PD role, and for a Franky Sandy, that it is
+/// one. The `Plain` variants cover the non-PD case.
 #[derive(Debug, Clone, Copy)]
 pub enum WorkerModeLabel {
     Prefill,
     Decode,
     Plain,
     Sandy,
+    SandyPrefill,
+    SandyDecode,
 }
 
 impl WorkerModeLabel {
-    fn as_str(self) -> &'static str {
+    pub fn of(worker: &Worker) -> Self {
+        match (worker.is_sandy(), worker.mode()) {
+            (false, WorkerMode::Prefill) => Self::Prefill,
+            (false, WorkerMode::Decode) => Self::Decode,
+            (false, WorkerMode::Plain) => Self::Plain,
+            (true, WorkerMode::Plain) => Self::Sandy,
+            (true, WorkerMode::Prefill) => Self::SandyPrefill,
+            (true, WorkerMode::Decode) => Self::SandyDecode,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Prefill => "prefill",
             Self::Decode => "decode",
             Self::Plain => "plain",
             Self::Sandy => "sandy",
+            Self::SandyPrefill => "sandy_prefill",
+            Self::SandyDecode => "sandy_decode",
         }
     }
 }

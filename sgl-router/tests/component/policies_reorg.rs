@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use sgl_router::buckets_reorg::{
-    Bucket, BucketGroups, BucketRequest, BucketResolver, EngineGroup, TokenLimits,
+    Bucket, BucketGroups, BucketRequest, BucketResolver, EngineGroup, TokenLimits, WorkerPool,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{
@@ -121,7 +121,7 @@ fn group(members: &[&str], policy: Arc<dyn Policy>) -> EngineGroup {
         worker_services: None,
         worker_ids: Some(members.iter().map(|id| WorkerId((*id).into())).collect()),
         policy,
-        sandy: false,
+        pool: WorkerPool::Serving,
     }
 }
 

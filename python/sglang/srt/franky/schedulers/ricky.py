@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from typing_extensions import override
 
-from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, prepare_abort
 from sglang.srt.environ import envs
@@ -26,6 +25,7 @@ from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.franky.transfer.messages import FrankyRoomClosed, FrankyTapsReady
 from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
 from sglang.srt.franky.transfer.receive_queue import FrankyReceiveQueue
+from sglang.srt.franky.transfer.relay.ends import relay_from_prefill
 from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
@@ -35,9 +35,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.runtime_context import (
     get_device,
-    get_franky,
     get_parallel,
-    get_serving,
 )
 from sglang.utils import TypeBasedDispatcher
 
@@ -144,24 +142,10 @@ class RickyScheduler(Scheduler):
         the first rank and a sending tap manager on every rank, given to PD's KV
         manager so each KV room also carries its taps.
         """
-        parallel = get_parallel()
-        port = get_franky().franky_bootstrap_port
-        self.franky_relay_server = (
-            CommonKVBootstrapServer(host=get_serving().host, port=port)
-            if parallel.tp_rank == 0 and parallel.pp_rank == 0
-            else None
-        )
-        self.franky_relay_manager = FrankyTapManager.from_buffers(
+        self.franky_relay = relay_from_prefill(
+            self.disagg_prefill_bootstrap_queue.kv_manager,
             buffers=self._franky_parts.tap_buffers,
-            side=DisaggregationMode.PREFILL,
             server_args=self.server_args,
-            bootstrap_port=port,
-            engine_rank=parallel.tp_rank,
-            pp_rank=parallel.pp_rank,
-            gpu_id=get_device().gpu_id,
-        )
-        self.disagg_prefill_bootstrap_queue.kv_manager.attach_tap_relay(
-            tap_relay=self.franky_relay_manager
         )
 
     @override

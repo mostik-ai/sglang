@@ -47,7 +47,6 @@ class TestSandyRelayTarget(CustomTestCase):
 
                 self.assertEqual(landing.tap_pages.tolist(), expected)
                 self.assertEqual(landing.prefix_len, 64)
-                self.assertEqual(landing.num_tokens, 64 + 8 * _TAP_PAGE_SIZE)
                 self.assertFalse(target.waits(room=7))
                 self.assertIsNone(target.refusal(room=7))
 

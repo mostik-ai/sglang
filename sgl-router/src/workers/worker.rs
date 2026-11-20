@@ -320,21 +320,18 @@ impl Worker {
     /// A Franky Ricky worker that reads taps: each request it serves needs a
     /// Sandy to send them.
     pub fn needs_taps(&self) -> bool {
-        self.franky == Some(FrankyRole::Ricky { reads_taps: true })
+        self.franky.is_some_and(FrankyRole::reads_taps)
     }
 
     /// A Franky Sandy worker, which serves a pair's frozen model, never its
     /// requests.
     pub fn is_sandy(&self) -> bool {
-        matches!(self.franky, Some(FrankyRole::Sandy { .. }))
+        self.franky.is_some_and(FrankyRole::is_sandy)
     }
 
     /// A Sandy worker's tap bootstrap port, where the rooms of its taps open.
     pub fn tap_port(&self) -> Option<u16> {
-        match self.franky {
-            Some(FrankyRole::Sandy { tap_port }) => tap_port,
-            _ => None,
-        }
+        self.franky.and_then(FrankyRole::tap_port)
     }
 
     pub fn services(&self) -> BTreeSet<String> {

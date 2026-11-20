@@ -20,10 +20,12 @@ def franky_scheduler_class() -> type[Scheduler]:
     mode = get_disagg().disaggregation_mode
     if tap_role == FrankyTapRole.NONE:
         return FrankyChainScheduler
+    if tap_role == FrankyTapRole.SENDS and mode == "prefill":
+        return SandyPrefillScheduler
+    if tap_role == FrankyTapRole.SENDS and mode == "decode":
+        return SandyDecodeScheduler
     if tap_role == FrankyTapRole.SENDS:
-        return {"prefill": SandyPrefillScheduler, "decode": SandyDecodeScheduler}.get(
-            mode, SandyScheduler
-        )
+        return SandyScheduler
     if mode == "decode":
         return RickyDecodeScheduler
     return RickyScheduler

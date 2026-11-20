@@ -52,6 +52,24 @@ pub enum FrankyRole {
     Ricky { reads_taps: bool },
 }
 
+impl FrankyRole {
+    pub fn is_sandy(self) -> bool {
+        matches!(self, Self::Sandy { .. })
+    }
+
+    /// A Ricky that reads taps: each request it serves needs a Sandy.
+    pub fn reads_taps(self) -> bool {
+        self == Self::Ricky { reads_taps: true }
+    }
+
+    pub fn tap_port(self) -> Option<u16> {
+        match self {
+            Self::Sandy { tap_port } => tap_port,
+            Self::Ricky { .. } => None,
+        }
+    }
+}
+
 /// Immutable worker description emitted by a discovery backend.
 ///
 /// Backends emit [`DiscoveryEvent::Added`] carrying a `WorkerSpec` when a

@@ -17,8 +17,11 @@ if TYPE_CHECKING:
 
 class RickyRelayTarget(FrankyRelayTarget):
     """Ricky decode's end of the relay: a room's taps land in the stripes its
-    request reserved, past their cached prefix.
+    request reserved, past their cached prefix. Both Ricky ends split tap pages
+    by the request's page.
     """
+
+    senders_split_alike = True
 
     def __init__(
         self, *, tap_requests: RickyTapRequests, tap_cache: RickyTapCache
@@ -46,6 +49,5 @@ class RickyRelayTarget(FrankyRelayTarget):
             return None
         return FrankyRelayLanding(
             tap_pages=self._tap_cache.pages_to_land(reservation),
-            num_tokens=reservation.num_taps,
             prefix_len=reservation.cached.num_taps,
         )

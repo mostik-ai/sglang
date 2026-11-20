@@ -47,8 +47,23 @@ pub struct EngineGroup {
     /// Match any named Kubernetes Service (namespace/name), across pod replacements.
     pub worker_services: Option<HashSet<String>>,
     pub policy: Arc<dyn Policy>,
-    /// Whether it picks Franky Sandy workers; any other group never does.
-    pub sandy: bool,
+    pub pool: WorkerPool,
+}
+
+/// Which of a model's workers a group picks from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkerPool {
+    /// The workers that serve its requests.
+    #[default]
+    Serving,
+    /// Its Franky Sandy workers, which only the Ricky workers' requests reach.
+    Sandy,
+}
+
+impl WorkerPool {
+    fn holds(self, worker: &Worker) -> bool {
+        worker.is_sandy() == (self == Self::Sandy)
+    }
 }
 
 impl EngineGroup {
@@ -57,7 +72,7 @@ impl EngineGroup {
             worker_ids: None,
             worker_services: None,
             policy,
-            sandy: false,
+            pool: WorkerPool::Serving,
         }
     }
 
@@ -92,7 +107,7 @@ impl EngineGroup {
         workers
             .healthy_workers_for(model)
             .into_iter()
-            .filter(|engine| engine.mode() == stage && engine.is_sandy() == self.sandy)
+            .filter(|engine| engine.mode() == stage && self.pool.holds(engine))
             .filter(|engine| {
                 self.worker_ids
                     .as_ref()
@@ -345,6 +360,43 @@ impl Bucket {
             .max
             .unwrap_or(u64::MAX)
             .min(self.max_context_tokens.unwrap_or(u64::MAX))
+    }
+}
+
+/// A Franky model's Sandy workers, picked as any bucket's: plain Sandys, or
+/// Sandy prefill and decode pairs. Its buckets' groups hold only Sandy workers.
+#[derive(Debug)]
+pub struct SandyPool {
+    pub plain: Bucket,
+    pub pd: Bucket,
+}
+
+impl SandyPool {
+    /// Fails if a group installs a policy on a stage it cannot serve.
+    pub fn new(plain: Bucket, pd: Bucket) -> Result<Self, PickError> {
+        plain.validate()?;
+        pd.validate()?;
+        Ok(Self { plain, pd })
+    }
+
+    /// The bucket a Sandy call picks from: the PD one once a Sandy prefill
+    /// serves `model`, since one model's Sandys are all plain or all PD.
+    pub fn call_bucket(&self, workers: &WorkerRegistry, model: &ModelId) -> &Bucket {
+        let pd = (workers.workers_for(model).iter())
+            .any(|worker| worker.is_sandy() && worker.mode() == Stage::Prefill);
+        if pd {
+            &self.pd
+        } else {
+            &self.plain
+        }
+    }
+
+    pub fn has_ready_workers(&self, workers: &WorkerRegistry, model: &ModelId) -> bool {
+        self.plain.has_ready_workers(workers, model) || self.pd.has_ready_workers(workers, model)
+    }
+
+    pub fn needs_request_tokens(&self) -> bool {
+        self.plain.needs_request_tokens() || self.pd.needs_request_tokens()
     }
 }
 

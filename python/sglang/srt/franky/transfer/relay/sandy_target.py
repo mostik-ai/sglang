@@ -17,7 +17,10 @@ if TYPE_CHECKING:
 class SandyRelayTarget(FrankyRelayTarget):
     """Sandy decode's end of the relay: a room's taps land at the request's own
     KV slots, as all of Sandy's taps do, so it never waits and never refuses.
+    Both Sandy ends split tap pages by KV slot, which differ between them.
     """
+
+    senders_split_alike = False
 
     def __init__(self, *, tap_cache: SandyTapCache, kv_page_size: int) -> None:
         self._tap_cache = tap_cache
@@ -30,7 +33,4 @@ class SandyRelayTarget(FrankyRelayTarget):
         tap_pages = self._tap_cache.pages_of_kv_pages(
             kv_pages=kv_pages, kv_page_size=self._kv_page_size
         )
-        num_tokens = prefix_len + len(tap_pages) * self._tap_cache.buffers.page_size
-        return FrankyRelayLanding(
-            tap_pages=tap_pages, num_tokens=num_tokens, prefix_len=prefix_len
-        )
+        return FrankyRelayLanding(tap_pages=tap_pages, prefix_len=prefix_len)

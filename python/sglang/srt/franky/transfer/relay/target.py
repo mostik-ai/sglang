@@ -13,20 +13,26 @@ class FrankyRelayLanding(msgspec.Struct, frozen=True, kw_only=True):
     Attributes:
         tap_pages: int32, per tap page past ``prefix_len``, its local page on
             this rank, or -1 where another rank keeps it.
-        num_tokens: the tokens whose taps the room holds, the prefix included.
         prefix_len: the leading tokens, in whole tap pages, whose taps this
             rank already holds; the prefill skips them.
     """
 
     tap_pages: np.ndarray
-    num_tokens: int
     prefix_len: int
 
 
 class FrankyRelayTarget(ABC):
     """Where the taps a PD prefill relays to its decode land, room by room: the
     decode side's own tap pages of the room's request.
+
+    Attributes:
+        senders_split_alike: whether the prefill splits a request's tap pages
+            over its attention-TP ranks as this decode does, by the request's
+            page, so a decode rank pairs only with the prefill ranks that keep
+            its pages.
     """
+
+    senders_split_alike: bool
 
     def waits(self, *, room: int) -> bool:
         """Whether the room's request cannot take its tap pages yet; PD prepares

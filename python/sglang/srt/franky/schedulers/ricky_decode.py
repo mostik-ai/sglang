@@ -5,19 +5,17 @@ from typing import TYPE_CHECKING, List, Optional
 
 from typing_extensions import override
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.franky.finish_rules.request_blocks import RequestBlocks
-from sglang.srt.franky.ricky_taps.relay_target import RickyRelayTarget
 from sglang.srt.franky.ricky_taps.taps import RickyTaps
-from sglang.srt.franky.transfer.manager import FrankyTapManager
+from sglang.srt.franky.transfer.relay.ends import relay_to_decode
+from sglang.srt.franky.transfer.relay.ricky_target import RickyRelayTarget
 from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     STALL_METRICS_INTERVAL_S,
 )
-from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -64,20 +62,11 @@ class RickyDecodeScheduler(Scheduler):
         """PD decode's end of the tap relay from Ricky prefill: this rank's tap
         manager, given to PD's KV manager so each KV room also brings its taps.
         """
-        parallel = get_parallel()
-        self.franky_relay_manager = FrankyTapManager.from_buffers(
+        self.franky_relay_manager = relay_to_decode(
+            self.disagg_decode_prealloc_queue.kv_manager,
             buffers=self._franky_parts.tap_buffers,
-            side=DisaggregationMode.DECODE,
             server_args=self.server_args,
-            bootstrap_port=None,
-            engine_rank=parallel.attn_tp_rank,
-            pp_rank=parallel.pp_rank,
-            gpu_id=get_device().gpu_id,
-            senders_split_alike=True,
-        )
-        self.disagg_decode_prealloc_queue.kv_manager.attach_tap_relay(
-            tap_relay=self.franky_relay_manager,
-            relay_target=RickyRelayTarget(
+            target=RickyRelayTarget(
                 tap_requests=self.franky_taps.requests,
                 tap_cache=self.franky_taps.cache,
             ),

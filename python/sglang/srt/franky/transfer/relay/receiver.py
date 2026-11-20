@@ -64,7 +64,6 @@ class FrankyRelayReceiver(NixlKVReceiver):
             manager=self.kv_mgr.tap_relay,
             franky_room=self._relay_room(),
             tap_pages=landing.tap_pages,
-            num_tokens=landing.num_tokens,
             prefix_len=landing.prefix_len,
         )
         self.kv_mgr.track_tap_receiver(self.bootstrap_room, self.tap_receiver)

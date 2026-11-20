@@ -3,7 +3,6 @@
 
 use crate::discovery::ModelId;
 use crate::policies::registry::PdPoolResolver;
-use crate::policies_reorg::Stage;
 use crate::server::app_context::{AppContext, ChatRouting};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -46,10 +45,7 @@ pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
     };
     // A Ricky that reads taps serves nothing until a Sandy can send them.
     let sandy_ready = !(ctx.registry.workers_for(&model).iter()).any(|w| w.needs_taps())
-        || (ctx.sandy.as_ref()).is_some_and(|group| {
-            let has = |stage| group.has_members(&ctx.registry, &model, stage);
-            has(Stage::Plain) || (has(Stage::Prefill) && has(Stage::Decode))
-        });
+        || (ctx.sandy.as_ref()).is_some_and(|pool| pool.has_ready_workers(&ctx.registry, &model));
     if pool_ready && sandy_ready && ctx.kv_bootstrap_admit_ready() {
         StatusCode::OK
     } else {

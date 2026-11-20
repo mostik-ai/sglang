@@ -95,8 +95,8 @@ impl WorkerRegistry {
         profile: impl Into<EngineProfile>,
     ) -> Result<(), AddWorkerError> {
         let incoming_mode = spec.mode;
-        let incoming_sandy = matches!(spec.franky, Some(FrankyRole::Sandy { .. }));
-        let incoming_needs_taps = spec.franky == Some(FrankyRole::Ricky { reads_taps: true });
+        let incoming_sandy = spec.franky.is_some_and(FrankyRole::is_sandy);
+        let incoming_needs_taps = spec.franky.is_some_and(FrankyRole::reads_taps);
         let profile = profile.into();
         // Hold the write lock for the entire validate→insert sequence.
         // Without it, two concurrent callers for conflicting modes on

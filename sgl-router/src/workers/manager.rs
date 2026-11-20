@@ -569,8 +569,9 @@ async fn register_one(
     if info.franky_role.is_some() {
         spec.franky = info.franky_role;
     }
-    if matches!(spec.franky, Some(FrankyRole::Sandy { .. })) {
-        // A Sandy serves the router's model as its frozen half, whatever name it serves under.
+    // A Sandy serves the router's model as its frozen half, whatever name it
+    // serves under, once its /server_info says it is one.
+    if info.franky_role.is_some_and(FrankyRole::is_sandy) {
         if let Some(cfg) = &cfg {
             spec.model_ids = vec![ModelId(cfg.model.id.clone())];
         }

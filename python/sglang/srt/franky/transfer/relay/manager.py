@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     from sglang.srt.franky.transfer.receiver import FrankyReceiver
     from sglang.srt.franky.transfer.relay.target import FrankyRelayTarget
 
+_RELAY_PORT = "franky_relay_port"
+
 
 class FrankyRelayManager(NixlKVManager):
     """PD's NIXL KV manager on an engine with taps, beside the tap manager that
@@ -41,8 +43,8 @@ class FrankyRelayManager(NixlKVManager):
         self.relay_target = relay_target
 
     @override
-    def extra_registration_fields(self) -> dict:
-        return {"franky_relay_port": get_franky().franky_bootstrap_port}
+    def registration_extensions(self) -> dict:
+        return {_RELAY_PORT: get_franky().franky_bootstrap_port}
 
     def relay_port(self, bootstrap_addr: str) -> int:
         """
@@ -51,13 +53,13 @@ class FrankyRelayManager(NixlKVManager):
         Raises:
             RuntimeError: the prefill registered no relay port.
         """
-        port = self.prefill_info_table[bootstrap_addr].franky_relay_port
+        port = self.prefill_info_table[bootstrap_addr].extensions.get(_RELAY_PORT)
         if port is None:
             raise RuntimeError(
                 f"The PD prefill at {bootstrap_addr} registered no Franky relay "
                 "port; run it with the same Franky config as this decode."
             )
-        return port
+        return int(port)
 
     def track_tap_receiver(self, room: int, receiver: FrankyReceiver) -> None:
         self.tap_receivers[room] = receiver

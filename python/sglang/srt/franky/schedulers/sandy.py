@@ -5,31 +5,28 @@ from typing import TYPE_CHECKING, List, Optional
 
 from typing_extensions import override
 
-from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
-from sglang.srt.disaggregation.utils import DisaggregationMode, is_aborted
+from sglang.srt.disaggregation.utils import is_aborted
 from sglang.srt.franky.finish_rules.tap_step import TapStep
 from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.franky.schedulers.chain import FrankyChainScheduler
 from sglang.srt.franky.schedulers.sandy_batch_result_processor import (
     SandyBatchResultProcessor,
 )
-from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.franky.transfer.messages import FrankySendDone
 from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
+from sglang.srt.franky.transfer.relay.ends import FrankySendingEnd
 from sglang.srt.franky.transfer.send_queue import FrankySendQueue
 from sglang.srt.franky.transfer.senders.room import FrankyRoomSender
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.runtime_context import get_device, get_franky, get_parallel, get_serving
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import ceil_div
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
-    from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
     from sglang.srt.franky.transfer.senders.sender import FrankyTapSender
     from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.server_args import ServerArgs
 
 
 class SandyScheduler(FrankyChainScheduler):
@@ -56,8 +53,8 @@ class SandyScheduler(FrankyChainScheduler):
         )
 
     def init_franky_sending(self) -> None:
-        self.franky_bootstrap_server, self.franky_tap_manager = sandy_tap_sending(
-            tap_cache=self.tp_worker.model_runner.franky_parts.tap_cache,
+        self.franky_sending = FrankySendingEnd.build(
+            buffers=self.tp_worker.model_runner.franky_parts.tap_cache.buffers,
             server_args=self.server_args,
         )
 
@@ -145,7 +142,7 @@ class SandyScheduler(FrankyChainScheduler):
 
     def _open_franky_room(self, req: Req, num_tokens: int) -> FrankyTapSender:
         return FrankyRoomSender(
-            manager=self.franky_tap_manager,
+            manager=self.franky_sending.manager,
             franky_room=FrankyRequest.of(req).room,
             num_pages=ceil_div(
                 num_tokens,
@@ -173,32 +170,3 @@ def prepare_sandy_request(recv_req: TokenizedGenerateReqInput) -> Optional[str]:
     if has_embeds and recv_req.franky is not None and recv_req.franky.room:
         return "--franky-side sandy takes token ids only in a room."
     return None
-
-
-def sandy_tap_sending(
-    *, tap_cache: SandyTapCache, server_args: ServerArgs
-) -> tuple[Optional[CommonKVBootstrapServer], FrankyTapManager]:
-    """A Sandy's sending end of tap transfers over PD's NIXL classes: the
-    bootstrap server on the first rank, and a tap manager on every rank, since
-    a receiver waits for every rank and the server for every rank to register.
-
-    Returns:
-        The bootstrap server, None off the first rank, and the tap manager.
-    """
-    parallel = get_parallel()
-    port = get_franky().franky_bootstrap_port
-    server = (
-        CommonKVBootstrapServer(host=get_serving().host, port=port)
-        if parallel.tp_rank == 0 and parallel.pp_rank == 0
-        else None
-    )
-    manager = FrankyTapManager.from_buffers(
-        buffers=tap_cache.buffers,
-        side=DisaggregationMode.PREFILL,
-        server_args=server_args,
-        bootstrap_port=port,
-        engine_rank=parallel.tp_rank,
-        pp_rank=parallel.pp_rank,
-        gpu_id=get_device().gpu_id,
-    )
-    return server, manager

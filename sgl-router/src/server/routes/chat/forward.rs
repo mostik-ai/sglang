@@ -7,7 +7,7 @@ use super::nonempty_header;
 use super::preparation::{
     append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
-use crate::discovery::{ModelId, WorkerId, WorkerMode};
+use crate::discovery::{ModelId, WorkerId};
 use crate::policies::dp_rank::select_dp_rank;
 use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
@@ -298,7 +298,7 @@ async fn dispatch<T: Transport>(
             ctx,
             &metrics,
             Arc::clone(&sandy),
-            WorkerModeLabel::Sandy,
+            WorkerModeLabel::of(&sandy),
             path,
             leg,
             load_guards,
@@ -318,7 +318,7 @@ async fn dispatch<T: Transport>(
                 ctx,
                 &metrics,
                 Arc::clone(&prefill),
-                WorkerModeLabel::Prefill,
+                WorkerModeLabel::of(&prefill),
                 path,
                 prefill_leg,
                 prefill_load_guards,
@@ -1029,12 +1029,7 @@ impl DispatchMetrics {
             registry: Arc::clone(&ctx.metrics),
             model: request.model.0.clone(),
             worker_url: response_worker.url.clone(),
-            mode: match response_worker.mode() {
-                _ if response_worker.is_sandy() => WorkerModeLabel::Sandy,
-                WorkerMode::Prefill => WorkerModeLabel::Prefill,
-                WorkerMode::Decode => WorkerModeLabel::Decode,
-                WorkerMode::Plain => WorkerModeLabel::Plain,
-            },
+            mode: WorkerModeLabel::of(response_worker),
             streaming: request.streaming,
             request_started_at,
             duration: Arc::clone(duration),
@@ -1160,6 +1155,7 @@ impl Drop for RequestDurationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::WorkerMode;
 
     #[tokio::test]
     async fn stream_after_prefill_waits_for_prefill() {

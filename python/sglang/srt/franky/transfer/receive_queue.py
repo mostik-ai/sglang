@@ -188,7 +188,7 @@ class FrankyReceiveQueue:
         if receiver is None:
             return True
         state = receiver.poll()
-        reception.landed = receiver.landed()
+        reception.landed = min(receiver.landed(), reception.req.franky_taps.tap_len)
         if state == KVPoll.Success:
             receiver.close()
             reception.receiver = None

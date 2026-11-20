@@ -20,13 +20,13 @@ from sglang.srt.franky.chains.blocks.sandy_call import FrankySandyCall
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.request import FrankyRequest
-from sglang.srt.franky.ricky_taps.relay_target import RickyRelayTarget
 from sglang.srt.franky.ricky_taps.tap_requests import RickyTapRequests
 from sglang.srt.franky.tap_runs import FrankyTapRuns
 from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.franky.transfer.relay import receiver as relay_receiver_module
 from sglang.srt.franky.transfer.relay import sender as relay_sender_module
 from sglang.srt.franky.transfer.relay.receiver import FrankyRelayReceiver
+from sglang.srt.franky.transfer.relay.ricky_target import RickyRelayTarget
 from sglang.srt.franky.transfer.relay.sender import FrankyRelaySender
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, FINISH_MATCHED_TOKEN
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -571,7 +571,6 @@ class TestTapRelay(_Requests):
         pages = reservation.pages.tolist()
         self.assertEqual(kwargs["tap_pages"].tolist(), [pages[2], -1, pages[3], -1])
         self.assertEqual(kwargs["prefix_len"], 16)
-        self.assertEqual(kwargs["num_tokens"], 30)
         self.assertEqual(
             kwargs["franky_room"],
             FrankyRoom(bootstrap_host="prefill", bootstrap_port=9000, room=7),

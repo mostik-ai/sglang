@@ -63,10 +63,9 @@ _SANDY_CALL = FrankySandyCall(next_block=2)
 
 
 class _Receiver:
-    def __init__(self, *, manager, franky_room, tap_pages, num_tokens, prefix_len):
+    def __init__(self, *, manager, franky_room, tap_pages, prefix_len):
         self.manager = manager
         self.tap_pages = tap_pages.tolist()
-        self.num_tokens = num_tokens
         self.prefix_len = prefix_len
         self.bootstrap_room = franky_room.room
         self.state = KVPoll.WaitingForInput
@@ -344,7 +343,6 @@ class TestFrankyReceiveQueue(CustomTestCase):
         self.assertEqual(len(pages), 5)
         self.assertEqual(receiver.tap_pages, pages)
         self.assertEqual(receiver.prefix_len, 0)
-        self.assertEqual(receiver.num_tokens, 70)
         self.assertEqual(req.franky_taps.tap_len, 70)
         self.assertEqual(req.franky_taps.taps_ready, 0)
         self.assertEqual(self.tap_cache.num_takeable_stripes(), _NUM_STRIPES - 5)
@@ -429,7 +427,7 @@ class TestFrankyReceiveQueue(CustomTestCase):
 
         [receiver] = self.receivers
         self.assertEqual(len(receiver.tap_pages), 4)
-        self.assertEqual(receiver.num_tokens, 50)
+        self.assertEqual(req.franky_taps.tap_len, 50)
         self.assertEqual(req.franky_taps.tap_runs.taps[-1], 50)
 
     def test_sandys_own_tokens_key_the_cached_taps(self):

@@ -5,7 +5,8 @@ from typing import TYPE_CHECKING, Optional
 from typing_extensions import override
 
 from sglang.srt.franky.schedulers.chain import FrankyChainScheduler
-from sglang.srt.franky.schedulers.sandy import prepare_sandy_request, sandy_tap_sending
+from sglang.srt.franky.schedulers.sandy import prepare_sandy_request
+from sglang.srt.franky.transfer.relay.ends import relay_from_prefill
 from sglang.srt.franky.transfer.relay.sender import FrankyRelaySender
 
 if TYPE_CHECKING:
@@ -34,11 +35,10 @@ class SandyPrefillScheduler(FrankyChainScheduler):
         """PD prefill's end of the tap relay to Sandy decode, given to PD's KV
         manager so each KV room also carries the trace's taps.
         """
-        self.franky_relay_server, self.franky_relay_manager = sandy_tap_sending(
-            tap_cache=self._tap_cache, server_args=self.server_args
-        )
-        self.disagg_prefill_bootstrap_queue.kv_manager.attach_tap_relay(
-            tap_relay=self.franky_relay_manager
+        self.franky_relay = relay_from_prefill(
+            self.disagg_prefill_bootstrap_queue.kv_manager,
+            buffers=self._tap_cache.buffers,
+            server_args=self.server_args,
         )
 
     @override
