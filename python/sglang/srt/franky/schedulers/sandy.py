@@ -9,9 +9,9 @@ from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import DisaggregationMode, is_aborted
 from sglang.srt.franky.cache.mamba_room import FrankyMambaRoom
-from sglang.srt.franky.chains.chain import put_continuations_first
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
+from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.franky.schedulers.sandy_batch_result_processor import (
     SandyBatchResultProcessor,
 )
@@ -36,7 +36,9 @@ if TYPE_CHECKING:
 class SandyScheduler(Scheduler):
     """The Sandy engine regime: prefill on input tokens, send taps, never decode.
     It runs the normal event loops; a request ends at its prefill and answers
-    with no tokens once its taps are sent.
+    with no tokens once its taps are sent. A held chain's next block goes first
+    and other requests wait for room; when that block cannot start with nothing
+    else running, the chain with the least progress gives up its hold.
     """
 
     @override
@@ -73,8 +75,8 @@ class SandyScheduler(Scheduler):
             if parallel.tp_rank == 0 and parallel.pp_rank == 0
             else None
         )
-        self.franky_tap_manager = FrankyTapManager.from_tap_cache(
-            tap_cache=self.tp_worker.model_runner.franky_parts.tap_cache,
+        self.franky_tap_manager = FrankyTapManager.from_buffers(
+            buffers=self.tp_worker.model_runner.franky_parts.tap_cache.buffers,
             side=DisaggregationMode.PREFILL,
             server_args=self.server_args,
             bootstrap_port=port,
@@ -85,7 +87,7 @@ class SandyScheduler(Scheduler):
 
     def init_franky_chain_holds(self) -> None:
         self.franky_chain_holds = FrankyChainHolds.from_config(
-            tree_cache=self.tree_cache, max_total_num_tokens=self.max_total_num_tokens
+            tree_cache=self.tree_cache
         )
 
     def init_franky_mamba_room(self) -> None:
@@ -125,7 +127,11 @@ class SandyScheduler(Scheduler):
     ) -> None:
         # SGLang's server warmup sends requests without a room, which no Ricky reads.
         has_embeds = recv_req.mm_inputs is not None or recv_req.input_embeds is not None
-        if has_embeds and recv_req.franky_room is not None:
+        if (
+            has_embeds
+            and recv_req.franky is not None
+            and recv_req.franky.room is not None
+        ):
             mm_input_error = "--franky-side sandy takes token ids only in a room."
         # Sandy runs the prompt and answers no tokens, so sampling has no use.
         recv_req.sampling_params.max_new_tokens = 0
@@ -164,13 +170,15 @@ class SandyScheduler(Scheduler):
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass, running_batch: ScheduleBatch
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
-        put_continuations_first(self.waiting_queue)
+        self.franky_chain_holds.put_held_chains_first(self.waiting_queue)
         self.franky_num_startable_reqs = self._num_franky_startable_reqs()
         new_batch, running_batch = super()._get_new_batch_prefill_raw(
             prefill_delayer_single_pass, running_batch
         )
-        if new_batch is None and self._waits_without_running(running_batch):
-            self.franky_chain_holds.release_oldest()
+        if new_batch is None and self._a_held_chain_waits_alone(running_batch):
+            self.franky_chain_holds.release_least_progress(
+                sparing_chain_id=FrankyRequest.of(self.waiting_queue[0]).chain.id
+            )
         return new_batch, running_batch
 
     @override
@@ -230,18 +238,23 @@ class SandyScheduler(Scheduler):
             num_pinned_states=len(self.franky_chain_holds.locked_nodes())
         )
 
-    def _waits_without_running(self, running_batch: ScheduleBatch) -> bool:
+    def _a_held_chain_waits_alone(self, running_batch: ScheduleBatch) -> bool:
         return (
             len(self.waiting_queue) > 0
             and self.chunked_req is None
             and running_batch.is_empty()
+            and self.franky_chain_holds.holds_chain_of(self.waiting_queue[0])
         )
 
     def _open_franky_room(self, req: Req) -> FrankyTapSender:
-        if req.franky_room is None:
+        room = FrankyRequest.of(req).room
+        if room is None:
             return FrankyNoRoomSender()
         return FrankyRoomSender(
             manager=self.franky_tap_manager,
-            franky_room=req.franky_room,
-            num_pages=ceil_div(len(req.origin_input_ids), self.page_size),
+            franky_room=room,
+            num_pages=ceil_div(
+                len(req.origin_input_ids),
+                self.tp_worker.model_runner.franky_parts.tap_cache.buffers.page_size,
+            ),
         )

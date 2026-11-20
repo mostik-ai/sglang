@@ -6,7 +6,7 @@ from typing import Annotated
 import msgspec
 
 from sglang.srt.franky.parts.encoder.config import EncoderConfig
-from sglang.srt.franky.parts.injector.config import InjectorConfig
+from sglang.srt.franky.parts.injector.config import InjectorsConfig
 from sglang.srt.franky.parts.reader.config import ReaderConfig
 
 
@@ -25,9 +25,15 @@ class FrankyConfig(
 
     encoder: EncoderConfig
     reader: ReaderConfig
-    injector: InjectorConfig
-    # Each KV page pairs with one tap page, so both sides run this --page-size.
+    injector: InjectorsConfig
+    # Tokens of a tap page, the unit taps are sent and read in. Sandy's taps live
+    # at its KV slots, so its --page-size is a multiple of it; Ricky's KV pages
+    # are any size, since Ricky keeps its taps in pages of their own.
     tap_page_size: Annotated[int, msgspec.Meta(gt=1)]
+    # Whether Sandy reads Ricky's tokens. When it tokenizes on its own, each
+    # request sends Sandy's tokens of its input and names its answers in both
+    # sides' tokens.
+    shared_tokenizer: bool = True
 
     def __post_init__(self) -> None:
         num_encoders = len(self.encoder.layers)

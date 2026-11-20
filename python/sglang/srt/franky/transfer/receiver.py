@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.nixl.conn import NixlKVReceiver
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
+    from sglang.srt.franky.cache.ricky_tap_cache import RickyTapCache, TapReservation
     from sglang.srt.franky.transfer.manager import FrankyTapManager
     from sglang.srt.franky.transfer.messages import FrankyRoom
 
@@ -40,6 +41,23 @@ class FrankyReceiver(NixlKVReceiver):
         self.num_tokens = num_tokens
         self.prefix_len = prefix_len
         self.pages_registered = False
+
+    @staticmethod
+    def of_reservation(
+        *,
+        manager: FrankyTapManager,
+        franky_room: FrankyRoom,
+        tap_cache: RickyTapCache,
+        reservation: TapReservation,
+    ) -> FrankyReceiver:
+        """A request's taps landing in its stripes past their cached prefix."""
+        return FrankyReceiver(
+            manager=manager,
+            franky_room=franky_room,
+            tap_pages=tap_cache.pages_to_land(reservation),
+            num_tokens=reservation.num_taps,
+            prefix_len=reservation.cached.num_taps,
+        )
 
     @override
     def poll(self) -> int:

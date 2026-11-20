@@ -1771,6 +1771,8 @@ class ServingChatTestCase(CustomTestCase):
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             franky_generated_spans=[[3, 7]],
+            franky_sandy_input_ids=[11, 12, 13, 14, 15, 16, 17, 18, 19],
+            franky_sandy_spans=[[2, 6]],
         )
         processed = MessageProcessingResult(
             "Test prompt", [1, 2, 3, 4, 5, 6, 7, 8], None, None, [], [], None
@@ -1779,6 +1781,10 @@ class ServingChatTestCase(CustomTestCase):
             adapted, _ = self.chat._convert_to_internal_request(request)
 
         self.assertEqual(adapted.franky_generated_spans, [[3, 7]])
+        self.assertEqual(
+            adapted.franky_sandy_input_ids, [11, 12, 13, 14, 15, 16, 17, 18, 19]
+        )
+        self.assertEqual(adapted.franky_sandy_spans, [[2, 6]])
 
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(

@@ -62,6 +62,9 @@ _TRITON_KERNELS = [
     ("aiter_unified_page_table", "scatter_req_to_token_to_page_table_kernel"),
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
     ("mla_qk_prep", "concat_and_cast_mha_k_triton"),
+    ("franky_reader_prefill", "franky_reader_prefill"),
+    ("franky_reader_merge", "franky_reader_pack"),
+    ("franky_reader_merge", "franky_reader_merge"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

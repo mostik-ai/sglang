@@ -48,7 +48,6 @@ from typing import (
 )
 
 import fastapi
-import msgspec
 import numpy as np
 import pybase64
 import torch
@@ -70,9 +69,7 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
-from sglang.srt.franky.cache.generated_spans import checked_earlier_answers
-from sglang.srt.franky.chains.chain import FrankyChain
-from sglang.srt.franky.transfer.messages import FrankyRoom
+from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
@@ -152,6 +149,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
+    client_request_id,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
@@ -1587,23 +1585,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
-            franky_chain = (
-                FrankyChain.from_request(
-                    franky_chain=obj.franky_chain,
-                    rid=obj.rid,
-                    prompt_len=len(input_ids_arr or ()),
-                )
-                if obj.franky_chain is not None
-                else None
-            )
-            franky_generated_spans = (
-                checked_earlier_answers(
-                    obj.franky_generated_spans,
-                    generation_start=len(input_ids_arr or ())
-                    - (franky_chain.num_generated_before if franky_chain else 0),
-                )
-                if obj.franky_generated_spans is not None
-                else ()
+            franky = FrankyRequest.of_input(
+                obj,
+                prompt_len=len(input_ids_arr or ()),
+                on_sandy=get_franky().franky_side == "sandy",
             )
 
             tokenized_obj = self.tokenized_generate_req_type(
@@ -1624,13 +1609,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
-                franky_room=(
-                    msgspec.convert(obj.franky_room, FrankyRoom)
-                    if obj.franky_room is not None
-                    else None
-                ),
-                franky_chain=franky_chain,
-                franky_generated_spans=franky_generated_spans,
+                franky=franky,
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,
@@ -2066,6 +2045,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
+                    out["meta_info"]["client_request_id"] = client_request_id(request)
                     asyncio.create_task(
                         self.request_metrics_exporter_manager.write_record(obj, out)
                     )
@@ -2557,6 +2537,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
                     meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
+                    if (
+                        recv_obj.finished_reasons[i] is not None
+                        and self.request_metrics_exporter_manager.exporter_enabled()
+                    ):
+                        meta_info["stage_times"] = (
+                            scheduler_time_stats.convert_to_stage_times()
+                        )
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(

@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-mod qwen35;
+mod marked_answers;
 
-pub use qwen35::Qwen35;
+pub use marked_answers::MarkedAnswers;
 
 use crate::config::ChatTemplateAdapterKind;
 use anyhow::Result;
@@ -24,7 +24,10 @@ pub fn build(
     kind: ChatTemplateAdapterKind,
     tokenizer: &Tokenizer,
 ) -> Result<Arc<dyn ChatTemplateAdapter>> {
-    match kind {
-        ChatTemplateAdapterKind::Qwen35 => Ok(Arc::new(Qwen35::from_tokenizer(tokenizer)?)),
-    }
+    let adapter = match kind {
+        ChatTemplateAdapterKind::Qwen35 => MarkedAnswers::qwen35(tokenizer)?,
+        ChatTemplateAdapterKind::DeepseekV4 => MarkedAnswers::deepseek_v4(tokenizer)?,
+        ChatTemplateAdapterKind::KimiK3 => MarkedAnswers::kimi_k3(tokenizer)?,
+    };
+    Ok(Arc::new(adapter))
 }

@@ -14,8 +14,36 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 # Fields that should always be excluded from request parameters
-# because they contain non-JSON-serializable objects (e.g., ImageData, tensors)
-ALWAYS_EXCLUDE_FIELDS = {"image_data", "video_data", "audio_data", "input_embeds"}
+# because they contain non-JSON-serializable objects (e.g., ImageData, tensors),
+# or the prompt itself, which would make every record as large as its request.
+ALWAYS_EXCLUDE_FIELDS = {
+    "image_data",
+    "video_data",
+    "audio_data",
+    "input_embeds",
+    "text",
+    "input_ids",
+}
+# Any other field of token ids of the prompt, in whichever tokenizer.
+ALWAYS_EXCLUDE_SUFFIX = "input_ids"
+
+# Records are written in batches: one write per request, with its worker-thread
+# hop and flush, cost the API server about 9% of its throughput at 80 requests/s.
+RECORD_FLUSH_INTERVAL_S = 0.5
+
+# The header a client names its request with; routers pass it to every engine
+# that serves a part of the request.
+CLIENT_REQUEST_ID_HEADER = "x-request-id"
+
+
+def client_request_id(request) -> Optional[str]:
+    """
+    Args:
+        request: the HTTP request the engine received, or None for an internal one.
+    """
+    if request is None:
+        return None
+    return request.headers.get(CLIENT_REQUEST_ID_HEADER)
 
 
 class RequestMetricsExporter(ABC):
@@ -44,6 +72,7 @@ class RequestMetricsExporter(ABC):
             if (
                 field_name not in self.obj_skip_names
                 and field_name not in ALWAYS_EXCLUDE_FIELDS
+                and not field_name.endswith(ALWAYS_EXCLUDE_SUFFIX)
             ):
                 value = getattr(obj, field_name)
                 # Convert to serializable format
@@ -74,6 +103,7 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
 
     Records are written to files in the directory specified by `--export-metrics-to-file-dir`
     server launch flag. File names are of the form `"sglang-request-metrics-{hour_suffix}.log"`.
+    Records reach the file in batches, at most RECORD_FLUSH_INTERVAL_S after their request ends.
     """
 
     def __init__(
@@ -93,6 +123,8 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
         self._current_file_handler = None
         self._current_file_lock = asyncio.Lock()
         self._current_hour_suffix = None
+        self._pending_records: List[dict] = []
+        self._flush_task: Optional[asyncio.Task] = None
 
     def _ensure_file_handler(self, hour_suffix: str):
         """Ensure the file handler is open for the current hour suffix."""
@@ -136,27 +168,39 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
             return
 
         try:
-            # Get the log file path for the current time.
-            current_time = datetime.now()
-            hour_suffix = current_time.strftime("%Y%m%d_%H")
+            self._pending_records.append(self._format_output_data(obj, out_dict))
+        except Exception as e:
+            logger.exception(f"Failed to format perf metrics: {e}")
+            return
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_after_interval())
 
+    async def flush(self):
+        """Write every pending record to the current hour's file."""
+        records, self._pending_records = self._pending_records, []
+        if not records:
+            return
+        try:
+            hour_suffix = datetime.now().strftime("%Y%m%d_%H")
             async with self._current_file_lock:
-                # Ensure correct file handler is open for current hour
                 self._ensure_file_handler(hour_suffix)
-
                 if self._current_file_handler is None:
                     return
-
-                metrics_data = self._format_output_data(obj, out_dict)
+                file_handler = self._current_file_handler
 
                 def write_file():
-                    json.dump(metrics_data, self._current_file_handler)
-                    self._current_file_handler.write("\n")
-                    self._current_file_handler.flush()
+                    file_handler.write(
+                        "".join(json.dumps(record) + "\n" for record in records)
+                    )
+                    file_handler.flush()
 
                 await asyncio.to_thread(write_file)
         except Exception as e:
             logger.exception(f"Failed to write perf metrics to file: {e}")
+
+    async def _flush_after_interval(self):
+        await asyncio.sleep(RECORD_FLUSH_INTERVAL_S)
+        await self.flush()
 
 
 class RequestMetricsExporterManager:

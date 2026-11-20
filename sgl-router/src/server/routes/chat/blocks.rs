@@ -11,6 +11,7 @@ use super::{serves_franky, ModelRouting};
 use crate::discovery::ModelId;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
+use crate::tokenizer::franky_sandy::FrankySandyTokens;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Response, StatusCode};
 use bytes::Bytes;
@@ -57,6 +58,83 @@ pub(super) struct BlockChain {
     workers: Option<SelectedWorkers>,
     end: ChainEnd,
     blocks_sent: u32,
+    sandy: Option<SandyChain>,
+}
+
+/// A chain for a Sandy that tokenizes on its own: its tokenizer and its ids.
+struct SandyChain {
+    tokens: Arc<FrankySandyTokens>,
+    ids: SandyIds,
+}
+
+impl SandyChain {
+    /// The next block's ids for Sandy.
+    ///
+    /// Errors: `ApiError::Internal` when Sandy's tokenizer fails.
+    fn next_block(&mut self, generated_text: &str) -> Result<SandyBlock, ApiError> {
+        let tokens = &self.tokens;
+        self.ids
+            .next_block(generated_text, |text| tokens.encode_answer_text(text))
+            .map_err(|error| ApiError::Internal(error.context("tokenize a Franky block for Sandy")))
+    }
+}
+
+/// Sandy's ids of a chain: its rendering of the prompt, then its own tokens of
+/// each finished block's text, so each block's Sandy prompt extends the last
+/// one's and Sandy's cache keeps it.
+#[derive(Debug, Default, PartialEq)]
+struct SandyIds {
+    prompt_ids: Vec<u32>,
+    answer_ids: Vec<u32>,
+    /// Sandy's tokens before each block sent so far.
+    block_starts: Vec<usize>,
+    /// Bytes of the chain's text already in `answer_ids`.
+    text_done: usize,
+}
+
+/// What one block sends a Sandy that tokenizes on its own.
+#[derive(Debug, PartialEq)]
+struct SandyBlock {
+    ids: Vec<u32>,
+    /// Sandy's tokens before each earlier block.
+    earlier_starts: Vec<usize>,
+}
+
+impl SandyIds {
+    fn of_prompt(prompt_ids: Vec<u32>) -> Self {
+        Self {
+            prompt_ids,
+            ..Self::default()
+        }
+    }
+
+    /// The next block's ids, after `encode`'s tokens of the text the finished
+    /// blocks added to `generated_text`, the chain's text so far.
+    fn next_block(
+        &mut self,
+        generated_text: &str,
+        encode: impl FnOnce(&str) -> anyhow::Result<Vec<u32>>,
+    ) -> anyhow::Result<SandyBlock> {
+        let new_text = &generated_text[self.text_done..];
+        if !new_text.is_empty() {
+            self.answer_ids.extend(encode(new_text)?);
+            self.text_done = generated_text.len();
+        }
+        let earlier_starts = self.block_starts.clone();
+        self.block_starts
+            .push(self.prompt_ids.len() + self.answer_ids.len());
+        Ok(SandyBlock {
+            ids: [self.prompt_ids.as_slice(), self.answer_ids.as_slice()].concat(),
+            earlier_starts,
+        })
+    }
+}
+
+/// Gives Ricky's block body where each block starts in Sandy's tokens, and
+/// Sandy's input ids up to this block's start, which key Ricky's taps.
+fn add_sandy_block(body: &mut Map<String, Value>, chain: &mut Value, sandy: &SandyBlock) {
+    chain["sandy_block_starts"] = json!(sandy.earlier_starts);
+    body.insert("franky_sandy_input_ids".into(), json!(sandy.ids));
 }
 
 impl BlockChain {
@@ -111,6 +189,18 @@ impl BlockChain {
             .map_or_else(|| id.clone(), str::to_owned);
         let incremental_streaming_output = model_openai_settings(ctx, &request.model)
             .is_some_and(|settings| settings.incremental_streaming_output);
+        let sandy = match ctx.franky_sandy.clone() {
+            None => None,
+            Some(tokens) => {
+                let Some(prompt_ids) = request.take_franky_sandy_ids() else {
+                    return Err(refused("a prompt the router did not render for Sandy"));
+                };
+                Some(SandyChain {
+                    tokens,
+                    ids: SandyIds::of_prompt(prompt_ids),
+                })
+            }
+        };
         Ok(Some(Self {
             output: ChainOutput::new(reported_id, incremental_streaming_output),
             end: ChainEnd::new(ctx.proxy.admin_client().clone(), id.clone(), headers),
@@ -124,6 +214,7 @@ impl BlockChain {
             responder: request.responder.take(),
             workers: None,
             blocks_sent: 0,
+            sandy,
         }))
     }
 
@@ -172,8 +263,15 @@ impl BlockChain {
             .total_limit
             .is_some_and(|limit| generated + max_new_tokens >= limit);
         self.blocks_sent += 1;
-        let body = self.block_body(max_new_tokens, last_block);
+        let sandy = match self.sandy.as_mut() {
+            Some(sandy) => Some(sandy.next_block(self.output.generated_text())?),
+            None => None,
+        };
+        let body = self.block_body(max_new_tokens, last_block, sandy.as_ref());
         let mut request = PreparedRequest::generate_value(ctx, self.model.clone(), body, None)?;
+        if let Some(sandy) = sandy {
+            request.set_franky_sandy_ids(sandy.ids);
+        }
         self.output.start_block(last_block);
         let (response, answered) = routing
             .forward_with_retries(
@@ -192,7 +290,12 @@ impl BlockChain {
         Ok(response)
     }
 
-    fn block_body(&self, max_new_tokens: u64, last_block: bool) -> Value {
+    fn block_body(
+        &self,
+        max_new_tokens: u64,
+        last_block: bool,
+        sandy: Option<&SandyBlock>,
+    ) -> Value {
         let mut body = self.body_without_prompt.clone();
         let context = self.prompt_ids.iter().chain(self.output.generated_ids());
         body.insert("input_ids".into(), Value::Array(context.cloned().collect()));
@@ -200,15 +303,16 @@ impl BlockChain {
             "rid".into(),
             format!("{}-{}", self.id, self.blocks_sent).into(),
         );
-        body.insert(
-            "franky_chain".into(),
-            json!({
-                "id": self.id,
-                "block": self.blocks_sent,
-                "block_size": self.block_size,
-                "last_block": last_block,
-            }),
-        );
+        let mut chain = json!({
+            "id": self.id,
+            "block": self.blocks_sent,
+            "block_size": self.block_size,
+            "last_block": last_block,
+        });
+        if let Some(sandy) = sandy {
+            add_sandy_block(&mut body, &mut chain, sandy);
+        }
+        body.insert("franky_chain".into(), chain);
         let sampling = body.entry("sampling_params").or_insert_with(|| json!({}));
         sampling["max_new_tokens"] = max_new_tokens.into();
         if self.blocks_sent > 1 && body.contains_key("logprob_start_len") {
@@ -433,5 +537,62 @@ async fn error_event_from_response(response: Response<Body>) -> Bytes {
             "a Franky block failed with {status}: {}",
             String::from_utf8_lossy(&body)
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn letters(text: &str) -> anyhow::Result<Vec<u32>> {
+        Ok(text.bytes().map(u32::from).collect())
+    }
+
+    #[test]
+    fn each_block_extends_sandys_ids_with_its_own_tokens_of_the_new_text() {
+        let mut ids = SandyIds::of_prompt(vec![1, 2, 3]);
+
+        let first = ids.next_block("", letters).unwrap();
+        let second = ids.next_block("ab", letters).unwrap();
+        let third = ids.next_block("abcde", letters).unwrap();
+
+        assert_eq!(
+            first,
+            SandyBlock {
+                ids: vec![1, 2, 3],
+                earlier_starts: vec![]
+            }
+        );
+        assert_eq!(second.ids, vec![1, 2, 3, 97, 98]);
+        assert_eq!(second.earlier_starts, vec![3]);
+        assert_eq!(third.ids, vec![1, 2, 3, 97, 98, 99, 100, 101]);
+        assert_eq!(third.earlier_starts, vec![3, 5]);
+    }
+
+    #[test]
+    fn a_block_without_new_text_starts_where_the_last_one_did() {
+        let mut ids = SandyIds::of_prompt(vec![7]);
+        ids.next_block("", letters).unwrap();
+        ids.next_block("x", letters).unwrap();
+
+        let next = ids.next_block("x", letters).unwrap();
+
+        assert_eq!(next.ids, vec![7, 120]);
+        assert_eq!(next.earlier_starts, vec![1, 2]);
+    }
+
+    #[test]
+    fn ricky_reads_the_blocks_sandy_starts_and_sandys_input_ids() {
+        let mut body = Map::new();
+        let mut chain = json!({"id": "c", "block": 3});
+        let block = SandyBlock {
+            ids: vec![1, 2, 3, 4, 5, 6],
+            earlier_starts: vec![3, 5],
+        };
+
+        add_sandy_block(&mut body, &mut chain, &block);
+
+        assert_eq!(chain["sandy_block_starts"], json!([3, 5]));
+        assert_eq!(body["franky_sandy_input_ids"], json!([1, 2, 3, 4, 5, 6]));
     }
 }
