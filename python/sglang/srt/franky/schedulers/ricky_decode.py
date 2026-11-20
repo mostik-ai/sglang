@@ -8,6 +8,7 @@ from typing_extensions import override
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.franky.chains.messages import FrankyHoldExpired
 from sglang.srt.franky.finish_rules.request_blocks import RequestBlocks
+from sglang.srt.franky.ricky_taps.relay_target import RickyRelayTarget
 from sglang.srt.franky.ricky_taps.taps import RickyTaps
 from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.managers.io_struct import AbortReq, FrankyEndChainReq
@@ -16,7 +17,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     STALL_METRICS_INTERVAL_S,
 )
-from sglang.srt.runtime_context import get_device, get_franky, get_parallel
+from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -76,9 +77,10 @@ class RickyDecodeScheduler(Scheduler):
         )
         self.disagg_decode_prealloc_queue.kv_manager.attach_tap_relay(
             tap_relay=self.franky_relay_manager,
-            tap_cache=self.franky_taps.cache,
-            relay_bootstrap_port=get_franky().franky_bootstrap_port,
-            tap_requests=self.franky_taps.requests,
+            relay_target=RickyRelayTarget(
+                tap_requests=self.franky_taps.requests,
+                tap_cache=self.franky_taps.cache,
+            ),
         )
 
     @override

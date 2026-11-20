@@ -161,9 +161,7 @@ class RickyScheduler(Scheduler):
             gpu_id=get_device().gpu_id,
         )
         self.disagg_prefill_bootstrap_queue.kv_manager.attach_tap_relay(
-            tap_relay=self.franky_relay_manager,
-            tap_cache=self.franky_taps.cache,
-            relay_bootstrap_port=port,
+            tap_relay=self.franky_relay_manager
         )
 
     @override

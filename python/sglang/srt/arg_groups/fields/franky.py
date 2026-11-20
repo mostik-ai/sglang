@@ -22,8 +22,8 @@ class Franky(msgspec.Struct):
         "Side of a Franky model pair. 'sandy' runs the frozen model: it writes "
         "what a chain asks and, with --franky-config, sends the taps of every "
         "token it ran. 'ricky' runs the model that writes the chain's blocks and, "
-        "with --franky-config, reads the taps, with or without PD "
-        "disaggregation. Without --franky-config the sides only write text. "
+        "with --franky-config, reads the taps. Either side runs with or without "
+        "PD disaggregation. Without --franky-config the sides only write text. "
         "'null' disables Franky.",
     ] = "null"
     franky_config: A[
@@ -38,9 +38,10 @@ class Franky(msgspec.Struct):
     ] = None
     franky_bootstrap_port: A[
         int,
-        "Tap bootstrap server port. A sandy engine serves on it; a ricky PD "
-        "prefill engine serves the relay to its decode on it; a ricky PD decode "
-        "engine finds that relay on it. Default is 8996.",
+        "Tap bootstrap server port. A sandy engine serves Ricky's rooms on it, "
+        "and a PD prefill engine with --franky-config serves the relay of taps "
+        "to its decode on it; the decode finds that port through PD's bootstrap "
+        "server. Default is 8996.",
     ] = 8996
     franky_chain_hold_seconds: A[
         float,

@@ -20,10 +20,11 @@ from sglang.srt.franky.chains.blocks.sandy_call import FrankySandyCall
 from sglang.srt.franky.chains.chain import FrankyChain
 from sglang.srt.franky.chains.holds import FrankyChainHolds
 from sglang.srt.franky.request import FrankyRequest
+from sglang.srt.franky.ricky_taps.relay_target import RickyRelayTarget
 from sglang.srt.franky.ricky_taps.tap_requests import RickyTapRequests
 from sglang.srt.franky.tap_runs import FrankyTapRuns
-from sglang.srt.franky.transfer import receiver as receiver_module
 from sglang.srt.franky.transfer.messages import FrankyRoom
+from sglang.srt.franky.transfer.relay import receiver as relay_receiver_module
 from sglang.srt.franky.transfer.relay import sender as relay_sender_module
 from sglang.srt.franky.transfer.relay.receiver import FrankyRelayReceiver
 from sglang.srt.franky.transfer.relay.sender import FrankyRelaySender
@@ -487,7 +488,9 @@ class TestHeldChains(_Requests):
 class TestTapRelay(_Requests):
     def _sender(self):
         sender = FrankyRelaySender.__new__(FrankyRelaySender)
-        sender.kv_mgr = SimpleNamespace(tap_relay=object(), relay_bootstrap_port=9000)
+        sender.kv_mgr = SimpleNamespace(
+            tap_relay=SimpleNamespace(franky_bootstrap_port=9000)
+        )
         sender.bootstrap_server_url = "prefill:8998"
         sender.bootstrap_room = 7
         sender.tap_sender = None
@@ -521,10 +524,11 @@ class TestTapRelay(_Requests):
     def _receiver(self):
         receiver = FrankyRelayReceiver.__new__(FrankyRelayReceiver)
         receiver.kv_mgr = SimpleNamespace(
-            tap_requests=self.requests,
-            tap_cache=self.tap_cache,
+            relay_target=RickyRelayTarget(
+                tap_requests=self.requests, tap_cache=self.tap_cache
+            ),
             tap_relay=object(),
-            relay_bootstrap_port=9000,
+            relay_port=lambda bootstrap_addr: 9000,
             track_tap_receiver=MagicMock(),
             record_failure=MagicMock(),
         )
@@ -557,10 +561,9 @@ class TestTapRelay(_Requests):
         reservation = self._reserve(_request("r", range(30), bootstrap_room=7))
         receiver = self._receiver()
 
-        # FrankyReceiver.of_reservation builds the receiver this module names.
         with (
             patch.object(NixlKVReceiver, "send_metadata"),
-            patch.object(receiver_module, "FrankyReceiver") as tap_receiver,
+            patch.object(relay_receiver_module, "FrankyReceiver") as tap_receiver,
         ):
             receiver.send_metadata(np.array([3, 4, 5]), 0)
 
@@ -583,7 +586,7 @@ class TestTapRelay(_Requests):
 
         with (
             patch.object(NixlKVReceiver, "send_metadata"),
-            patch.object(receiver_module, "FrankyReceiver") as tap_receiver,
+            patch.object(relay_receiver_module, "FrankyReceiver") as tap_receiver,
         ):
             receiver.send_metadata(np.array([3, 4, 5]), 0)
 

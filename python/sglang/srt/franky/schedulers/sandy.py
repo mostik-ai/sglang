@@ -25,9 +25,11 @@ from sglang.srt.utils.common import ceil_div
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
+    from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
     from sglang.srt.franky.transfer.senders.sender import FrankyTapSender
     from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
 
 
 class SandyScheduler(FrankyChainScheduler):
@@ -54,25 +56,9 @@ class SandyScheduler(FrankyChainScheduler):
         )
 
     def init_franky_sending(self) -> None:
-        """Sandy's end of tap transfers over PD's NIXL classes: the bootstrap
-        server on the first rank, and a tap manager on every rank, since Ricky
-        waits for every rank and the server for every rank to register.
-        """
-        parallel = get_parallel()
-        port = get_franky().franky_bootstrap_port
-        self.franky_bootstrap_server = (
-            CommonKVBootstrapServer(host=get_serving().host, port=port)
-            if parallel.tp_rank == 0 and parallel.pp_rank == 0
-            else None
-        )
-        self.franky_tap_manager = FrankyTapManager.from_buffers(
-            buffers=self.tp_worker.model_runner.franky_parts.tap_cache.buffers,
-            side=DisaggregationMode.PREFILL,
+        self.franky_bootstrap_server, self.franky_tap_manager = sandy_tap_sending(
+            tap_cache=self.tp_worker.model_runner.franky_parts.tap_cache,
             server_args=self.server_args,
-            bootstrap_port=port,
-            engine_rank=parallel.tp_rank,
-            pp_rank=parallel.pp_rank,
-            gpu_id=get_device().gpu_id,
         )
 
     def init_franky_send_queue(self) -> None:
@@ -102,18 +88,10 @@ class SandyScheduler(FrankyChainScheduler):
         *,
         mm_input_error: Optional[str] = None,
     ) -> None:
-        # SGLang's server warmup sends requests without a room, which no Ricky reads.
-        has_embeds = recv_req.mm_inputs is not None or recv_req.input_embeds is not None
-        if has_embeds and recv_req.franky is not None and recv_req.franky.room:
-            mm_input_error = "--franky-side sandy takes token ids only in a room."
-        if recv_req.franky is not None and recv_req.franky.taps_only:
-            recv_req.sampling_params.max_new_tokens = 0
-        recv_req.sampling_params.json_schema = None
-        recv_req.sampling_params.regex = None
-        recv_req.sampling_params.ebnf = None
-        recv_req.sampling_params.structural_tag = None
-        recv_req.return_logprob = False
-        super().handle_generate_request(recv_req, mm_input_error=mm_input_error)
+        refusal = prepare_sandy_request(recv_req)
+        super().handle_generate_request(
+            recv_req, mm_input_error=refusal or mm_input_error
+        )
 
     @override
     def init_req_max_new_tokens(self, req: Req) -> None:
@@ -174,3 +152,53 @@ class SandyScheduler(FrankyChainScheduler):
                 self.tp_worker.model_runner.franky_parts.tap_cache.buffers.page_size,
             ),
         )
+
+
+def prepare_sandy_request(recv_req: TokenizedGenerateReqInput) -> Optional[str]:
+    """Sandy writes plain text: no constrained decoding and no logprobs; a
+    taps-only request writes nothing.
+
+    Returns:
+        Why the request is refused, or None.
+    """
+    if recv_req.franky is not None and recv_req.franky.taps_only:
+        recv_req.sampling_params.max_new_tokens = 0
+    recv_req.sampling_params.json_schema = None
+    recv_req.sampling_params.regex = None
+    recv_req.sampling_params.ebnf = None
+    recv_req.sampling_params.structural_tag = None
+    recv_req.return_logprob = False
+    has_embeds = recv_req.mm_inputs is not None or recv_req.input_embeds is not None
+    # SGLang's server warmup sends requests without a room, which no Ricky reads.
+    if has_embeds and recv_req.franky is not None and recv_req.franky.room:
+        return "--franky-side sandy takes token ids only in a room."
+    return None
+
+
+def sandy_tap_sending(
+    *, tap_cache: SandyTapCache, server_args: ServerArgs
+) -> tuple[Optional[CommonKVBootstrapServer], FrankyTapManager]:
+    """A Sandy's sending end of tap transfers over PD's NIXL classes: the
+    bootstrap server on the first rank, and a tap manager on every rank, since
+    a receiver waits for every rank and the server for every rank to register.
+
+    Returns:
+        The bootstrap server, None off the first rank, and the tap manager.
+    """
+    parallel = get_parallel()
+    port = get_franky().franky_bootstrap_port
+    server = (
+        CommonKVBootstrapServer(host=get_serving().host, port=port)
+        if parallel.tp_rank == 0 and parallel.pp_rank == 0
+        else None
+    )
+    manager = FrankyTapManager.from_buffers(
+        buffers=tap_cache.buffers,
+        side=DisaggregationMode.PREFILL,
+        server_args=server_args,
+        bootstrap_port=port,
+        engine_rank=parallel.tp_rank,
+        pp_rank=parallel.pp_rank,
+        gpu_id=get_device().gpu_id,
+    )
+    return server, manager

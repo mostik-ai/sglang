@@ -783,8 +783,8 @@ def get_kv_class(
         }
         from sglang.srt.franky.config import FrankyTapRole
 
-        if FrankyTapRole.of_running_engine() == FrankyTapRole.READS:
-            # Ricky relays its taps to its decode in each KV room.
+        if FrankyTapRole.of_running_engine() != FrankyTapRole.NONE:
+            # A Franky engine with taps relays them to its decode in each KV room.
             from sglang.srt.franky.transfer.relay.manager import FrankyRelayManager
             from sglang.srt.franky.transfer.relay.receiver import FrankyRelayReceiver
             from sglang.srt.franky.transfer.relay.sender import FrankyRelaySender

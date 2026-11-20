@@ -138,6 +138,9 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+    # The port where a Franky prefill relays each room's taps to its decode, on
+    # the bootstrap host; None on an engine without taps.
+    franky_relay_port: Optional[int] = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -160,6 +163,9 @@ class PrefillServerInfo:
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
+        )
+        self.franky_relay_port = (
+            int(self.franky_relay_port) if self.franky_relay_port is not None else None
         )
 
 
@@ -1559,6 +1565,10 @@ class CommonKVManager(BaseKVManager):
             )
         return synced_port
 
+    def extra_registration_fields(self) -> Dict:
+        """Fields a subclass adds to this rank's bootstrap registration."""
+        return {}
+
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP PUT."""
         if self.dist_init_addr:
@@ -1605,6 +1615,7 @@ class CommonKVManager(BaseKVManager):
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
+            **self.extra_registration_fields(),
         }
 
         payload["decode_allocation_policy"] = (
@@ -3035,6 +3046,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
+        self.franky_relay_port: Optional[int] = None
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -3104,6 +3116,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_cache_dtype = data["kv_cache_dtype"]
         kv_layout = data.get("kv_layout")
         prefill_http_port = data.get("prefill_http_port")
+        franky_relay_port = data.get("franky_relay_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
@@ -3142,6 +3155,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
+
+        if self.franky_relay_port is None and franky_relay_port is not None:
+            self.franky_relay_port = int(franky_relay_port)
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -3227,6 +3243,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
                 prefill_http_port=self.prefill_http_port,
+                franky_relay_port=self.franky_relay_port,
                 decode_allocation_policy=self.decode_allocation_policy,
             )
             payload = dataclasses.asdict(info)

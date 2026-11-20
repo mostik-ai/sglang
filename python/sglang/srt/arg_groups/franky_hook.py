@@ -53,14 +53,14 @@ def handle_franky(server_args: ServerArgs) -> None:
 
 
 def _resolve_for_taps(*, server_args: ServerArgs, cfg: Any) -> None:
-    if cfg.franky_side == "ricky" and cfg.disaggregation_mode == "decode":
+    if cfg.disaggregation_mode == "decode":
         # A retracted request's KV backup holds no taps, so PD aborts it instead.
         declare_resolution(
             server_args,
             "handle_franky",
             disaggregation_decode_retraction_backup="none",
         )
-    if cfg.franky_side == "sandy":
+    if cfg.franky_side == "sandy" and cfg.disaggregation_mode != "decode":
         # A prefill's tap pages are final only once the next forward ran, as a
         # dedup insert rewrites them on the main stream; taps leave at once without.
         declare_resolution(server_args, "handle_franky", disable_overlap_schedule=True)
@@ -68,9 +68,6 @@ def _resolve_for_taps(*, server_args: ServerArgs, cfg: Any) -> None:
 
 def _chain_checks(*, cfg: Any) -> dict[str, bool]:
     return {
-        f"--disaggregation-mode {cfg.disaggregation_mode}": (
-            cfg.franky_side == "sandy" and cfg.disaggregation_mode != "null"
-        ),
         "speculative decoding": cfg.speculative_algorithm is not None,
         "LoRA": cfg.enable_lora,
         # A chain's requests go to one engine, whose holds keep its prefix.
@@ -82,7 +79,17 @@ def _chain_checks(*, cfg: Any) -> dict[str, bool]:
 
 
 def _tap_checks(*, cfg: Any) -> dict[str, bool]:
+    pd = cfg.disaggregation_mode != "null"
+    retraction_backup = cfg.disaggregation_decode_retraction_backup
     return {
+        # Taps go with the KV over PD's NIXL classes only.
+        f"--disaggregation-transfer-backend {cfg.disaggregation_transfer_backend}": (
+            pd and cfg.disaggregation_transfer_backend != "nixl"
+        ),
+        f"--disaggregation-decode-retraction-backup {retraction_backup}": (
+            cfg.disaggregation_mode == "decode"
+            and retraction_backup not in (None, "none")
+        ),
         # Parts must see each layer's whole residual, for all of its tokens, once.
         "--enable-attn-tp-input-scattered": cfg.enable_attn_tp_input_scattered,
         "--enable-layernorm-sp": cfg.enable_layernorm_sp,
@@ -140,20 +147,12 @@ def _ricky_checks(
     tap_size = config.encoder.output_size
     pd = cfg.disaggregation_mode != "null"
     decode = cfg.disaggregation_mode == "decode"
-    retraction_backup = cfg.disaggregation_decode_retraction_backup
     return {
-        # Taps go with the KV over PD's NIXL classes only.
-        f"--disaggregation-transfer-backend {cfg.disaggregation_transfer_backend}": (
-            pd and cfg.disaggregation_transfer_backend != "nixl"
-        ),
         # Every Ricky stage holds all taps, so PD stages would relay them twice.
         "--pp-size above 1 with --disaggregation-mode": pd and cfg.pp_size > 1,
         # Decode KV that one request computed saw only that request's taps.
         "--disaggregation-decode-enable-radix-cache": (
             decode and cfg.disaggregation_decode_enable_radix_cache
-        ),
-        f"--disaggregation-decode-retraction-backup {retraction_backup}": (
-            decode and retraction_backup not in (None, "none")
         ),
         # A chunk ends at the taps that have landed.
         "--chunked-prefill-size -1": not decode and cfg.chunked_prefill_size <= 0,

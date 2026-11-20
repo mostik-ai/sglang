@@ -30,6 +30,8 @@ from sglang.srt.franky.schedulers import (
     FrankyChainScheduler,
     RickyDecodeScheduler,
     RickyScheduler,
+    SandyDecodeScheduler,
+    SandyPrefillScheduler,
     SandyScheduler,
     franky_scheduler_class,
 )
@@ -201,10 +203,6 @@ class TestHandleFranky(_WithFiles):
 
     def test_refused_on_sandy_only(self):
         for reason, fields in {
-            "--disaggregation-mode prefill": {
-                "disaggregation_mode": "prefill",
-                "disaggregation_transfer_backend": "nixl",
-            },
             "encoder layer 12": {"num_hidden_layers": 10},
             "page size 16": {"page_size": 16},
         }.items():
@@ -242,17 +240,41 @@ class TestHandleFranky(_WithFiles):
                     handle_franky(server_args)
                 handle_franky(self._server_args(side="sandy", **fields))
 
-    def test_sandy_runs_outside_pd_with_or_without_parts(self):
-        text_only_pd = {
-            "franky_config": None,
-            "franky_weights": None,
-            "disaggregation_mode": "prefill",
-            "disaggregation_transfer_backend": "mooncake",
-        }
+    def test_either_side_runs_pd_and_taps_need_nixl(self):
+        text_only = {"franky_config": None, "franky_weights": None}
+        for side in ("sandy", "ricky"):
+            for mode in ("prefill", "decode"):
+                with self.subTest(side=side, mode=mode):
+                    pd = {"disaggregation_mode": mode}
+                    nixl = {"disaggregation_transfer_backend": "nixl"}
+                    mooncake = {"disaggregation_transfer_backend": "mooncake"}
 
-        handle_franky(self._server_args(side="ricky", **text_only_pd))
-        with self.assertRaisesRegex(ValueError, "--disaggregation-mode prefill"):
-            handle_franky(self._server_args(side="sandy", **text_only_pd))
+                    handle_franky(self._server_args(side=side, **pd, **nixl))
+                    handle_franky(
+                        self._server_args(side=side, **pd, **mooncake, **text_only)
+                    )
+                    with self.assertRaisesRegex(ValueError, "backend mooncake"):
+                        handle_franky(self._server_args(side=side, **pd, **mooncake))
+
+    def test_a_decode_with_taps_aborts_retractions_and_keeps_overlap_scheduling(self):
+        for side in ("sandy", "ricky"):
+            with self.subTest(side=side):
+                decode = self._server_args(
+                    side=side,
+                    disaggregation_mode="decode",
+                    disaggregation_transfer_backend="nixl",
+                )
+
+                handle_franky(decode)
+
+                resolved = dict(getattr(decode, "_resolved_overrides", []))
+                self.assertEqual(
+                    resolved["handle_franky"][
+                        "disaggregation_decode_retraction_backup"
+                    ],
+                    "none",
+                )
+                self.assertNotIn("disable_overlap_schedule", resolved["handle_franky"])
 
     def test_a_side_without_parts_writes_text_only_and_refuses_only_chain_rules(self):
         for side in ("sandy", "ricky"):
@@ -452,7 +474,9 @@ class TestThroughThePipeline(_WithFiles):
 class TestTapRole(CustomTestCase):
     def test_an_engine_gets_the_scheduler_and_pd_classes_of_its_tap_role(self):
         for side, config, mode, scheduler, pd_manager in [
-            ("sandy", "c.json", "null", SandyScheduler, "NixlKVManager"),
+            ("sandy", "c.json", "null", SandyScheduler, "FrankyRelayManager"),
+            ("sandy", "c.json", "prefill", SandyPrefillScheduler, "FrankyRelayManager"),
+            ("sandy", "c.json", "decode", SandyDecodeScheduler, "FrankyRelayManager"),
             ("ricky", "c.json", "null", RickyScheduler, "FrankyRelayManager"),
             ("ricky", "c.json", "decode", RickyDecodeScheduler, "FrankyRelayManager"),
             ("sandy", None, "null", FrankyChainScheduler, "NixlKVManager"),
