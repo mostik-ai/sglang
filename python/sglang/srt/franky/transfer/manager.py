@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
@@ -28,9 +29,9 @@ class FrankyTapManager(NixlKVManager):
     attention-TP rank keeps its own stripe pages of every request, so every
     receiving rank pairs with every sending rank of every stage; page lists are
     whole requests with -1 where a rank keeps no page, and only the pages both
-    ends keep move. Where the senders split taps as the receivers do, over as
-    many ranks, each receiving rank pairs only with the sending rank of its
-    stripe. Encoders pair by id.
+    ends keep move. Where the senders split a request's pages as the receivers
+    do, a receiving rank pairs only with the sending ranks that keep pages it
+    keeps. Encoders pair by id.
     """
 
     def __init__(
@@ -158,17 +159,26 @@ class FrankyTapManager(NixlKVManager):
         # handle_franky refuses attention context parallelism at start.
         info.target_cp_ranks = [0]
         info.target_pp_ranks = list(range(info.pp_size))
-        if self.senders_split_alike and info.attn_tp_size == self.attn_tp_size:
-            # The sending rank of this rank's stripe keeps every page it reads.
-            info.target_tp_rank = self.attn_tp_rank
-            info.target_tp_ranks = [self.attn_tp_rank]
-            info.required_dst_info_num = self.pp_size
-            info.required_prefill_response_num = info.pp_size
-            return
-        info.target_tp_rank = None
-        info.target_tp_ranks = list(range(info.attn_tp_size))
-        info.required_dst_info_num = self.attn_tp_size * self.pp_size
-        info.required_prefill_response_num = info.attn_tp_size * info.pp_size
+        # Page p of a request is on sending rank p % S and on receiving rank
+        # p % R where both split by it, so two ranks share pages only when they
+        # are equal modulo gcd(S, R). Sandy splits by KV slot instead: any of its
+        # ranks may keep any page.
+        groups = (
+            math.gcd(info.attn_tp_size, self.attn_tp_size)
+            if self.senders_split_alike
+            else 1
+        )
+        info.target_tp_ranks = [
+            rank
+            for rank in range(info.attn_tp_size)
+            if rank % groups == self.attn_tp_rank % groups
+        ]
+        # None marks every target a real sender, as SGLang's sharded MLA KV does.
+        info.target_tp_rank = (
+            info.target_tp_ranks[0] if len(info.target_tp_ranks) == 1 else None
+        )
+        info.required_dst_info_num = self.attn_tp_size // groups * self.pp_size
+        info.required_prefill_response_num = len(info.target_tp_ranks) * info.pp_size
 
     @override
     def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:

@@ -449,6 +449,7 @@ class TestFrankyPdEndToEnd(_FrankyPair):
     rank sends its taps to both prefill ranks, each keeping its stripe pages,
     and prefill's ranks relay their pages to decode's rank with the KV."""
 
+    prefill_tp_size = 2
     decode_tp_size = 1
 
     @classmethod
@@ -465,7 +466,7 @@ class TestFrankyPdEndToEnd(_FrankyPair):
                 "ricky",
                 cls.prefill_url,
                 gpu=1,
-                tp_size=2,
+                tp_size=cls.prefill_tp_size,
                 extra=[
                     *pd,
                     *relay,
@@ -478,7 +479,7 @@ class TestFrankyPdEndToEnd(_FrankyPair):
             cls._launch(
                 "ricky",
                 cls.decode_url,
-                gpu=3,
+                gpu=1 + cls.prefill_tp_size,
                 tp_size=cls.decode_tp_size,
                 extra=[*pd, *relay, "--disaggregation-mode", "decode"],
             ),
@@ -565,6 +566,15 @@ class TestFrankyPdDecodeTp2EndToEnd(TestFrankyPdEndToEnd):
     """Ricky PD decode on two ranks too: each decode rank reads only the prefill
     rank that keeps its stripe."""
 
+    decode_tp_size = 2
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 7, "requires 7 GPUs")
+class TestFrankyPdPrefillTp4DecodeTp2EndToEnd(TestFrankyPdEndToEnd):
+    """Ricky PD prefill on four ranks and decode on two: each decode rank reads
+    the two prefill ranks that keep its pages."""
+
+    prefill_tp_size = 4
     decode_tp_size = 2
 
 

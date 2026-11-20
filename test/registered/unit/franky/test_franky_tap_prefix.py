@@ -210,6 +210,34 @@ class TestFrankyTapManager(CustomTestCase):
         self.assertEqual(sending_engine.target_tp_ranks, [0, 1])
         self.assertEqual(sending_engine.required_prefill_response_num, 2)
 
+    def test_a_rank_reads_only_the_senders_that_keep_its_pages(self):
+        # Pages 1, 3, 5, ... are on receiving rank 1 of 2: sending ranks 1 and 3 of 4.
+        manager = _tap_manager(
+            attn_tp_size=2, pp_size=1, attn_tp_rank=1, senders_split_alike=True
+        )
+        sending_engine = _sending_engine(attn_tp_size=4, pp_size=1)
+
+        manager._resolve_rank_mapping(sending_engine)
+
+        self.assertIsNone(sending_engine.target_tp_rank)
+        self.assertEqual(sending_engine.target_tp_ranks, [1, 3])
+        self.assertEqual(sending_engine.required_prefill_response_num, 2)
+        self.assertEqual(sending_engine.required_dst_info_num, 1)
+
+    def test_a_sender_serves_every_rank_that_keeps_its_pages(self):
+        # Pages 1, 3, 5, ... are on sending rank 1 of 2: receiving ranks 1 and 3 of 4.
+        manager = _tap_manager(
+            attn_tp_size=4, pp_size=1, attn_tp_rank=3, senders_split_alike=True
+        )
+        sending_engine = _sending_engine(attn_tp_size=2, pp_size=1)
+
+        manager._resolve_rank_mapping(sending_engine)
+
+        self.assertEqual(sending_engine.target_tp_rank, 1)
+        self.assertEqual(sending_engine.target_tp_ranks, [1])
+        self.assertEqual(sending_engine.required_prefill_response_num, 1)
+        self.assertEqual(sending_engine.required_dst_info_num, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
