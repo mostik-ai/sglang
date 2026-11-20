@@ -727,11 +727,11 @@ async fn text_only_chains_send_no_rooms_or_tap_runs() {
     }
 }
 
-/// A streamed chain is one stream: Sandy's text comes as one frame, every
-/// frame carries the answer so far, and only the last one finishes it.
+/// A streamed chain is one stream: Sandy's calls stream too, every frame
+/// carries the answer so far, and only the last one finishes it.
 #[tokio::test]
 async fn a_streamed_chain_with_sandys_text_is_one_stream() {
-    let (ctx, [_ricky, _sandy], _stop) = chain_router(12, chain_config(2, true, 4)).await;
+    let (ctx, [_ricky, sandy], _stop) = chain_router(12, chain_config(2, true, 4)).await;
     let body = json!({
         "input_ids": PROMPT,
         "stream": true,
@@ -748,7 +748,8 @@ async fn a_streamed_chain_with_sandys_text_is_one_stream() {
         .iter()
         .map(|frame| frame["output_ids"].as_array().unwrap().len())
         .collect();
-    assert_eq!(lengths, [2, 3, 4, 5, 6, 8, 9, 10, 11, 12]);
+    assert_eq!(lengths, (1..=12).collect::<Vec<_>>());
+    assert!(sandy.requests().iter().all(|call| call["stream"] == true));
     let last = frames.len() - 1;
     for frame in &frames[..last] {
         assert_eq!(frame["meta_info"]["finish_reason"], Value::Null, "{frame}");

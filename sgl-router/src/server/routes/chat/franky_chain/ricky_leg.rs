@@ -1,12 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::openai::sse_data;
 use super::answer_limits::WriteLimits;
-use axum::body::Body;
-use bytes::Bytes;
-use futures::stream::{self, BoxStream};
-use futures::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
 
 /// The finish reason of a Ricky leg that ends where Sandy writes next.
@@ -53,43 +48,6 @@ impl LegEnd {
         let next_block = finish_reason["next_block"].as_u64()?;
         Some(Self::CallsSandy { next_block })
     }
-}
-
-/// One frame of a Ricky leg, as its engine sent it.
-pub(super) enum LegFrame {
-    Frame(Value),
-    /// An error frame of a streamed leg, which ends it.
-    Error(Bytes),
-}
-
-/// The frames of a Ricky leg's response: its one frame when unary, its SSE
-/// frames when streamed.
-pub(super) fn leg_frames(
-    body: Body,
-    streamed: bool,
-) -> BoxStream<'static, Result<LegFrame, axum::Error>> {
-    if !streamed {
-        return stream::once(async move {
-            let bytes = axum::body::to_bytes(body, usize::MAX).await?;
-            let frame = serde_json::from_slice(&bytes).map_err(axum::Error::new)?;
-            Ok(LegFrame::Frame(frame))
-        })
-        .boxed();
-    }
-    streamed_frames(body).boxed()
-}
-
-fn streamed_frames(body: Body) -> impl Stream<Item = Result<LegFrame, axum::Error>> {
-    let not_done = |data: &Result<Bytes, axum::Error>| {
-        futures::future::ready(!matches!(data, Ok(data) if data.as_ref() == b"[DONE]"))
-    };
-    sse_data(body).filter(not_done).map(|data| {
-        let data = data?;
-        Ok(match serde_json::from_slice::<Value>(&data) {
-            Ok(frame) if frame.get("error").is_none() => LegFrame::Frame(frame),
-            _ => LegFrame::Error(data),
-        })
-    })
 }
 
 /// The `/generate` body of a Ricky leg that continues the trace `input_ids`

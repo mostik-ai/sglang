@@ -35,9 +35,11 @@ pub(super) async fn error_event_from_response(response: Response<Body>) -> Bytes
     let status = response.status();
     let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
         Ok(body) => body,
-        Err(error) => return error_event(&format!(
+        Err(error) => {
+            return error_event(&format!(
             "a Franky chain's request failed with {status}, and reading its body failed: {error}"
-        )),
+        ))
+        }
     };
     match serde_json::from_slice::<Value>(&body) {
         Ok(error) if error.get("error").is_some() => data_event(&body),
