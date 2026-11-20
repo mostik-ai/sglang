@@ -7,10 +7,6 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
-from sglang.kernels.ops.attention.franky_reader_merge import (
-    franky_reader_merge,
-    franky_reader_pack,
-)
 from sglang.kernels.ops.attention.franky_reader_prefill import franky_reader_prefill
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
@@ -22,7 +18,7 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 
 if TYPE_CHECKING:
     from sglang.srt.franky.parts.reader.current_tap_reading import CurrentTapReading
-    from sglang.srt.franky.parts.reader.tap_gather import TapGather
+    from sglang.srt.franky.parts.reader.tap_merge import TapMerge
     from sglang.srt.franky.parts.reader.tap_reading import TapReading
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -82,7 +78,7 @@ class TrtllmWorkspace(msgspec.Struct, frozen=True, kw_only=True):
 class TapAttention:
     """One reader's attention over the taps of its encoder on this rank. Each
     rank attends over the taps it keeps; with more than one rank, the ranks
-    gather each row's result and log-sum-exp and merge them.
+    merge each row's results by their log-sum-exp.
     """
 
     def __init__(
@@ -91,7 +87,7 @@ class TapAttention:
         pages: torch.Tensor,
         reading: CurrentTapReading,
         builds_reading: bool,
-        gather: Optional[TapGather],
+        merge: Optional[TapMerge],
         workspace: Optional[TrtllmWorkspace],
     ) -> None:
         """
@@ -101,13 +97,13 @@ class TapAttention:
             reading: the stage's reading of the forward that runs.
             builds_reading: whether this reader runs first in each forward and
                 makes the forward's reading for the stage.
-            gather: how the attention-TP ranks that split the taps gather their
+            merge: how the attention-TP ranks that split the taps merge their
                 results; None when this rank keeps them all.
         """
         self.pages = pages
         self.reading = reading
         self.builds_reading = builds_reading
-        self.gather = gather
+        self.merge = merge
         self.workspace = workspace
 
     @eager_on_graph
@@ -139,57 +135,64 @@ class TapAttention:
         if rows is not None:
             reading = reading.select(rows)
         num_rows = reading.num_rows
-        has_taps[:num_rows].copy_(reading.has_taps[:num_rows])
         has_taps[num_rows:].zero_()
         attended[num_rows:].zero_()
         if num_rows == 0:
             return
-        real = attended[:num_rows]
-        self._attend_rows(queries[:num_rows], reading, out=real)
-        real.masked_fill_(reading.no_taps[:num_rows, None, None], 0)
+        self._attend_rows(
+            queries[:num_rows],
+            reading,
+            out=attended[:num_rows],
+            has_taps=has_taps[:num_rows],
+        )
 
     def _attend_rows(
-        self, queries: torch.Tensor, reading: TapReading, *, out: torch.Tensor
+        self,
+        queries: torch.Tensor,
+        reading: TapReading,
+        *,
+        out: torch.Tensor,
+        has_taps: torch.Tensor,
     ) -> None:
+        """Write the rows' attended taps into ``out``, zeros for the rows that
+        read none, and 1 or 0 into ``has_taps`` by whether they read any.
+        """
+        num_rows = queries.shape[0]
         kernel = self._local_kernel(queries, reading)
-        if self.gather is None:
+        rows = reading.merged_rows
+        if self.merge is None:
+            has_taps.copy_(reading.has_taps[:num_rows])
             self._attend_locally(kernel, queries, reading, out=out, lse=None)
+            out.masked_fill_(reading.no_taps[:num_rows, None, None], 0)
             return
         local_out = torch.empty_like(queries)
         lse = torch.empty(queries.shape[:2], dtype=torch.float32, device=queries.device)
         self._attend_locally(kernel, queries, reading, out=local_out, lse=lse)
-        local_taps = reading.local_taps[: queries.shape[0]]
-        rows = reading.merged_rows
+        local_taps = reading.local_taps[:num_rows]
         if rows is None:
-            self._merge(
-                local_out, lse, local_taps, out=out, lse_is_base_e=kernel.lse_is_base_e
+            # The merge also writes has_taps and zeroes the rows that read none.
+            self.merge.merge(
+                local_out,
+                lse,
+                local_taps,
+                out=out,
+                has_taps=has_taps,
+                lse_is_base_e=kernel.lse_is_base_e,
             )
             return
-        merged = local_out.new_empty((rows.shape[0], *local_out.shape[1:]))
-        self._merge(
-            local_out[rows],
-            lse[rows],
-            local_taps[rows],
-            out=merged,
-            lse_is_base_e=kernel.lse_is_base_e,
-        )
-        out[rows] = merged
-
-    def _merge(
-        self,
-        local_out: torch.Tensor,
-        lse: torch.Tensor,
-        local_taps: torch.Tensor,
-        *,
-        out: torch.Tensor,
-        lse_is_base_e: bool,
-    ) -> None:
-        if local_out.shape[0] == 0:
-            return
-        packed = franky_reader_pack(local_out, lse, local_taps)
-        franky_reader_merge(
-            self.gather.gather(packed), out=out, lse_is_base_e=lse_is_base_e
-        )
+        has_taps.copy_(reading.has_taps[:num_rows])
+        if rows.shape[0] > 0:
+            merged = local_out.new_empty((rows.shape[0], *local_out.shape[1:]))
+            self.merge.merge(
+                local_out[rows],
+                lse[rows],
+                local_taps[rows],
+                out=merged,
+                has_taps=has_taps.new_empty((rows.shape[0], 1)),
+                lse_is_base_e=kernel.lse_is_base_e,
+            )
+            out[rows] = merged
+        out.masked_fill_(reading.no_taps[:num_rows, None, None], 0)
 
     def _local_kernel(self, queries: torch.Tensor, reading: TapReading) -> LocalKernel:
         if reading.row_blocks is not None and queries.shape[1] == 1 and queries.is_cuda:

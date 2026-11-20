@@ -549,7 +549,7 @@ class TestRickyParts(_Files):
             [True, False],
         )
         self.assertIs(parts._attentions[0].reading, parts._attentions[1].reading)
-        self.assertIsNone(parts._attentions[0].gather)
+        self.assertIsNone(parts._attentions[0].merge)
 
     def test_the_pool_holds_the_taps_of_the_kv_tokens_and_rows_fit_the_context(
         self,

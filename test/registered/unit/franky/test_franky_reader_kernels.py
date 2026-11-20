@@ -11,9 +11,6 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
-    MultimemAllGatherer,
-)
 from sglang.srt.franky.cache.generated_spans import (
     FrankyGeneratedSpans,
     GeneratedSpan,
@@ -26,7 +23,7 @@ from sglang.srt.franky.parts.reader.tap_attention import (
     TapAttention,
     TrtllmWorkspace,
 )
-from sglang.srt.franky.parts.reader.tap_gather import TapGather
+from sglang.srt.franky.parts.reader.tap_merge import TapMerge
 from sglang.srt.franky.parts.reader.tap_reading import TapReading
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -127,12 +124,7 @@ class TestReaderKernels(CustomTestCase):
                 request_table=request_table, stripes=stripes, page_size=_PAGE_SIZE
             ),
             builds_reading=True,
-            gather=None
-            if group is None
-            else TapGather(
-                gatherer=MultimemAllGatherer(1, enabled=False, group=group),
-                num_ranks=group.world_size,
-            ),
+            merge=None if group is None else TapMerge(group=group, exchange=None),
             workspace=TrtllmWorkspace.for_device("cuda"),
         )
 

@@ -39,6 +39,12 @@ class _EmbeddingReqInput:
     input_ids: Optional[List[int]] = None
 
 
+@dataclass
+class _FrankyReqInput:
+    rid: Optional[str] = None
+    franky_sandy_input_ids: Optional[List[int]] = None
+
+
 class _ServerArgs:
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -352,6 +358,17 @@ class TestPromptLeftOut(unittest.TestCase):
         params = json.loads(result["request_parameters"])
         self.assertNotIn("input_ids", params)
         self.assertEqual(result["stage_times"], {})
+
+    def test_sandy_token_ids_stay_out_of_every_record(self):
+        server_args = _make_server_args("/tmp/unused")
+        exporter = _ConcreteExporter(
+            server_args, obj_skip_names=None, out_skip_names=None
+        )
+        obj = _FrankyReqInput(rid="req-1", franky_sandy_input_ids=list(range(8192)))
+        result = exporter._format_output_data(obj, {"meta_info": {}})
+
+        params = json.loads(result["request_parameters"])
+        self.assertEqual(params, {"rid": "req-1"})
 
 
 if __name__ == "__main__":

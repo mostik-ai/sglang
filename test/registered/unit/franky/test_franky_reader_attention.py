@@ -11,9 +11,6 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.franky_reader_merge import PACK_COLUMNS
-from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
-    MultimemAllGatherer,
-)
 from sglang.srt.franky.cache.generated_spans import (
     FrankyGeneratedSpans,
     GeneratedSpan,
@@ -21,10 +18,10 @@ from sglang.srt.franky.cache.generated_spans import (
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE, TapBuffers
 from sglang.srt.franky.cache.tap_request_table import TapRequestTable
 from sglang.srt.franky.cache.tap_stripes import TapStripes
-from sglang.srt.franky.parts.reader import tap_attention
+from sglang.srt.franky.parts.reader import tap_attention, tap_merge
 from sglang.srt.franky.parts.reader.current_tap_reading import CurrentTapReading
 from sglang.srt.franky.parts.reader.tap_attention import TapAttention
-from sglang.srt.franky.parts.reader.tap_gather import TapGather
+from sglang.srt.franky.parts.reader.tap_merge import TapMerge
 from sglang.srt.franky.parts.reader.tap_reading import TapReading
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -301,12 +298,12 @@ class TestTapReading(CustomTestCase):
 class TestTapAttention(CustomTestCase):
     def setUp(self):
         super().setUp()
-        for name, stand_in in (
-            ("flash_attn_with_kvcache", _flash_attention_on_cpu),
-            ("franky_reader_pack", _pack_on_cpu),
-            ("franky_reader_merge", _merge_on_cpu),
+        for module, name, stand_in in (
+            (tap_attention, "flash_attn_with_kvcache", _flash_attention_on_cpu),
+            (tap_merge, "franky_reader_pack", _pack_on_cpu),
+            (tap_merge, "franky_reader_merge", _merge_on_cpu),
         ):
-            stand_in_patch = patch.object(tap_attention, name, stand_in)
+            stand_in_patch = patch.object(module, name, stand_in)
             stand_in_patch.start()
             self.addCleanup(stand_in_patch.stop)
         self.taps = _taps()
@@ -321,12 +318,7 @@ class TestTapAttention(CustomTestCase):
                 page_size=_PAGE_SIZE,
             ),
             builds_reading=True,
-            gather=None
-            if group is None
-            else TapGather(
-                gatherer=MultimemAllGatherer(1, enabled=False, group=group),
-                num_ranks=group.world_size,
-            ),
+            merge=None if group is None else TapMerge(group=group, exchange=None),
             workspace=None,
         )
 
@@ -414,25 +406,27 @@ class TestTapAttention(CustomTestCase):
         other_lse = torch.tensor([[1.5], [float("-inf")]])
         local_taps = torch.tensor([3, 0], dtype=torch.int32)
         ranks = _Ranks(2)
-        attentions = [
-            self._attention(num_ranks=2, rank=rank, group=ranks.group(rank))
-            for rank in range(2)
-        ]
+        merges = [TapMerge(group=ranks.group(rank), exchange=None) for rank in range(2)]
         merged = torch.full_like(out, float("nan"))
-        attentions[1]._merge(
+        has_taps = torch.full((2, 1), float("nan"))
+        merges[1].merge(
             other_out,
             other_lse,
             local_taps,
             out=torch.empty_like(out),
+            has_taps=torch.empty_like(has_taps),
             lse_is_base_e=True,
         )
 
-        attentions[0]._merge(out, lse, local_taps, out=merged, lse_is_base_e=True)
+        merges[0].merge(
+            out, lse, local_taps, out=merged, has_taps=has_taps, lse_is_base_e=True
+        )
 
         weights = torch.softmax(torch.tensor([0.5, 1.5]), dim=0)
         expected = weights[0] * out[0].float() + weights[1] * other_out[0].float()
         torch.testing.assert_close(merged[0].float(), expected, atol=1e-2, rtol=1e-2)
         self.assertTrue(torch.all(merged[1] == 0))
+        self.assertEqual(has_taps[:, 0].tolist(), [1.0, 0.0])
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ ALWAYS_EXCLUDE_FIELDS = {
     "input_embeds",
     "text",
     "input_ids",
+    # Franky: the prompt in Sandy's tokens.
+    "franky_sandy_input_ids",
 }
 
 # Records are written in batches: one write per request, with its worker-thread
