@@ -132,6 +132,9 @@ pub(super) struct FrankyChain {
     /// Whether the chain's Sandy streams only what each frame adds; `None`
     /// when its workers do not all say the same, so its calls go unary.
     sandy_increments: Option<bool>,
+    /// Where the template of Sandy's input starts closing an answer before
+    /// Sandy's EOS; Sandy's calls stop there.
+    sandy_text_end: Option<u32>,
     limits: AnswerLimits,
     body_without_prompt: Map<String, Value>,
     client_stop_ids: Vec<u64>,
@@ -221,6 +224,7 @@ impl FrankyChain {
             config: config.clone(),
             taps: reads_taps(ctx, &request.model),
             sandy_increments: sandy_incremental_streaming(ctx, &request.model),
+            sandy_text_end: sandy_text_end(ctx),
             limits,
             body_without_prompt: body,
             client_stop_ids,
@@ -497,10 +501,7 @@ impl FrankyChain {
             _ => SandyLimit::Call,
         };
         let (input_ids, tokenizer) = match self.trace.sandy_ids() {
-            Some(ids) => {
-                let text_end = self.trace.sandy_text_end();
-                (json!(ids), SandyTokenizer::Own { text_end })
-            }
+            Some(ids) => (json!(ids), SandyTokenizer::Own),
             None => (json!(self.trace.ricky_ids()), SandyTokenizer::Ricky),
         };
         let streamed_increments = (self.sandy_increments)
@@ -510,6 +511,7 @@ impl FrankyChain {
             &self.body_without_prompt,
             input_ids,
             limits,
+            self.sandy_text_end,
             tokenizer,
             streamed_increments.is_some(),
         );
@@ -698,6 +700,15 @@ impl Next {
             }
             Self::SendRickyLeg(_) | Self::Failed(_) | Self::Ended(_) => empty,
         }
+    }
+}
+
+/// The text end of the template that renders Sandy's input: Sandy's own with
+/// its own tokenizer, else the served model's.
+fn sandy_text_end(ctx: &AppContext) -> Option<u32> {
+    match &ctx.franky_sandy {
+        Some(tokens) => tokens.text_end(),
+        None => (ctx.franky_chat_adapter.as_ref()).and_then(|adapter| adapter.text_end()),
     }
 }
 
