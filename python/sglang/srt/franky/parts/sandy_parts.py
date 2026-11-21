@@ -9,7 +9,6 @@ from typing_extensions import override
 from sglang.srt.franky.cache.sandy_tap_cache import SandyTapCache
 from sglang.srt.franky.cache.tap_stripes import TapStripes
 from sglang.srt.franky.parts.franky_parts import FrankyParts, load_part
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 if TYPE_CHECKING:
     from sglang.srt.franky.config import FrankyConfig
@@ -22,8 +21,8 @@ if TYPE_CHECKING:
 
 
 class SandyParts(FrankyParts):
-    """Sandy's side on this rank: runs the encoders of this PP stage. It also drops
-    the model's head, because Sandy never samples.
+    """Sandy's side on this rank: runs the encoders of this PP stage on every
+    token its forwards run over, the tokens Sandy writes included.
 
     Layer numbers start at 1 and mean "after this layer". The stage runs layers
     ``start_layer + 1 .. end_layer``.
@@ -95,7 +94,6 @@ class SandyParts(FrankyParts):
                     dtype=dtype,
                     device=device,
                 )
-        _drop_head(model=model, language_model=language_model)
         return cls(
             config=config,
             injector=injector,
@@ -163,45 +161,6 @@ class SandyParts(FrankyParts):
             else:
                 self._states[index] = state
         return output
-
-
-class _NoLogits(nn.Module):
-    """Sandy's requests have ``max_new_tokens=0``, so the head never runs. The
-    logits have rows and no columns: attention DP slices them after the forward,
-    and a prefill-only batch samples nothing.
-    """
-
-    def forward(
-        self, input_ids: torch.Tensor, hidden_states: torch.Tensor, *args, **kwargs
-    ) -> LogitsProcessorOutput:
-        return LogitsProcessorOutput(
-            next_token_logits=hidden_states.new_empty((hidden_states.shape[0], 0))
-        )
-
-
-def _drop_head(*, model: nn.Module, language_model: FrankyMixin) -> None:
-    owner = _head_owner(model=model, language_model=language_model)
-    owner.logits_processor = _NoLogits()
-    # A tied head is the language model's own embedding, so only a separate one goes.
-    if all(module is not owner.lm_head for module in language_model.modules()):
-        owner.lm_head = None
-
-
-def _head_owner(*, model: nn.Module, language_model: FrankyMixin) -> nn.Module:
-    """The innermost module around the language model with the head; a vision
-    model can wrap the causal LM that holds it."""
-    owners = [
-        module
-        for module in model.modules()
-        if any(name == "logits_processor" for name, _ in module.named_children())
-        and any(inner is language_model for inner in module.modules())
-    ]
-    if not owners:
-        raise ValueError(
-            f"{type(model).__name__} has no logits_processor around "
-            f"{type(language_model).__name__} for Sandy to drop."
-        )
-    return owners[-1]
 
 
 def _open_at(all_inputs: list[tuple[int, ...]], *, edge: int) -> tuple[int, ...]:

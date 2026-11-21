@@ -418,48 +418,79 @@ sgl-router --model-id ricky --chat-routing reorg --policy cache_aware \
   EndpointSlices in plain or PD mode; next to `--selector`, that selector must
   use equality terms too.
 
-### Blocks
+### Chains
 
-With `--franky-block-size N`, the router runs each Franky request as a chain of
-blocks of at most `N` generated tokens, so a block's tokens read their own taps
-in the next block:
+`--franky-chain JSON` runs each Franky request as a chain of Sandy calls and
+Ricky legs over one trace: the prompt and every token written since.
 
-- Block `k` sends the prompt and every token of blocks `1..k-1` as `input_ids`
-  to the Sandy and the Ricky that answered block 1 (a failed attempt retries as
-  usual). Its rid is `{chain}-{k}`, and `franky_chain` carries the chain id, the
-  block number `k`, the block size, and whether this is the last block the total
-  `max_new_tokens` allows. Ricky uses the block size to recompute a block's
-  tokens with the taps its decode read: those before the block.
-- The chain goes on while Ricky's block ends at the block's token limit. The
-  client gets one response: frames continue across blocks, `meta_info` keeps
-  the first block's prompt fields and adds up the counts, and the chain's id
-  replaces each block's.
-- Between blocks each engine holds the chain's cached prefix. Unless the chain
-  ended with its last block, the router posts `/franky/end_chain` to its engines
-  when it ends: after a stop, an error, or a client that left.
-- Blocks need token ids (`input_ids`, or text or chat the router renders) and
+```bash
+sgl-router ... --franky-chain '{"sandy_call_tokens": 64, "taps": true,
+  "blocks": {"block_size": 256, "call_token_id": 151669,
+    "decider": {"type": "call_token_or_every_blocks", "every_blocks": 4}}}'
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `sandy_call_tokens` | `0` | Tokens of the answer each Sandy call writes; `0` writes none. |
+| `taps` | `true` | Sandy sends the taps of all it ran, its own text included, and Ricky reads them. |
+| `blocks` | none | Ricky's blocks, which Ricky's engine checks: `block_size`, `call_token_id`, and the `decider` that says at each block end whether Sandy writes next. None: Ricky writes to the end in one leg. |
+
+Without Sandy's text and blocks (the default) a request runs as one Ricky
+request beside a Sandy leg that sends the prompt's taps.
+
+- A Sandy call (rid `{chain}-s{n}`) gets the trace as `input_ids` and writes at
+  most `sandy_call_tokens` of the answer; with taps it gets a new
+  `franky_room` at its tap port. It streams to a streaming client when Sandy
+  reads Ricky's tokens and all Sandy workers report the same
+  `incremental_streaming_output`; otherwise it is unary. Its text joins the trace and the answer. Its
+  EOS ends only its text; a client stop rule or the answer's token limit ends
+  the answer.
+- A Ricky leg (rid `{chain}-r{n}`) gets the trace, the client's sampling with
+  what is left of `max_new_tokens`, and `franky_chain`: the chain id, the leg's
+  first block and `blocks`. With taps it gets `franky_tap_runs` and the room of
+  the Sandy call before it, or, when Sandy writes nothing, a Sandy leg beside it
+  that sends the trace's taps (`franky_taps_only`). Ricky's engine ends the leg
+  at a block end where the decider calls Sandy, with finish reason
+  `{"type": "franky_sandy_call", "next_block": n}`; the call token stays in the
+  trace and the answer. Any other finish ends the answer.
+- `franky_tap_runs` are `[start, taps]` pairs: from Ricky's token `start` on,
+  the forward that makes a token reads the first `taps` of Sandy's tokens. Each
+  Sandy call adds a run that starts where its text starts and reads all Sandy
+  has then, its text included.
+- The client gets one response: frames continue across calls and legs, Sandy's
+  text comes as Sandy writes it (as one frame from a unary call), `meta_info` has the client's prompt length, the
+  first leg's other prompt fields with its cache hits counted within the
+  prompt, the counts added up, and the chain's id.
+- With blocks, each engine holds the chain's cached prefix between its
+  requests, and the router posts `/franky/end_chain` to every engine the chain
+  reached when it ends. Sandy's hold must outlast Ricky's blocks between two
+  calls (`--franky-chain-hold-seconds` on the engines).
+- A leg that reads a Sandy call's room gets one attempt, since the room sends
+  its taps once. A Ricky that answers `502` got no taps; its retry avoids the
+  Sandy that should have sent them.
+- Chains need token ids (`input_ids`, or text or chat the router renders) and
   one sequence. Batches, `n` above 1, constrained decoding, hidden states,
-  routed experts and sessions are refused with `400`, as is chat the router
-  does not lower to `/generate`: it lowers chat only for the templates it
-  renders as SGLang does (see [Chat rendering](#chat-rendering)).
-- A stop string across two blocks is not matched; each block checks its own
-  output.
-- Between two blocks a chain waits for Sandy to prefill the last block's tokens
-  and send their taps, and for Ricky to prefill them again. Both engines take a
-  chain's next block before new prompts, and Sandy runs without overlap
-  scheduling so a batch's taps leave right after its forward. Engines started
-  with a smaller `--chunked-prefill-size` (2048 in our runs) make a next block
-  wait less behind other prefills, at a small cost in throughput.
+  routed experts and sessions are refused with `400`, and while Sandy writes
+  also per-token logprobs, as is chat the router does not lower to `/generate`
+  (see [Chat rendering](#chat-rendering)).
+- A stop string across two requests is not matched; each checks its own output.
+- Engines started with `--franky-side` and without `--franky-config` write text
+  only; run them with `"taps": false`. Such a Ricky may run prefill-decode
+  disaggregation; a Sandy never does.
 
 ### Earlier answers
 
 A Franky request lists the answers Ricky generated in its earlier turns as
-`franky_generated_spans`: `[start, end)` runs of its `input_ids`. Ricky
-recomputes those tokens with the taps their decode read.
+`franky_generated_spans`: `[start, end)` runs of its `input_ids`. The router
+sends Ricky those as `franky_tap_runs` (see [Chains](#chains)): an earlier
+answer's tokens read Sandy's tokens before that answer, the tokens after it
+none, and the new answer all, so Ricky recomputes them with the taps their
+decode read.
 
 - `/generate` and `/v1/completions` clients, and chat clients that send
-  `input_ids` (Miles' session server), send their own spans; the router passes
-  them on unchanged, also in the `/generate` body it lowers a request to.
+  `input_ids` (Miles' session server), send their own spans, also in the
+  `/generate` body the router lowers a request to. Solo engines get them as
+  sent.
 - For a chat that sends only messages, `--franky-chat-adapter` names the
   served model's chat template (`qwen3.5`, `deepseek-v4`, `kimi-k3`). The router
   renders the chat as usual, the adapter finds the earlier answers in the
@@ -489,19 +520,21 @@ router gets `--franky-sandy-tokenizer-path` (Sandy's model files) and
   tokenizer, and finds the earlier answers in both renderings.
 - Sandy gets its own ids as `input_ids`, without the fields below.
 - Ricky gets its own ids, `franky_sandy_input_ids` (Sandy's ids, which key
-  Ricky's cached taps), and for the earlier answers `franky_generated_spans` and `franky_sandy_spans`, the same
-  answers' runs in Sandy's ids, one to one. A Ricky token of an answer reads
-  Sandy's taps before that answer's run.
+  Ricky's cached taps), and tap runs whose taps count Sandy's ids: a Ricky
+  token of an earlier answer reads Sandy's taps before the same answer in
+  Sandy's rendering.
 - `--franky-sandy-keep-every K` (default 1) shortens Sandy's ids: they keep the
   earlier answers whole and, outside them, only every Kth token of Sandy's
   rendering, counted from its start, so a chat's earlier turns keep the same
-  tokens in Sandy's cache. Ricky's `franky_sandy_input_ids` and
-  `franky_sandy_spans` hold the kept tokens.
+  tokens in Sandy's cache. Ricky's `franky_sandy_input_ids` and tap runs
+  count the kept tokens. Chains whose Sandy writes need `K` 1.
 - A chat gets `400` when it sends `input_ids`, when the router leaves it to the
   engine or Sandy's template does not render it, and when the two renderings
   hold different numbers of answers. `/v1/completions` and `/generate` get
-  `400`: the router renders only chats for Sandy. `--franky-block-size` is
-  refused with these flags, since blocks count Ricky's tokens.
+  `400`: the router renders only chats for Sandy.
+- In a chain, Sandy gets its own ids of the trace: its rendering of the chat,
+  its own ids of each Sandy call's text, and its tokens of each Ricky leg's
+  text. The router tokenizes Sandy's text for Ricky with Ricky's tokenizer.
 
 ## Chat rendering
 

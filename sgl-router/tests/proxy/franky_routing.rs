@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Franky routing at the HTTP layer with mock engines: a Ricky worker that reads
-//! taps gets a Sandy, and the Sandy and every Ricky leg carry one `franky_room`.
+//! taps gets a Sandy, the Sandy and every Ricky leg carry one `franky_room`,
+//! and chains run Sandy calls and Ricky legs over one trace.
 
 use crate::common::mock_worker::MockWorker;
 use axum::body::Body;
@@ -13,8 +14,8 @@ use axum::routing::post;
 use axum::Json;
 use serde_json::{json, Value};
 use sgl_router::config::{
-    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    Config, DiscoveryBackend, FrankyChainConfig, InflightLoadConfig, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
@@ -23,9 +24,12 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::{AppContext, ChatRouting};
 use sgl_router::state::kv_events::KvEventIndex;
+use sgl_router::tokenizer::chat_template_adapter::ChatTemplateAdapter;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
+use sglang_processor::openai::OpenAiSettings;
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower::ServiceExt;
@@ -33,7 +37,7 @@ use tower::ServiceExt;
 const SANDY_PORT: u16 = 8996;
 const PREFILL_PORT: u16 = 8997;
 
-fn config(max_attempts: u32, policy: PolicyKind, franky_block_size: Option<u32>) -> Config {
+fn config(max_attempts: u32, policy: PolicyKind, franky_chain: FrankyChainConfig) -> Config {
     Config {
         server: ServerConfig {
             host: "0".into(),
@@ -67,7 +71,7 @@ fn config(max_attempts: u32, policy: PolicyKind, franky_block_size: Option<u32>)
         }),
         proxy: ProxyConfig {
             max_attempts: NonZeroU32::new(max_attempts).unwrap(),
-            franky_block_size: franky_block_size.map(|size| NonZeroU32::new(size).unwrap()),
+            franky_chain,
             ..Default::default()
         },
         router_inflight_load: InflightLoadConfig::default(),
@@ -82,22 +86,48 @@ fn franky_ctx(
     max_attempts: u32,
     reorg: bool,
 ) -> Arc<AppContext> {
-    franky_ctx_with_blocks(ricky, sandy, max_attempts, reorg, None)
+    franky_ctx_with_chain(
+        ricky,
+        sandy,
+        max_attempts,
+        reorg,
+        FrankyChainConfig::default(),
+    )
 }
 
-fn franky_ctx_with_blocks(
+fn franky_ctx_with_chain(
     ricky: &[(&str, &str, WorkerMode)],
     sandy: &[(&str, &str)],
     max_attempts: u32,
     reorg: bool,
-    franky_block_size: Option<u32>,
+    franky_chain: FrankyChainConfig,
+) -> Arc<AppContext> {
+    let sandy_settings = Some(OpenAiSettings::default());
+    franky_ctx_with_sandy_settings(
+        ricky,
+        sandy,
+        max_attempts,
+        reorg,
+        franky_chain,
+        sandy_settings,
+    )
+}
+
+/// `franky_ctx_with_chain` whose Sandy workers report `sandy_settings`.
+fn franky_ctx_with_sandy_settings(
+    ricky: &[(&str, &str, WorkerMode)],
+    sandy: &[(&str, &str)],
+    max_attempts: u32,
+    reorg: bool,
+    franky_chain: FrankyChainConfig,
+    sandy_settings: Option<OpenAiSettings>,
 ) -> Arc<AppContext> {
     let policy = if reorg {
         PolicyKind::PowerOfTwo
     } else {
         PolicyKind::RoundRobin
     };
-    let cfg = config(max_attempts, policy, franky_block_size);
+    let cfg = config(max_attempts, policy, franky_chain);
     let registry = Arc::new(WorkerRegistry::default());
     for (id, url, mode) in ricky {
         let spec = WorkerSpec {
@@ -123,7 +153,11 @@ fn franky_ctx_with_blocks(
             bootstrap_port: Some(SANDY_PORT),
             ..Default::default()
         };
-        registry.add(spec).unwrap();
+        let profile = EngineProfile {
+            openai: sandy_settings.clone().map(Arc::new),
+            ..EngineProfile::from(WireProtocol::default())
+        };
+        registry.add_with_cb(spec, None, profile).unwrap();
     }
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
@@ -182,7 +216,8 @@ fn outcomes(ctx: &AppContext, url: &str, mode: &str) -> Vec<String> {
         .collect()
 }
 
-/// Sandy gets Ricky's own prompt, and both get one room on Sandy's tap port.
+/// Sandy gets Ricky's own prompt as a leg that writes nothing, and both get
+/// one room on Sandy's tap port.
 #[tokio::test]
 async fn a_plain_ricky_and_its_sandy_share_one_room() {
     for reorg in [false, true] {
@@ -204,7 +239,12 @@ async fn a_plain_ricky_and_its_sandy_share_one_room() {
         assert_eq!(room["bootstrap_port"], json!(SANDY_PORT), "reorg={reorg}");
         assert!(room["room"].as_u64().unwrap() <= i64::MAX as u64);
         assert_eq!(&sandy_body["franky_room"], room, "reorg={reorg}");
-        assert_eq!(sandy_body, ricky_body, "reorg={reorg}");
+        assert_eq!(sandy_body["franky_taps_only"], true, "reorg={reorg}");
+        assert_eq!(
+            without(sandy_body, &["franky_taps_only"]),
+            ricky_body,
+            "reorg={reorg}"
+        );
     }
 }
 
@@ -239,7 +279,7 @@ async fn pd_legs_and_their_sandy_share_one_room() {
         );
         let pd_fields = ["bootstrap_host", "bootstrap_port", "bootstrap_room"];
         assert_eq!(
-            sandy_body,
+            without(sandy_body, &["franky_taps_only"]),
             without(prefill_body, &pd_fields),
             "reorg={reorg}"
         );
@@ -341,10 +381,15 @@ async fn a_failed_sandy_is_blamed_and_not_retried() {
     }
 }
 
+/// A mock engine of a Franky chain over a prompt of `prompt_len` tokens. Each
+/// token it writes is its position in the trace. As Ricky it ends a leg for a
+/// Sandy call at the end of every `every_blocks`-th block of the chain and
+/// stops once the answer has `stop_at` tokens; as Sandy it writes what a call
+/// asks and nothing for a tap leg.
 #[derive(Clone, Default)]
-struct BlockEngine {
+struct ChainEngine {
+    prompt_len: usize,
     stop_at: usize,
-    prompt_len: Arc<Mutex<Option<usize>>>,
     requests: Arc<Mutex<Vec<Value>>>,
     request_ids: Arc<Mutex<Vec<Option<String>>>>,
     request_came: Arc<tokio::sync::Notify>,
@@ -352,9 +397,12 @@ struct BlockEngine {
     chain_ended: Arc<tokio::sync::Notify>,
 }
 
-impl BlockEngine {
+const PROMPT: [u64; 3] = [1, 2, 3];
+
+impl ChainEngine {
     async fn start(stop_at: usize) -> (Self, String, Shutdown) {
         let engine = Self {
+            prompt_len: PROMPT.len(),
             stop_at,
             ..Default::default()
         };
@@ -376,6 +424,40 @@ impl BlockEngine {
         (engine, url, shutdown)
     }
 
+    /// How many tokens a request writes after `written` tokens of the answer,
+    /// and why it stops.
+    fn write(&self, request: &Value, written: usize) -> (usize, Value) {
+        if request["franky_taps_only"] == json!(true) {
+            return (0, json!({"type": "length", "length": 0}));
+        }
+        let max_new_tokens = request["sampling_params"]["max_new_tokens"]
+            .as_u64()
+            .map_or(usize::MAX, |max| max as usize);
+        let to_stop = self.stop_at.saturating_sub(written);
+        let count = max_new_tokens.min(to_stop);
+        let chain = &request["franky_chain"];
+        if let Some(block_size) = chain["blocks"]["block_size"].as_u64() {
+            let every_blocks = chain["blocks"]["decider"]["every_blocks"]
+                .as_u64()
+                .unwrap_or(1);
+            let first_block = chain["block"].as_u64().unwrap();
+            let call_block = first_block.next_multiple_of(every_blocks);
+            let call_at = ((call_block - first_block + 1) * block_size) as usize;
+            if call_at < count {
+                let next_block = call_block + 1;
+                return (
+                    call_at,
+                    json!({"type": "franky_sandy_call", "next_block": next_block}),
+                );
+            }
+        }
+        if count == to_stop {
+            (count, json!({"type": "stop", "matched": 0}))
+        } else {
+            (count, json!({"type": "length", "length": count}))
+        }
+    }
+
     async fn generate(
         State(engine): State<Self>,
         headers: HeaderMap,
@@ -388,18 +470,8 @@ impl BlockEngine {
         engine.request_ids.lock().unwrap().push(request_id);
         engine.request_came.notify_one();
         let input = request["input_ids"].as_array().unwrap().len();
-        let prompt = *engine.prompt_len.lock().unwrap().get_or_insert(input);
-        let generated = input - prompt;
-        let max_new_tokens = request["sampling_params"]["max_new_tokens"]
-            .as_u64()
-            .unwrap() as usize;
-        let count = max_new_tokens.min(engine.stop_at.saturating_sub(generated));
+        let (count, finish) = engine.write(&request, input - engine.prompt_len);
         let ids: Vec<usize> = (input..input + count).collect();
-        let finish = if generated + count >= engine.stop_at {
-            json!({"type": "stop", "matched": 0})
-        } else {
-            json!({"type": "length", "length": count})
-        };
         let frame = |ids: &[usize], finish: Value| {
             json!({
                 "text": ids.iter().map(|id| format!("<{id}>")).collect::<String>(),
@@ -439,10 +511,6 @@ impl BlockEngine {
         self.requests.lock().unwrap().clone()
     }
 
-    fn chain_ends(&self) -> Vec<Value> {
-        self.chain_ends.lock().unwrap().clone()
-    }
-
     /// The `x-request-id` of each request, once `count` requests came: a
     /// Sandy's leg may still be on its way when the chain answers.
     async fn wait_for_request_ids(&self, count: usize) -> Vec<Option<String>> {
@@ -458,10 +526,15 @@ impl BlockEngine {
     }
 
     async fn wait_for_chain_end(&self) -> Vec<Value> {
-        tokio::time::timeout(Duration::from_secs(5), self.chain_ended.notified())
+        let ended = async {
+            while self.chain_ends.lock().unwrap().is_empty() {
+                self.chain_ended.notified().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), ended)
             .await
             .expect("the engine got no chain end within 5 seconds");
-        self.chain_ends()
+        self.chain_ends.lock().unwrap().clone()
     }
 }
 
@@ -474,58 +547,111 @@ fn generate(body: Value) -> Request<Body> {
 
 type Shutdown = tokio::sync::oneshot::Sender<()>;
 
-async fn blocks_router(stop_at: usize) -> (Arc<AppContext>, [BlockEngine; 2], [Shutdown; 2]) {
-    let (ricky, ricky_url, ricky_stop) = BlockEngine::start(stop_at).await;
-    let (sandy, sandy_url, sandy_stop) = BlockEngine::start(usize::MAX).await;
-    let ctx = franky_ctx_with_blocks(
+fn blocks(block_size: u64, every_blocks: u64) -> serde_json::Map<String, Value> {
+    let blocks = json!({
+        "block_size": block_size,
+        "decider": {"type": "call_token_or_every_blocks", "every_blocks": every_blocks},
+    });
+    blocks.as_object().unwrap().clone()
+}
+
+fn chain_config(sandy_call_tokens: u32, taps: bool, block_size: u64) -> FrankyChainConfig {
+    FrankyChainConfig {
+        sandy_call_tokens,
+        taps,
+        blocks: Some(blocks(block_size, 1)),
+    }
+}
+
+/// A chain router over one Ricky that stops after `stop_at` tokens of the
+/// answer and one Sandy.
+async fn chain_router(
+    stop_at: usize,
+    chain: FrankyChainConfig,
+) -> (Arc<AppContext>, [ChainEngine; 2], [Shutdown; 2]) {
+    let (ricky, ricky_url, ricky_stop) = ChainEngine::start(stop_at).await;
+    let (sandy, sandy_url, sandy_stop) = ChainEngine::start(usize::MAX).await;
+    let ctx = franky_ctx_with_chain(
         &[("r", &ricky_url, WorkerMode::Plain)],
         &[("s", &sandy_url)],
         1,
         false,
-        Some(4),
+        chain,
     );
     (ctx, [ricky, sandy], [ricky_stop, sandy_stop])
 }
 
+async fn json_answer(response: Response) -> Value {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn streamed_frames(response: Response) -> (Vec<Value>, usize) {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let frames = text
+        .split("\n\n")
+        .filter_map(|event| event.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    (frames, text.matches("[DONE]").count())
+}
+
+fn trace(answer: Range<u64>) -> Value {
+    json!(PROMPT.into_iter().chain(answer).collect::<Vec<_>>())
+}
+
+/// With Sandy writing nothing, each Ricky leg writes a block beside a Sandy
+/// tap leg over the trace, and reads all of its taps.
 #[tokio::test]
-async fn blocks_run_until_ricky_stops_and_answer_once() {
-    let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
-    let body = json!({"input_ids": [1, 2, 3], "sampling_params": {"max_new_tokens": 100}});
+async fn ricky_blocks_read_the_taps_of_a_sandy_leg_over_the_trace() {
+    let (ctx, [ricky, sandy], _stop) = chain_router(10, chain_config(0, true, 4)).await;
+    let body = json!({"input_ids": PROMPT, "sampling_params": {"max_new_tokens": 100}});
 
     let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
 
     assert_eq!(res.status(), StatusCode::OK);
-    let answer: Value = serde_json::from_slice(
-        &axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let answer = json_answer(res).await;
     assert_eq!(answer["output_ids"], json!((3..13).collect::<Vec<_>>()));
     assert_eq!(answer["meta_info"]["completion_tokens"], 10);
     assert_eq!(answer["meta_info"]["prompt_tokens"], 3);
     assert_eq!(answer["meta_info"]["finish_reason"]["type"], "stop");
-    let requests = ricky.requests();
-    assert_eq!(requests.len(), 3);
-    let chain = requests[0]["franky_chain"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    for (block, request) in requests.iter().enumerate() {
-        let context: Vec<u64> = [1, 2, 3]
-            .into_iter()
-            .chain(3..3 + 4 * block as u64)
-            .collect();
-        assert_eq!(request["input_ids"], json!(context));
-        assert_eq!(request["rid"], json!(format!("{chain}-{}", block + 1)));
+    let legs = ricky.requests();
+    assert_eq!(legs.len(), 3);
+    let chain = legs[0]["franky_chain"]["id"].as_str().unwrap().to_string();
+    let mut runs = Vec::new();
+    for (leg, request) in legs.iter().enumerate() {
+        let start = 3 + 4 * leg as u64;
+        runs.push(json!([start, start]));
+        assert_eq!(request["input_ids"], trace(3..start));
+        assert_eq!(request["rid"], json!(format!("{chain}-r{}", leg + 1)));
         assert_eq!(
             request["franky_chain"],
-            json!({"id": chain, "block": block + 1, "block_size": 4, "last_block": false})
+            json!({"id": chain, "block": leg + 1, "blocks": blocks(4, 1)})
         );
-        assert_eq!(request["sampling_params"]["max_new_tokens"], 4);
+        assert_eq!(request["franky_tap_runs"], json!(runs));
+        assert_eq!(
+            request["sampling_params"]["max_new_tokens"],
+            100 - 4 * leg as u64
+        );
     }
-    assert_eq!(sandy.requests().len(), 3);
-    assert_eq!(sandy.requests()[2]["input_ids"], requests[2]["input_ids"]);
+    let tap_legs = sandy.requests();
+    assert_eq!(tap_legs.len(), 3);
+    for (tap_leg, leg) in tap_legs.iter().zip(&legs) {
+        assert_eq!(tap_leg["input_ids"], leg["input_ids"]);
+        assert_eq!(tap_leg["franky_room"], leg["franky_room"]);
+        assert_eq!(tap_leg["franky_taps_only"], true);
+        assert_eq!(
+            tap_leg["franky_chain"],
+            json!({"id": chain, "block": leg["franky_chain"]["block"]})
+        );
+        assert!(tap_leg.get("franky_tap_runs").is_none());
+    }
     for engine in [&ricky, &sandy] {
         assert_eq!(
             engine.wait_for_chain_end().await,
@@ -534,11 +660,231 @@ async fn blocks_run_until_ricky_stops_and_answer_once() {
     }
 }
 
+/// Sandy writes before each leg; the leg reads the room of Sandy's call, whose
+/// taps cover the trace and Sandy's text, from the text's start on.
 #[tokio::test]
-async fn every_block_carries_the_clients_request_id() {
+async fn sandy_writes_before_each_leg_and_the_leg_reads_its_room() {
+    let (ctx, [ricky, sandy], _stop) = chain_router(12, chain_config(2, true, 4)).await;
+    let body = json!({"input_ids": PROMPT, "sampling_params": {"max_new_tokens": 100}});
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = json_answer(res).await;
+    assert_eq!(answer["output_ids"], json!((3..15).collect::<Vec<_>>()));
+    assert_eq!(
+        answer["text"],
+        (3..15).map(|id| format!("<{id}>")).collect::<String>()
+    );
+    assert_eq!(answer["meta_info"]["completion_tokens"], 12);
+    assert_eq!(answer["meta_info"]["prompt_tokens"], 3);
+    assert_eq!(answer["meta_info"]["finish_reason"]["type"], "stop");
+    let calls = sandy.requests();
+    let legs = ricky.requests();
+    assert_eq!((calls.len(), legs.len()), (2, 2));
+    let chain = calls[0]["franky_chain"]["id"].as_str().unwrap().to_string();
+    assert_eq!(calls[0]["input_ids"], trace(3..3));
+    assert_eq!(calls[1]["input_ids"], trace(3..9));
+    assert_eq!(legs[0]["input_ids"], trace(3..5));
+    assert_eq!(legs[1]["input_ids"], trace(3..11));
+    assert_eq!(legs[0]["franky_tap_runs"], json!([[3, 5]]));
+    assert_eq!(legs[1]["franky_tap_runs"], json!([[3, 5], [9, 11]]));
+    for (index, (call, leg)) in calls.iter().zip(&legs).enumerate() {
+        let block = [1, 2][index];
+        assert_eq!(call["rid"], json!(format!("{chain}-s{}", 2 * index + 1)));
+        assert_eq!(leg["rid"], json!(format!("{chain}-r{}", 2 * index + 2)));
+        assert_eq!(call["franky_chain"], json!({"id": chain, "block": block}));
+        assert_eq!(
+            leg["franky_chain"],
+            json!({"id": chain, "block": block, "blocks": blocks(4, 1)})
+        );
+        assert_eq!(call["stream"], false);
+        assert_eq!(call["sampling_params"]["max_new_tokens"], 2);
+        assert!(call.get("franky_tap_runs").is_none());
+        assert!(call["franky_room"]["room"].is_u64());
+        assert_eq!(leg["franky_room"], call["franky_room"]);
+        assert!(leg.get("franky_taps_only").is_none());
+    }
+    assert_ne!(calls[0]["franky_room"], calls[1]["franky_room"]);
+    assert_eq!(legs[0]["sampling_params"]["max_new_tokens"], 98);
+    assert_eq!(legs[1]["sampling_params"]["max_new_tokens"], 92);
+    for engine in [&ricky, &sandy] {
+        assert_eq!(
+            engine.wait_for_chain_end().await,
+            [json!({"chain_id": chain})]
+        );
+    }
+}
+
+/// A served model's template that closes an answer with more than its EOS,
+/// starting at token 98.
+struct ClosingTemplate;
+
+impl ChatTemplateAdapter for ClosingTemplate {
+    fn generated_spans(&self, _input_ids: &[u32]) -> Vec<Range<usize>> {
+        Vec::new()
+    }
+
+    fn text_end(&self) -> Option<u32> {
+        Some(98)
+    }
+}
+
+/// A Sandy that reads the served model's tokens stops where that model's
+/// template starts closing an answer, beside the client's stop tokens.
+#[tokio::test]
+async fn sandy_calls_stop_at_the_text_end_of_their_inputs_template() {
+    let (ctx, [_ricky, sandy], _stop) = chain_router(12, chain_config(2, true, 4)).await;
+    let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+    ctx.franky_chat_adapter = Some(Arc::new(ClosingTemplate));
+    let body = json!({
+        "input_ids": PROMPT,
+        "sampling_params": {"max_new_tokens": 100, "stop_token_ids": [99]},
+    });
+
+    let res = build_router(Arc::new(ctx))
+        .oneshot(generate(body))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let calls = sandy.requests();
+    assert!(!calls.is_empty());
+    for call in calls {
+        assert_eq!(call["sampling_params"]["stop_token_ids"], json!([99, 98]));
+    }
+}
+
+/// The chat lowering writes `return_logprob: false` and `top_logprobs_num: 0`
+/// on every request; a chain where Sandy writes serves them.
+#[tokio::test]
+async fn a_chain_where_sandy_writes_serves_what_the_chat_lowering_writes() {
+    let (ctx, [ricky, sandy], _stop) = chain_router(12, chain_config(2, true, 4)).await;
+    let body = json!({
+        "input_ids": PROMPT,
+        "return_logprob": false,
+        "top_logprobs_num": 0,
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = json_answer(res).await;
+    assert_eq!(answer["output_ids"], json!((3..15).collect::<Vec<_>>()));
+    assert_eq!((sandy.requests().len(), ricky.requests().len()), (2, 2));
+}
+
+/// A Sandy call that writes all that is left of the answer ends it.
+#[tokio::test]
+async fn sandys_text_at_the_answers_limit_ends_the_answer() {
+    let (ctx, [ricky, sandy], _stop) = chain_router(100, chain_config(4, true, 4)).await;
+    let body = json!({"input_ids": PROMPT, "sampling_params": {"max_new_tokens": 3}});
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = json_answer(res).await;
+    assert_eq!(answer["output_ids"], json!([3, 4, 5]));
+    assert_eq!(answer["meta_info"]["finish_reason"]["type"], "length");
+    assert_eq!(answer["meta_info"]["completion_tokens"], 3);
+    assert_eq!(sandy.requests()[0]["sampling_params"]["max_new_tokens"], 3);
+    assert!(ricky.requests().is_empty());
+    sandy.wait_for_chain_end().await;
+}
+
+/// Without taps no request carries a room or tap runs.
+#[tokio::test]
+async fn text_only_chains_send_no_rooms_or_tap_runs() {
+    let (ctx, [ricky, sandy], _stop) = chain_router(12, chain_config(2, false, 4)).await;
+    let body = json!({"input_ids": PROMPT, "sampling_params": {"max_new_tokens": 100}});
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        json_answer(res).await["output_ids"],
+        json!((3..15).collect::<Vec<_>>())
+    );
+    for request in sandy.requests().iter().chain(&ricky.requests()) {
+        for field in ["franky_room", "franky_tap_runs", "franky_taps_only"] {
+            assert!(request.get(field).is_none(), "{field} in {request}");
+        }
+    }
+}
+
+/// A Sandy that does not say how it streams gets unary calls, each one frame
+/// of the client's stream.
+#[tokio::test]
+async fn a_sandy_that_does_not_say_how_it_streams_gets_unary_calls() {
+    let (_ricky, ricky_url, _ricky_stop) = ChainEngine::start(12).await;
+    let (sandy, sandy_url, _sandy_stop) = ChainEngine::start(usize::MAX).await;
+    let ctx = franky_ctx_with_sandy_settings(
+        &[("r", &ricky_url, WorkerMode::Plain)],
+        &[("s", &sandy_url)],
+        1,
+        false,
+        chain_config(2, true, 4),
+        None,
+    );
+    let body = json!({
+        "input_ids": PROMPT,
+        "stream": true,
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    let (frames, done) = streamed_frames(res).await;
+    assert_eq!(done, 1);
+    let lengths: Vec<_> = frames
+        .iter()
+        .map(|frame| frame["output_ids"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(lengths, [2, 3, 4, 5, 6, 8, 9, 10, 11, 12]);
+    assert!(sandy.requests().iter().all(|call| call["stream"] == false));
+}
+
+/// A streamed chain is one stream: Sandy's calls stream too, every frame
+/// carries the answer so far, and only the last one finishes it.
+#[tokio::test]
+async fn a_streamed_chain_with_sandys_text_is_one_stream() {
+    let (ctx, [_ricky, sandy], _stop) = chain_router(12, chain_config(2, true, 4)).await;
+    let body = json!({
+        "input_ids": PROMPT,
+        "stream": true,
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "text/event-stream");
+    let (frames, done) = streamed_frames(res).await;
+    assert_eq!(done, 1);
+    let lengths: Vec<_> = frames
+        .iter()
+        .map(|frame| frame["output_ids"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(lengths, (1..=12).collect::<Vec<_>>());
+    assert!(sandy.requests().iter().all(|call| call["stream"] == true));
+    let last = frames.len() - 1;
+    for frame in &frames[..last] {
+        assert_eq!(frame["meta_info"]["finish_reason"], Value::Null, "{frame}");
+    }
+    assert_eq!(frames[last]["meta_info"]["finish_reason"]["type"], "stop");
+    assert_eq!(frames[last]["meta_info"]["completion_tokens"], 12);
+    assert_eq!(
+        frames[last]["text"],
+        (3..15).map(|id| format!("<{id}>")).collect::<String>()
+    );
+}
+
+#[tokio::test]
+async fn every_request_of_a_chain_carries_the_clients_request_id() {
     for request_id in [Some("client-7"), None] {
-        let (ctx, [ricky, sandy], _stop) = blocks_router(10).await;
-        let body = json!({"input_ids": [1, 2, 3], "sampling_params": {"max_new_tokens": 100}});
+        let (ctx, [ricky, sandy], _stop) = chain_router(10, chain_config(0, true, 4)).await;
+        let body = json!({"input_ids": PROMPT, "sampling_params": {"max_new_tokens": 100}});
 
         let res = build_router(ctx)
             .oneshot(with_request_id(generate(body), request_id))
@@ -553,73 +899,13 @@ async fn every_block_carries_the_clients_request_id() {
 }
 
 #[tokio::test]
-async fn a_chain_at_its_token_limit_marks_its_last_block() {
-    let (ctx, [ricky, _sandy], _stop) = blocks_router(100).await;
-    let body = json!({"input_ids": [1, 2, 3], "sampling_params": {"max_new_tokens": 6}});
-
-    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
-
-    assert_eq!(res.status(), StatusCode::OK);
-    let requests = ricky.requests();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1]["sampling_params"]["max_new_tokens"], 2);
-    assert_eq!(requests[1]["franky_chain"]["last_block"], true);
-    assert!(ricky.chain_ends().is_empty());
-}
-
-#[tokio::test]
-async fn a_streamed_chain_is_one_stream() {
-    let (ctx, [_ricky, _sandy], _stop) = blocks_router(6).await;
-    let body =
-        json!({"input_ids": [1, 2, 3], "stream": true, "sampling_params": {"max_new_tokens": 100}});
-
-    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
-
-    assert_eq!(res.status(), StatusCode::OK);
-    let text = String::from_utf8(
-        axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    let frames: Vec<Value> = text
-        .split("\n\n")
-        .filter_map(|event| event.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .map(|data| serde_json::from_str(data).unwrap())
-        .collect();
-    assert_eq!(text.matches("[DONE]").count(), 1);
-    let lengths: Vec<_> = frames
-        .iter()
-        .map(|frame| frame["output_ids"].as_array().unwrap().len())
-        .collect();
-    assert_eq!(lengths, [1, 2, 3, 4, 5, 6]);
-    let finishes: Vec<_> = frames
-        .iter()
-        .map(|frame| frame["meta_info"]["finish_reason"]["type"].clone())
-        .collect();
-    assert_eq!(
-        finishes[..5],
-        [
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null
-        ]
-    );
-    assert_eq!(finishes[5], "stop");
-    assert_eq!(frames[5]["text"], "<3><4><5><6><7><8>");
-}
-
-#[tokio::test]
-async fn requests_blocks_cannot_serve_are_refused() {
-    let (ctx, [ricky, _sandy], _stop) = blocks_router(10).await;
+async fn requests_chains_cannot_serve_are_refused() {
+    let (ctx, [ricky, sandy], _stop) = chain_router(10, chain_config(2, true, 4)).await;
     for body in [
         json!({"input_ids": [1, 2], "sampling_params": {"max_new_tokens": 8, "n": 2}}),
         json!({"input_ids": [1, 2], "sampling_params": {"max_new_tokens": 8, "regex": "a+"}}),
         json!({"input_ids": [1, 2], "return_hidden_states": true}),
+        json!({"input_ids": [1, 2], "return_logprob": true}),
     ] {
         let res = build_router(Arc::clone(&ctx))
             .oneshot(generate(body.clone()))
@@ -633,4 +919,56 @@ async fn requests_blocks_cannot_serve_are_refused() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     assert!(ricky.requests().is_empty());
+    assert!(sandy.requests().is_empty());
+}
+
+/// A leg that reads a Sandy call's room gets one attempt: the room sends its
+/// taps once.
+#[tokio::test]
+async fn a_leg_reading_a_sandy_calls_room_is_not_retried() {
+    let ricky = MockWorker::start_returning_error(StatusCode::BAD_GATEWAY, json!({})).await;
+    let other_ricky = MockWorker::start_returning_error(StatusCode::BAD_GATEWAY, json!({})).await;
+    let (sandy, sandy_url, _sandy_stop) = ChainEngine::start(usize::MAX).await;
+    let ctx = franky_ctx_with_chain(
+        &[
+            ("r", &ricky.url, WorkerMode::Plain),
+            ("r2", &other_ricky.url, WorkerMode::Plain),
+        ],
+        &[("s", &sandy_url)],
+        2,
+        false,
+        chain_config(2, true, 4),
+    );
+    let body = json!({"input_ids": PROMPT, "sampling_params": {"max_new_tokens": 100}});
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(sandy.requests().len(), 1);
+    let tried = [&ricky, &other_ricky]
+        .iter()
+        .filter(|worker| worker.captured.lock().unwrap().last_body.is_some())
+        .count();
+    assert_eq!(tried, 1);
+}
+
+/// A Ricky that answers 502 got no taps: its retry goes to another Sandy.
+#[tokio::test]
+async fn a_ricky_without_its_taps_blames_the_sandy() {
+    let ricky = MockWorker::start_returning_error(StatusCode::BAD_GATEWAY, json!({})).await;
+    let sandy = MockWorker::start(vec![]).await;
+    let other_sandy = MockWorker::start(vec![]).await;
+    let ctx = franky_ctx(
+        &[("r", &ricky.url, WorkerMode::Plain)],
+        &[("s", &sandy.url), ("s2", &other_sandy.url)],
+        2,
+        true,
+    );
+
+    let res = build_router(ctx).oneshot(chat()).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    for worker in [&sandy, &other_sandy] {
+        worker.captured_json().await;
+    }
 }

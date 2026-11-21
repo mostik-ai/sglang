@@ -124,11 +124,13 @@ router's default 180 s stream idle timeout cuts requests that are only slow; the
 aborts then count against the decode worker and open its breaker for every request.
 Keep `--stream-idle-timeout-secs` at the request timeout.
 
-Blocks: with `--franky-block-size 256` the router runs each answer as blocks of
-256 generated tokens, so its later tokens read the taps of its earlier blocks.
-Each block sends Sandy its own rendering of the chat plus its own tokens of the
-answer so far, tokenized block by block, and tells Ricky where each block starts
-in Sandy's tokens. Sandy's cache keeps each block's prompt, so a block costs Sandy
+Blocks: with `--franky-chain '{"blocks": {"block_size": 256}}'` the router runs
+each answer as a chain of Ricky legs of one 256-token block each, so its later
+tokens read the taps of its earlier blocks; `sandy_call_tokens` above 0 makes
+Sandy write part of the answer before each leg (see the router's REFERENCE.md,
+Chains). Each leg sends Sandy its own rendering of the chat plus its own tokens of
+the answer so far, tokenized leg by leg, and gives Ricky tap runs that count
+Sandy's tokens. Sandy's cache keeps each block's prompt, so a block costs Sandy
 only its new text. Between blocks Ricky prefill keeps the chain's prefix and tap
 pages, and decode its tap pages, so Sandy sends a block only the taps past the
 last block's whole pages and prefill relays decode only those; decode still

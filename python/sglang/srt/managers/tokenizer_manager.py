@@ -69,6 +69,7 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.franky.config import FrankyTapRole
 from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
@@ -1588,7 +1589,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             franky = FrankyRequest.of_input(
                 obj,
                 prompt_len=len(input_ids_arr or ()),
-                on_sandy=get_franky().franky_side == "sandy",
+                tap_role=FrankyTapRole.of_running_engine(),
             )
 
             tokenized_obj = self.tokenized_generate_req_type(

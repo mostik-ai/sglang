@@ -9,7 +9,6 @@ import torch
 from sglang.srt.franky.cache.ricky_tap_cache import TapReservation
 from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.franky.ricky_taps.tap_progress import TapProgress
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -48,8 +47,8 @@ class RickyTapRequests:
     may release other chains' holds for room. When it joins a batch its tokens
     are set for the readers and its chain's hold may go. At its end a request
     whose taps all landed leaves its whole stripes in the prefix tree, held for
-    its chain's next block when it is a block that ended at its length; a request
-    aborted before that ends its chain's hold. Every rank decides at the same
+    its chain's next request; a request aborted before that ends its chain's
+    hold. Every rank decides at the same
     steps, so stripe pages stay the same on every rank.
 
     Where the engine has a mamba state pool, the chains' holds stay within its
@@ -115,7 +114,7 @@ class RickyTapRequests:
         req.franky_taps = TapProgress(
             tap_len=len(sandy_tokens),
             taps_ready=0,
-            spans=request.spans(num_input_tokens=len(req.origin_input_ids)),
+            tap_runs=request.tap_runs,
         )
         self._waiting[req.rid] = _Waiting(req=req, sandy_tokens=sandy_tokens)
         return None
@@ -159,8 +158,8 @@ class RickyTapRequests:
         self._request_table.bind(
             req_pool_indices=[req.kv.req_pool_idx for req in reqs],
             pages=pages,
-            spans=[
-                None if req.franky_taps is None else req.franky_taps.spans
+            tap_runs=[
+                None if req.franky_taps is None else req.franky_taps.tap_runs
                 for req in reqs
             ],
             num_input_tokens=[len(req.origin_input_ids) for req in reqs],
@@ -179,12 +178,9 @@ class RickyTapRequests:
             self._tap_cache.drop(reservation)
             self._chain_holds.release_chain_of(req)
             return
-        lock = self._tap_cache.cache(reservation)
-        if isinstance(req.finished_reason, FINISH_LENGTH):
-            self._chain_holds.hold_for_next_block(req, tap_lock=lock)
-            return
-        self._tap_cache.release(lock)
-        self._chain_holds.release_chain_of(req)
+        self._chain_holds.hold_for_next_request(
+            req, tap_lock=self._tap_cache.cache(reservation)
+        )
 
     def forget(self, req: Req) -> None:
         """A request ended before it reserved anything, or was aborted while its

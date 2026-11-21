@@ -960,13 +960,14 @@ async fn service_membership_updates_preserve_live_worker_state() {
 }
 
 /// A Sandy joins the router's model under its tap port, whatever model it serves,
-/// and a Franky Ricky is marked as reading taps.
+/// and a Ricky with a Franky config is marked as reading taps.
 #[tokio::test]
 async fn manager_registers_a_franky_pair_from_introspection() {
     let (sandy_url, _sandy) = spawn_fake_worker(json!({
         "served_model_name": "big",
         "disaggregation_mode": "null",
         "franky_side": "sandy",
+        "franky_config": "/pair.json",
         "franky_bootstrap_port": 8996,
     }))
     .await;
@@ -974,6 +975,7 @@ async fn manager_registers_a_franky_pair_from_introspection() {
         "served_model_name": "m",
         "disaggregation_mode": "null",
         "franky_side": "ricky",
+        "franky_config": "/pair.json",
         "franky_bootstrap_port": 8996,
     }))
     .await;

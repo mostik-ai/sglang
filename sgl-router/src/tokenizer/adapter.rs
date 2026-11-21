@@ -4,8 +4,8 @@
 use anyhow::{Context, Result};
 use dynamo_tokenizers::{
     create_tokenizer_from_file, create_tokenizer_from_file_with_options, traits,
-    traits::DecodeResult, CacheTokenUsage, CachedTokenizer, FastTokenizer, Tokenizer,
-    TokenizerOptions,
+    traits::DecodeResult, CacheTokenUsage, CachedTokenizer, EncodeSegment, FastTokenizer,
+    Tokenizer, TokenizerOptions,
 };
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -488,6 +488,27 @@ pub fn encode(t: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     Ok(enc.token_ids().to_vec())
 }
 
+/// The tokens of plain text inside an answer the model already holds the start
+/// of, as the model's chat rendering on `backend` encodes an answer's text. A
+/// backend with segmented encoding keeps special-token spellings in the text as
+/// text; Hugging Face's has none, so there they read as special tokens, as in
+/// its chat rendering and in the engine's own tokenizer.
+///
+/// Errors: the tokenizer fails on the text.
+pub fn encode_answer_text(
+    tokenizer: &Tokenizer,
+    backend: EncodeBackend,
+    text: &str,
+) -> Result<Vec<u32>> {
+    let segment = [EncodeSegment::new(text, false)];
+    match backend {
+        // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
+        EncodeBackend::Tiktoken => super::kimi::encode(tokenizer, &segment),
+        EncodeBackend::Fast => Ok(tokenizer.encode_segments(&segment)?.token_ids().to_vec()),
+        EncodeBackend::Hf | EncodeBackend::FastFallbackHf => encode(tokenizer, text),
+    }
+}
+
 /// Decode token ids to a complete UTF-8 string.
 ///
 /// Non-streaming callers (e.g. `/v1/detokenize`) get the full result either way:
@@ -674,6 +695,38 @@ mod prompt_affix_tests {
             (affixes.apply(&[7]), affixes.apply(&[7, 1])),
             (vec![7, 1], vec![7, 1])
         );
+    }
+}
+
+#[cfg(test)]
+mod answer_text_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// Hugging Face's backend has no segmented encoding; the answer's text still
+    /// encodes there, as plain text does.
+    #[test]
+    fn answer_text_encodes_on_both_tokenizer_json_backends() {
+        let mut data: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/tiny_tokenizer.json")).unwrap();
+        data["model"]["type"] = json!("BPE");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, data.to_string()).unwrap();
+        let path = path.to_str().unwrap();
+        let text = "a plain answer";
+        for backend in [TokenizerBackend::Hf, TokenizerBackend::Fast] {
+            let config = TokenizerConfig {
+                backend,
+                l1_cache_mb: 0,
+            };
+            let (tokenizer, stats) = load_with(path, config).unwrap();
+            assert_eq!(
+                encode_answer_text(&tokenizer, stats.backend(), text).unwrap(),
+                encode(&tokenizer, text).unwrap(),
+                "{backend:?}"
+            );
+        }
     }
 }
 

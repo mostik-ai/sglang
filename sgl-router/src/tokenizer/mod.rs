@@ -244,6 +244,17 @@ impl TokenizerRegistry {
         (!ids.is_empty()).then(|| affixes.apply(&ids))
     }
 
+    /// The model's tokens of `text` inside an answer it already holds the start
+    /// of, as `adapter::encode_answer_text` encodes it on this model's backend.
+    ///
+    /// Errors: the model's tokenizer is not loaded, or fails on the text.
+    pub fn encode_answer_text(&self, model_id: &str, text: &str) -> Result<Vec<u32>> {
+        let tokenizer = self
+            .get(model_id)
+            .ok_or_else(|| anyhow::anyhow!("model {model_id}'s tokenizer is not loaded"))?;
+        adapter::encode_answer_text(&tokenizer, self.stats.backend(), text)
+    }
+
     /// Whether this model has a chat formatter (and thus the chat-aware
     /// tokenization path is available for it).
     pub fn has_chat_formatter(&self, model_id: &str) -> bool {

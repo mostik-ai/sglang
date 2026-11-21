@@ -15,6 +15,13 @@ use std::sync::Arc;
 pub trait ChatTemplateAdapter: Send + Sync {
     /// `[start, end)` runs of `input_ids` that the model generated.
     fn generated_spans(&self, input_ids: &[u32]) -> Vec<Range<usize>>;
+
+    /// The token a model writes where its answer's text ends and the template
+    /// starts closing the answer before the model's EOS; `None` for a template
+    /// whose answer's text ends at the EOS.
+    fn text_end(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// The adapter of the chat template `kind`, with its marker tokens looked up in `tokenizer`.

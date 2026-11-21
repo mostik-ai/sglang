@@ -330,35 +330,16 @@ class TestSandyParts(_Files):
 
 
 class TestAttach(_Files):
-    def test_sandy_drops_a_separate_head_and_keeps_a_tied_one(self):
-        """Attention DP slices the logits after the forward, so they have rows."""
-        config_path, weights_path, _ = self._write(encoder_type="singular", layers=[3])
-        separate, tied = _Model(), _Model(tied=True)
-
-        for model in (separate, tied):
-            self._attach(
-                model=model, config_path=config_path, weights_path=weights_path
-            )
-            hidden_states = torch.zeros(_NUM_TOKENS, _HIDDEN_SIZE)
-            output = model.logits_processor(None, hidden_states, model.lm_head, None)
-            self.assertEqual(output.next_token_logits[:2].shape, (2, 0))
-
-        self.assertIsNone(separate.lm_head)
-        self.assertIs(tied.lm_head, tied.model.embed_tokens)
-
-    def test_sandy_drops_the_head_of_the_causal_lm_a_vision_model_wraps(self):
-        """Kimi K3's vision model runs its causal LM, which keeps its own head."""
+    def test_sandy_keeps_its_head_since_it_writes_tokens(self):
         config_path, weights_path, _ = self._write(encoder_type="singular", layers=[3])
         model = _VisionModel()
+        causal_lm = model.language_model
+        head, logits_processor = causal_lm.lm_head, causal_lm.logits_processor
 
         self._attach(model=model, config_path=config_path, weights_path=weights_path)
 
-        causal_lm = model.language_model
-        self.assertIsNone(causal_lm.lm_head)
-        output = causal_lm.logits_processor(
-            None, torch.zeros(_NUM_TOKENS, _HIDDEN_SIZE), causal_lm.lm_head, None
-        )
-        self.assertEqual(output.next_token_logits.shape, (_NUM_TOKENS, 0))
+        self.assertIs(causal_lm.lm_head, head)
+        self.assertIs(causal_lm.logits_processor, logits_processor)
 
     def test_an_injector_for_another_residual_form_is_refused(self):
         config_path, weights_path, _ = self._write(

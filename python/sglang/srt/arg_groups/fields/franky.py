@@ -19,18 +19,22 @@ class Franky(msgspec.Struct):
 
     franky_side: A[
         Literal["null", "sandy", "ricky"],
-        "Side of a Franky model pair. 'sandy' is an engine regime that runs the "
-        "frozen model and its encoders on input tokens only. 'ricky' runs the "
-        "model with readers, with or without PD disaggregation. 'null' disables "
-        "Franky.",
+        "Side of a Franky model pair. 'sandy' runs the frozen model: it writes "
+        "what a chain asks and, with --franky-config, sends the taps of every "
+        "token it ran. 'ricky' runs the model that writes the chain's blocks and, "
+        "with --franky-config, reads the taps, with or without PD "
+        "disaggregation. Without --franky-config the sides only write text. "
+        "'null' disables Franky.",
     ] = "null"
     franky_config: A[
         Optional[str],
-        "Path to the Franky config JSON. Use the same file on both sides.",
+        "Path to the Franky config JSON of the pair's encoders and readers. Use "
+        "the same file on both sides; omit it on both for text-only chains.",
     ] = None
     franky_weights: A[
         Optional[str],
-        "Path to this side's Franky weights: encoders on sandy, readers on ricky.",
+        "Path to this side's Franky weights: encoders on sandy, readers on ricky; "
+        "given with --franky-config.",
     ] = None
     franky_bootstrap_port: A[
         int,
@@ -41,10 +45,11 @@ class Franky(msgspec.Struct):
     franky_chain_hold_seconds: A[
         float,
         "How long a sandy or ricky engine keeps a chain's cached prefix locked "
-        "after one of its blocks, waiting for the next block; a ricky whose sandy "
-        "tokenizes on its own also keeps the block's tap pages. A held chain is in "
-        "flight: other requests wait rather than take its memory. Sandy's must "
-        "outlast a block's decode on ricky. Default is 60.",
+        "after one of the chain's requests, waiting for the next one, unless the "
+        "router ends the chain first; a ricky that reads taps also keeps their "
+        "pages. A held chain is in flight: other requests wait rather than take "
+        "its memory. Sandy's must outlast ricky's blocks between two Sandy calls. "
+        "Default is 60.",
     ] = 60.0
     franky_tap_pool_ratio: A[
         float,

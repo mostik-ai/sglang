@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.franky.finish_rules.finish_rule import FinishRule
     from sglang.srt.franky.request import FrankyRequest
     from sglang.srt.franky.ricky_taps.tap_progress import TapProgress
     from sglang.srt.layers.engram_staging import StagedRows
@@ -1412,9 +1413,11 @@ class Req(ReqDllmMixin):
         # that forward's output is dropped and the request finishes with it.
         self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
-        # Franky: what the request asks of it, and on Ricky its taps' progress.
+        # Franky: what the request asks of it, on Ricky its taps' progress, and
+        # its own rule for where the output ends.
         self.franky: Optional[FrankyRequest] = franky
         self.franky_taps: Optional[TapProgress] = None
+        self.franky_finish_rule: Optional[FinishRule] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
@@ -2013,7 +2016,13 @@ class Req(ReqDllmMixin):
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
             return
+        self._update_own_finish_state(new_accepted_len)
+        if self.franky_finish_rule is not None:
+            self.franky_finish_rule.after_checks(
+                self, self.output_ids[len(self.output_ids) - new_accepted_len :]
+            )
 
+    def _update_own_finish_state(self, new_accepted_len: int):
         if self.to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None

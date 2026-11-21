@@ -4,9 +4,10 @@
 use super::adapter;
 use super::chat_formatter::ChatFormatter;
 use super::chat_template_adapter::{self, ChatTemplateAdapter};
+use super::stats::EncodeBackend;
 use crate::config::{FrankySandyConfig, TokenizerConfig};
 use anyhow::{Context, Result};
-use dynamo_tokenizers::{EncodeSegment, Tokenizer};
+use dynamo_tokenizers::Tokenizer;
 use serde_json::Value;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 /// the markers of its earlier answers, kept apart from the served model's.
 pub struct FrankySandyTokens {
     tokenizer: Arc<Tokenizer>,
+    backend: EncodeBackend,
     formatter: ChatFormatter,
     adapter: Arc<dyn ChatTemplateAdapter>,
     keep_every: NonZeroUsize,
@@ -64,7 +66,7 @@ impl FrankySandyTokens {
     /// template the router renders, or the tokenizer lacks the template's markers.
     pub fn load(config: &FrankySandyConfig, tokenizer_config: TokenizerConfig) -> Result<Self> {
         let path = &config.tokenizer_path;
-        let (tokenizer, _) = adapter::load_with(path, tokenizer_config)
+        let (tokenizer, stats) = adapter::load_with(path, tokenizer_config)
             .with_context(|| format!("load Sandy's tokenizer from {path}"))?;
         let formatter = ChatFormatter::load_from(path, &adapter::ModelFiles::open(path))?
             .with_context(|| {
@@ -74,26 +76,23 @@ impl FrankySandyTokens {
             .context("build --franky-sandy-chat-adapter")?;
         Ok(Self {
             tokenizer,
+            backend: stats.backend(),
             formatter,
             adapter,
             keep_every: config.keep_every,
         })
     }
 
-    /// Sandy's tokens of `text` inside an answer it already holds the start of:
-    /// plain text, which cannot name special tokens.
+    /// Sandy's tokens of `text` inside an answer it already holds the start of,
+    /// as `adapter::encode_answer_text` encodes it on Sandy's backend.
     ///
     /// Errors: the tokenizer fails.
     pub fn encode_answer_text(&self, text: &str) -> Result<Vec<u32>> {
-        let segment = [EncodeSegment::new(text, false)];
-        if self.formatter.is_kimi_k3() {
-            return super::kimi::encode(&self.tokenizer, &segment);
-        }
-        Ok(self
-            .tokenizer
-            .encode_segments(&segment)?
-            .token_ids()
-            .to_vec())
+        adapter::encode_answer_text(&self.tokenizer, self.backend, text)
+    }
+
+    pub fn text_end(&self) -> Option<u32> {
+        self.adapter.text_end()
     }
 
     /// Errors: Sandy's template does not render `chat`.

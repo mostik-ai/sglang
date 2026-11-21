@@ -297,13 +297,15 @@ class GenerateReqInput:
     # Franky: where the request's taps meet, as {"bootstrap_host", "bootstrap_port",
     # "room"}. One room for a batch gives each request the next room.
     franky_room: Optional[Union[List[Optional[Dict[str, Any]]], Dict[str, Any]]] = None
-    # Franky: the chain this request is a block of, as FrankyChain's fields.
+    # Franky: the chain this request is part of, as FrankyChain's fields.
     franky_chain: Optional[Dict[str, Any]] = None
-    franky_generated_spans: Optional[List[List[int]]] = None
-    # Franky with a Sandy that tokenizes on its own: Sandy's token ids of the
-    # input, and the runs of franky_generated_spans' answers in Sandy's tokens.
+    # Franky on Ricky: which taps the forward making each token reads, as
+    # [start, taps] runs; without them the answer after the input reads all.
+    franky_tap_runs: Optional[List[List[int]]] = None
+    # Franky on Sandy: run the prompt for its taps only and write nothing.
+    franky_taps_only: bool = False
+    # Franky with a Sandy that tokenizes on its own: Sandy's token ids of the input.
     franky_sandy_input_ids: Optional[List[int]] = None
-    franky_sandy_spans: Optional[List[List[int]]] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -969,8 +971,8 @@ class GenerateReqInput:
 
         if self.franky_chain is not None:
             raise ValueError("franky_chain takes a single request with n=1.")
-        if self.franky_generated_spans is not None:
-            raise ValueError("franky_generated_spans takes a single request with n=1.")
+        if self.franky_tap_runs is not None:
+            raise ValueError("franky_tap_runs takes a single request with n=1.")
         if self.franky_sandy_input_ids is not None:
             raise ValueError("franky_sandy_input_ids takes a single request with n=1.")
 

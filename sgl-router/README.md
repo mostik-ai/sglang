@@ -300,8 +300,9 @@ native gRPC port, so engines must run with `--grpc-port` too. See
 
 A Ricky engine's requests also go to a Sandy engine, which sends Ricky the
 prompt's taps; Sandy is picked by `--policy`, cache-aware by its own prefix.
-`--franky-block-size` runs each request as blocks, so generated tokens read
-their own taps in the next block. `--franky-chat-adapter` marks the earlier
+`--franky-chain` runs each request as a chain: Sandy calls write part of the
+answer and send their taps, and Ricky legs write blocks until Ricky's engine
+calls Sandy again. `--franky-chat-adapter` marks the earlier
 answers in the chats the router renders; `--franky-sandy-tokenizer-path` and
 `--franky-sandy-chat-adapter` render them for a Sandy with its own tokenizer.
 See [Franky pairs](REFERENCE.md#franky-pairs).

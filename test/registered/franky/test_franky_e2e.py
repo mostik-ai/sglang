@@ -2,9 +2,11 @@
 server, and Ricky's readers read them, chunk by chunk as they land. Ricky's
 greedy logprobs must match HF transformers running Sandy's model with the
 encoders and Ricky's model with the readers; without the readers they must not.
-With TP 2 on both sides, every attention-TP rank keeps its stripe of the taps,
-each Sandy rank sends its pages to the Ricky ranks that keep them, and Ricky's
-ranks merge their readers' attention.
+A Sandy that writes part of the answer sends the taps of its own tokens too,
+which Ricky reads as its tap runs say. With TP 2 on both sides, every
+attention-TP rank keeps its stripe of the taps, each Sandy rank sends its pages
+to the Ricky ranks that keep them, and Ricky's ranks merge their readers'
+attention.
 """
 
 import json
@@ -38,6 +40,8 @@ _TAP_SIZE = 256
 _MLP_SIZE = 256
 _PAGE_SIZE = 16
 _NEW_TOKENS = 8
+# Tokens a Sandy call writes, more than a tap page so its taps span pages.
+_WRITTEN = 24
 # Sandy's own tokens keep every 4th of Ricky's, as the router's
 # --franky-sandy-keep-every 4 sends them.
 _SANDY_KEEP_EVERY = 4
@@ -45,6 +49,20 @@ _TEXT = (
     "The river ran through the old town, past the mill and the bakery, under the "
     "stone bridge where children threw pebbles into the water every evening. "
 )
+
+
+_HANDED_OUT_PORTS: set[int] = set()
+
+
+def _free_port(base: int) -> int:
+    """A free port that no earlier draw in this file handed out. An SGLang
+    server binds its HTTP port with SO_REUSEPORT, so two servers that drew one
+    port would share it without an error."""
+    while True:
+        port = find_available_port(base)
+        if port not in _HANDED_OUT_PORTS:
+            _HANDED_OUT_PORTS.add(port)
+            return port
 
 
 def _hf_model():
@@ -59,13 +77,20 @@ def _layer_output(output):
     return output[0] if isinstance(output, tuple) else output
 
 
-def _taps_to_read(token, *, generation_start, block_size):
-    if token < generation_start:
-        return 0
-    if block_size is None:
-        return generation_start
-    blocks = (token - generation_start) // block_size
-    return generation_start + blocks * block_size
+def _taps_read_by(token, runs):
+    """The taps the forward that makes ``token`` reads, as ``franky_tap_runs``
+    say: those of the last run that starts at or before it."""
+    taps = 0
+    for start, run_taps in runs:
+        if start <= token:
+            taps = run_taps
+    return taps
+
+
+def _block_runs(prompt_len, block_size, num_blocks):
+    """The tap runs of a chain's leg after ``num_blocks - 1`` blocks, with Sandy
+    writing nothing: each block reads the taps of all before it."""
+    return [[prompt_len + block * block_size] * 2 for block in range(num_blocks)]
 
 
 def _reader(weights, index, layer_output, taps, num_taps):
@@ -107,9 +132,9 @@ class _FrankyPair(CustomTestCase):
     def setUpClass(cls):
         cls.directory = tempfile.mkdtemp(prefix="franky_e2e_")
         cls.sandy_weights, cls.ricky_weights = cls._write_files()
-        cls.bootstrap_port = find_available_port(18996)
-        cls.sandy_url = f"http://127.0.0.1:{find_available_port(31200)}"
-        cls.ricky_url = f"http://127.0.0.1:{find_available_port(31300)}"
+        cls.bootstrap_port = _free_port(18996)
+        cls.sandy_url = f"http://127.0.0.1:{_free_port(31200)}"
+        cls.ricky_url = f"http://127.0.0.1:{_free_port(31300)}"
         cls.processes = cls._servers()
 
     @classmethod
@@ -243,12 +268,16 @@ class _FrankyPair(CustomTestCase):
         pairs = answers[self.ricky_url]["meta_info"]["output_token_logprobs"]
         return [pair[1] for pair in pairs], torch.tensor([pair[0] for pair in pairs])
 
-    def _send(self, ids, room, ricky_sampling=None, ricky_fields=None, **block):
-        franky_room = {
+    def _room(self, room):
+        return {
             "bootstrap_host": "127.0.0.1",
             "bootstrap_port": self.bootstrap_port,
             "room": room,
         }
+
+    def _send(self, ids, room, ricky_sampling=None, ricky_fields=None, chain=None):
+        """Ricky's request beside a Sandy leg that sends the taps of ``ids``.
+        ``chain``: the chain's id and block, and Ricky's blocks."""
         answers = {}
 
         def post(url, input_ids, sampling_params, fields):
@@ -258,17 +287,22 @@ class _FrankyPair(CustomTestCase):
                     "input_ids": input_ids,
                     "sampling_params": sampling_params,
                     "return_logprob": True,
-                    "franky_room": franky_room,
-                    **block,
+                    "franky_room": self._room(room),
                     **fields,
                 },
                 timeout=600,
             ).json()
 
         ricky_fields = {**self._sandy_fields(ids), **(ricky_fields or {})}
+        sandy_fields = {"franky_taps_only": True}
+        if chain is not None:
+            rid = f"{chain['id']}-{chain['block']}"
+            ricky_fields.update(rid=rid, franky_chain=chain)
+            sandy_chain = {key: chain[key] for key in ("id", "block")}
+            sandy_fields.update(rid=rid, franky_chain=sandy_chain)
         threads = [
             threading.Thread(target=post, args=(self.ricky_url, ids, ricky_sampling or {"temperature": 0, "max_new_tokens": _NEW_TOKENS}, ricky_fields)),
-            threading.Thread(target=post, args=(self.sandy_url, self._sandy_ids(ids), {"max_new_tokens": 1}, {})),
+            threading.Thread(target=post, args=(self.sandy_url, self._sandy_ids(ids), {}, sandy_fields)),
         ]  # fmt: skip
         for thread in threads:
             thread.start()
@@ -276,10 +310,10 @@ class _FrankyPair(CustomTestCase):
             thread.join()
         return answers
 
-    def _reference(self, prompts, outputs, generation_start=None, block_size=None):
-        """HF logprobs of Ricky's tokens, with the readers and without them. For a
-        chain's later block, ``generation_start`` and ``block_size`` place its
-        earlier blocks in the prompt."""
+    def _reference(self, prompts, outputs, runs=None):
+        """HF logprobs of Ricky's tokens, with the readers and without them.
+        ``runs``: per prompt, the tap runs Ricky read; by default its answer
+        reads all of the prompt's taps."""
         model, language_model = _hf_model()
         weights = {name: tensor.cuda() for name, tensor in self.sandy_weights.items()}
         weights.update(
@@ -306,17 +340,13 @@ class _FrankyPair(CustomTestCase):
             language_model.layers[layer - 1].register_forward_hook(hook)
         results = []
         with torch.no_grad():
-            for ids, (tokens, _) in zip(prompts, outputs):
+            for index, (ids, (tokens, _)) in enumerate(zip(prompts, outputs)):
                 sandy_ids = self._sandy_ids(ids)
+                prompt_runs = (
+                    runs[index] if runs is not None else [[len(ids), len(sandy_ids)]]
+                )
                 num_taps = [
-                    min(
-                        _taps_to_read(
-                            row + 1,
-                            generation_start=generation_start or len(ids),
-                            block_size=block_size,
-                        ),
-                        len(sandy_ids),
-                    )
+                    _taps_read_by(row + 1, prompt_runs)
                     for row in range(len(ids) + len(tokens) - 1)
                 ]
                 state.update(
@@ -350,25 +380,27 @@ class TestFrankyEndToEnd(_FrankyPair):
     def test_a_chains_next_block_reuses_its_held_prompt_and_reads_new_taps(self):
         prompt = AutoTokenizer.from_pretrained(_MODEL).encode(_TEXT * 6)
         chain = "chain4200"
+        blocks = {"block_size": _NEW_TOKENS}
+        sampling = {"temperature": 0, "max_new_tokens": 4 * _NEW_TOKENS}
         first = self._send(
             prompt,
             4200,
-            rid=f"{chain}-1",
-            franky_chain={"id": chain, "block_size": _NEW_TOKENS, "last_block": False},
+            ricky_sampling=sampling,
+            chain={"id": chain, "block": 1, "blocks": blocks},
+        )
+        self.assertEqual(
+            first[self.ricky_url]["meta_info"]["finish_reason"],
+            {"type": "franky_sandy_call", "next_block": 2},
         )
         pairs = first[self.ricky_url]["meta_info"]["output_token_logprobs"]
         self.assertEqual(len(pairs), _NEW_TOKENS)
         context = prompt + [pair[1] for pair in pairs]
+        runs = _block_runs(len(prompt), _NEW_TOKENS, 2)
         second = self._send(
             context,
             4201,
-            rid=f"{chain}-2",
-            franky_chain={
-                "id": chain,
-                "block": 2,
-                "block_size": _NEW_TOKENS,
-                "last_block": True,
-            },
+            ricky_fields={"franky_tap_runs": runs},
+            chain={"id": chain, "block": 2, "blocks": blocks},
         )
 
         whole_chunks = len(prompt) - len(prompt) % _STATE_CHUNK
@@ -379,12 +411,7 @@ class TestFrankyEndToEnd(_FrankyPair):
         pairs = second[self.ricky_url]["meta_info"]["output_token_logprobs"]
         tokens = [pair[1] for pair in pairs]
         logprobs = torch.tensor([pair[0] for pair in pairs])
-        [ref] = self._reference(
-            [context],
-            [(tokens, logprobs)],
-            generation_start=len(prompt),
-            block_size=_NEW_TOKENS,
-        )
+        [ref] = self._reference([context], [(tokens, logprobs)], runs=[runs])
         self.assertLess((logprobs - ref["readers"]).abs().max().item(), 0.2)
         for url in (self.sandy_url, self.ricky_url):
             ended = requests.post(
@@ -399,12 +426,12 @@ class TestFrankyEndToEnd(_FrankyPair):
         block_size = 48
         sampling = {"temperature": 0, "max_new_tokens": block_size, "ignore_eos": True}
         chain = "chain4300"
+        blocks = {"block_size": block_size}
         first = self._send(
             prompt,
             4300,
             ricky_sampling=sampling,
-            rid=f"{chain}-1",
-            franky_chain={"id": chain, "block_size": block_size, "last_block": False},
+            chain={"id": chain, "block": 1, "blocks": blocks},
         )
         decoded = first[self.ricky_url]["meta_info"]["output_token_logprobs"]
         self.assertEqual(len(decoded), block_size)
@@ -412,14 +439,11 @@ class TestFrankyEndToEnd(_FrankyPair):
             prompt + [pair[1] for pair in decoded],
             4301,
             ricky_sampling=sampling,
-            ricky_fields={"logprob_start_len": len(prompt) - 1},
-            rid=f"{chain}-2",
-            franky_chain={
-                "id": chain,
-                "block": 2,
-                "block_size": block_size,
-                "last_block": True,
+            ricky_fields={
+                "logprob_start_len": len(prompt) - 1,
+                "franky_tap_runs": _block_runs(len(prompt), block_size, 2),
             },
+            chain={"id": chain, "block": 2, "blocks": blocks},
         )
 
         recomputed = second[self.ricky_url]["meta_info"]["input_token_logprobs"]
@@ -436,6 +460,64 @@ class TestFrankyEndToEnd(_FrankyPair):
         # average, some past 0.3.
         self.assertLess(gap.mean().item(), 0.03, gap.tolist())
         self.assertLess(gap.max().item(), 0.2, gap.tolist())
+        for url in (self.sandy_url, self.ricky_url):
+            requests.post(
+                f"{url}/franky/end_chain", json={"chain_id": chain}, timeout=60
+            )
+
+    def test_ricky_reads_the_taps_of_the_tokens_sandy_wrote(self):
+        # A short prompt whose continuation is new text, so the taps of
+        # Sandy's tokens are most of what Ricky reads, not near copies of the
+        # prompt's.
+        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(
+            "Write a short story about a lighthouse keeper who finds a map."
+        )
+        room = self._room(4500)
+        sandy = requests.post(
+            f"{self.sandy_url}/generate",
+            json={
+                "input_ids": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": _WRITTEN,
+                    "ignore_eos": True,
+                },
+                "franky_room": room,
+            },
+            timeout=600,
+        ).json()
+        written = sandy["output_ids"]
+        self.assertEqual(len(written), _WRITTEN)
+        self.assertEqual(
+            sandy["meta_info"]["finish_reason"], {"type": "length", "length": _WRITTEN}
+        )
+        trace = prompt + written
+        runs = [[len(prompt), len(trace)]]
+        ricky = requests.post(
+            f"{self.ricky_url}/generate",
+            json={
+                "input_ids": trace,
+                "sampling_params": {"temperature": 0, "max_new_tokens": _NEW_TOKENS},
+                "return_logprob": True,
+                "franky_room": room,
+                "franky_tap_runs": runs,
+            },
+            timeout=600,
+        ).json()
+
+        pairs = ricky["meta_info"]["output_token_logprobs"]
+        output = (
+            [pair[1] for pair in pairs],
+            torch.tensor([pair[0] for pair in pairs]),
+        )
+        without_written = [[len(prompt), len(prompt)]]
+        ref, ref_without_written = self._reference(
+            [trace, trace], [output, output], runs=[runs, without_written]
+        )
+        error = (output[1] - ref["readers"]).abs().max().item()
+        written_effect = (ref["readers"] - ref_without_written["readers"]).abs().max()
+        self.assertLess(error, 0.2)
+        self.assertGreater(written_effect.item(), 4 * error)
 
 
 @unittest.skipUnless(torch.cuda.device_count() >= 4, "requires 4 GPUs")
@@ -454,10 +536,10 @@ class TestFrankyPdEndToEnd(_FrankyPair):
 
     @classmethod
     def _servers(cls):
-        cls.relay_port = find_available_port(19096)
-        cls.pd_port = find_available_port(19196)
+        cls.relay_port = _free_port(19096)
+        cls.pd_port = _free_port(19196)
         cls.prefill_url = cls.ricky_url
-        cls.decode_url = f"http://127.0.0.1:{find_available_port(31400)}"
+        cls.decode_url = f"http://127.0.0.1:{_free_port(31400)}"
         pd = ["--disaggregation-transfer-backend", "nixl"]
         relay = ["--franky-bootstrap-port", str(cls.relay_port)]
         return [
@@ -485,12 +567,8 @@ class TestFrankyPdEndToEnd(_FrankyPair):
             ),
         ]
 
-    def _send(self, ids, room, ricky_sampling=None, ricky_fields=None, **block):
-        franky_room = {
-            "bootstrap_host": "127.0.0.1",
-            "bootstrap_port": self.bootstrap_port,
-            "room": room,
-        }
+    def _send(self, ids, room, ricky_sampling=None, ricky_fields=None, chain=None):
+        franky_room = self._room(room)
         pd = {
             "bootstrap_host": "127.0.0.1",
             "bootstrap_port": self.pd_port,
@@ -510,15 +588,13 @@ class TestFrankyPdEndToEnd(_FrankyPair):
             "return_logprob": True,
             "franky_room": franky_room,
             **pd,
-            **block,
             **self._sandy_fields(ids),
             **(ricky_fields or {}),
         }
         sandy = {
             "input_ids": self._sandy_ids(ids),
-            "sampling_params": {"max_new_tokens": 1},
             "franky_room": franky_room,
-            **block,
+            "franky_taps_only": True,
         }
         threads = [
             threading.Thread(target=post, args=("prefill", self.prefill_url, ricky)),
@@ -600,6 +676,91 @@ class TestFrankyOwnSandyTokensEndToEndTp2(TestFrankyOwnSandyTokensEndToEnd):
 @unittest.skipUnless(torch.cuda.device_count() >= 4, "requires 4 GPUs")
 class TestFrankyOwnSandyTokensPdEndToEnd(TestFrankyPdEndToEnd):
     shared_tokenizer = False
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")
+class TestFrankyTextOnlyPdEndToEnd(CustomTestCase):
+    """A Ricky without Franky parts under PD, as a chain without taps runs it:
+    its legs go from prefill to decode over NIXL's own classes, and decode ends
+    a leg where its blocks call Sandy."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pd_port = _free_port(19296)
+        cls.prefill_url = f"http://127.0.0.1:{_free_port(31500)}"
+        cls.decode_url = f"http://127.0.0.1:{_free_port(31600)}"
+        ricky = [
+            "--franky-side", "ricky",
+            "--disaggregation-transfer-backend", "nixl",
+            "--mem-fraction-static", "0.6",
+        ]  # fmt: skip
+        if torch.cuda.get_device_capability()[0] >= 10:
+            ricky += ["--attention-backend", "trtllm_mha"]
+        prefill = [
+            "--base-gpu-id", "0",
+            "--disaggregation-mode", "prefill",
+            "--disaggregation-bootstrap-port", str(cls.pd_port),
+        ]  # fmt: skip
+        decode = ["--base-gpu-id", "1", "--disaggregation-mode", "decode"]
+        cls.processes = [
+            popen_launch_server(
+                _MODEL,
+                url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[*ricky, *stage],
+            )
+            for url, stage in ((cls.prefill_url, prefill), (cls.decode_url, decode))
+        ]
+
+    @classmethod
+    def tearDownClass(cls):
+        for process in cls.processes:
+            kill_process_tree(process.pid)
+
+    def test_a_leg_ends_on_decode_where_its_blocks_call_sandy(self):
+        leg = {
+            "rid": "text-only-r1",
+            "input_ids": AutoTokenizer.from_pretrained(_MODEL).encode(_TEXT),
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 64,
+                "ignore_eos": True,
+            },
+            "franky_chain": {
+                "id": "text-only",
+                "block": 1,
+                "blocks": {
+                    "block_size": 8,
+                    "decider": {
+                        "type": "call_token_or_every_blocks",
+                        "every_blocks": 2,
+                    },
+                },
+            },
+            "bootstrap_host": "127.0.0.1",
+            "bootstrap_port": self.pd_port,
+            "bootstrap_room": 6100,
+        }
+        answers = {}
+
+        def post(url):
+            answers[url] = requests.post(
+                f"{url}/generate", json=leg, timeout=600
+            ).json()
+
+        threads = [
+            threading.Thread(target=post, args=(url,))
+            for url in (self.prefill_url, self.decode_url)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        meta_info = answers[self.decode_url]["meta_info"]
+        self.assertEqual(meta_info["finish_reason"]["type"], "franky_sandy_call")
+        self.assertEqual(meta_info["finish_reason"]["next_block"], 3)
+        self.assertEqual(meta_info["completion_tokens"], 16)
 
 
 if __name__ == "__main__":

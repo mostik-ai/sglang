@@ -47,7 +47,7 @@ self.franky_read_pp(pp_proxy_tensors=pp_proxy_tensors)
 self.franky_write_pp(pp_proxy_tensors=pp_proxy_tensors)
 ```
 
-**What Franky reads from the model:** the class with the mixin has `start_layer`, `end_layer` (as `make_layers` gives them) and `config.hidden_size`. The top model class has `lm_head` and `logits_processor`, as SGLang models do; on Sandy they are replaced, because Sandy never samples.
+**What Franky reads from the model:** the class with the mixin has `start_layer`, `end_layer` (as `make_layers` gives them) and `config.hidden_size`. Both sides keep the model's head: Sandy writes tokens too.
 
 A model used only as Ricky needs steps 1 and 2. A residual of another form needs its own `LayerOutput`, injector and
 `FrankyMixin` method; encoders and readers only ever see one hidden per row.

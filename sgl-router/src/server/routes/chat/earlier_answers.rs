@@ -12,9 +12,9 @@ use bytes::Bytes;
 use serde_json::Value;
 
 /// A chat for Franky workers, prepared as any chat. When it has earlier answers
-/// but no `input_ids`, the engines get the ids the router rendered, with the
-/// runs of those answers as `franky_generated_spans`. A Sandy that tokenizes on
-/// its own gets its own rendering, see [`prepare_chat_for_both_tokenizers`].
+/// but no `input_ids`, the engines get the ids the router rendered, and Ricky
+/// the tap runs of those answers. A Sandy that tokenizes on its own gets its own
+/// rendering, see [`prepare_chat_for_both_tokenizers`].
 ///
 /// Errors: `ApiError::BadRequest` for `franky_generated_spans` without
 /// `input_ids`, and for earlier answers the router cannot mark: without
@@ -71,14 +71,15 @@ pub(super) fn prepare_franky_chat(
     };
     let spans = adapter.generated_spans(rendered_ids);
     if !spans.is_empty() {
-        request.add_franky_generated_spans(&spans)?;
+        let input_len = rendered_ids.len();
+        request.franky.add_earlier_answers(&spans, input_len);
     }
     Ok(request)
 }
 
 /// A chat for Franky workers whose Sandy tokenizes on its own. The router
 /// renders it for both models: Sandy gets its own ids, and Ricky gets Sandy's
-/// input length and, for each earlier answer, its runs in both renderings.
+/// ids and the tap runs of the earlier answers, from both renderings.
 ///
 /// Errors: `ApiError::BadRequest` for a chat with `input_ids`, one the router
 /// leaves to the engine or Sandy's template does not render, and one whose two
@@ -135,7 +136,8 @@ fn prepare_chat_for_both_tokenizers(
             sandy_chat.generated_spans.len()
         )));
     }
-    request.add_franky_sandy_chat(&generated_spans, sandy_chat)?;
+    let input_len = rendered_ids.len();
+    (request.franky).add_sandy_chat(&generated_spans, input_len, sandy_chat);
     Ok(request)
 }
 

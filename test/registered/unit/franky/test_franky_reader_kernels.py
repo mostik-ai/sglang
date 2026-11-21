@@ -11,10 +11,6 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.franky.cache.generated_spans import (
-    FrankyGeneratedSpans,
-    GeneratedSpan,
-)
 from sglang.srt.franky.cache.tap_buffers import TAP_DTYPE, TapBuffers
 from sglang.srt.franky.cache.tap_request_table import TapRequestTable
 from sglang.srt.franky.cache.tap_stripes import TapStripes
@@ -25,6 +21,7 @@ from sglang.srt.franky.parts.reader.tap_attention import (
 )
 from sglang.srt.franky.parts.reader.tap_merge import TapMerge
 from sglang.srt.franky.parts.reader.tap_reading import TapReading
+from sglang.srt.franky.tap_runs import FrankyTapRuns
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -48,12 +45,16 @@ def _taps_to_read(token, *, generation_start, block_size):
 
 
 def _spans(generation_start, block_size):
+    """An answer from ``generation_start`` on, in blocks of ``block_size``
+    where Sandy writes nothing, each reading the context before it."""
     if generation_start is None:
         return None
-    return FrankyGeneratedSpans(
-        spans=(GeneratedSpan(start=generation_start, sandy_start=generation_start),),
-        block_size=block_size,
+    starts = (
+        range(generation_start, _CONTEXT, block_size)
+        if block_size
+        else [generation_start]
     )
+    return FrankyTapRuns(starts=tuple(starts), taps=tuple(starts))
 
 
 class _Ranks:
@@ -136,7 +137,7 @@ class TestReaderKernels(CustomTestCase):
         request_table.bind(
             req_pool_indices=rows,
             pages=[None] * len(rows),
-            spans=[spans[row] for row in rows],
+            tap_runs=[spans[row] for row in rows],
             num_input_tokens=[num_input_tokens[row] for row in rows],
         )
         return request_table
