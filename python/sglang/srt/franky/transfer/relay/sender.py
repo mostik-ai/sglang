@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 from typing_extensions import override
 
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.nixl.conn import NixlKVSender
 from sglang.srt.franky.transfer.messages import FrankyRoom
 from sglang.srt.franky.transfer.senders.room import FrankyRoomSender
@@ -54,8 +55,18 @@ class FrankyRelaySender(NixlKVSender):
 
     @override
     def poll(self) -> int:
+        """The less advanced of the two transfers. The decode's tap receiver
+        joins the room apart from its KV receiver, so the taps may still wait
+        for it once the KV is on its way: PD's queues see that as waiting for
+        input, and a receiver that never comes fails at the bootstrap timeout.
+        """
         state = super().poll()
-        return state if self.tap_sender is None else min(state, self.tap_sender.poll())
+        if self.tap_sender is None:
+            return state
+        taps = self.tap_sender.poll()
+        if taps == KVPoll.Bootstrapping:
+            taps = KVPoll.WaitingForInput
+        return min(state, taps)
 
     @override
     def abort(self) -> None:
