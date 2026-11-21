@@ -397,6 +397,22 @@ async fn a_sandy_with_its_own_tokenizer_reads_its_rendering_and_ricky_runs_in_it
     assert_eq!(sandy_body["franky_room"], ricky_body["franky_room"]);
 }
 
+/// Kimi K3 starts closing an answer with `<|close|>` before its EOS, so its
+/// text, and a Sandy call's, ends there.
+#[tokio::test]
+async fn a_kimi_sandys_answer_text_ends_at_its_first_close_marker() {
+    let (FrankyPair { ctx, .. }, kimi) = pair_with_kimi_sandy().await;
+    let tokenizer =
+        sgl_router::tokenizer::adapter::load(kimi.path().join("tiktoken.model").to_str().unwrap())
+            .unwrap();
+    let close = encode(&tokenizer, "<|close|>").unwrap();
+
+    let text_end = ctx.franky_sandy.as_ref().unwrap().text_end();
+
+    assert_eq!(close.len(), 1);
+    assert_eq!(text_end, Some(close[0]));
+}
+
 #[tokio::test]
 async fn a_sandy_with_its_own_tokenizer_refuses_what_the_router_cannot_render_for_it() {
     let mut with_input_ids = chat_with_an_answer(DEEPSEEK_V4);

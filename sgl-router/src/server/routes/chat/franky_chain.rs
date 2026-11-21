@@ -497,7 +497,10 @@ impl FrankyChain {
             _ => SandyLimit::Call,
         };
         let (input_ids, tokenizer) = match self.trace.sandy_ids() {
-            Some(ids) => (json!(ids), SandyTokenizer::Own),
+            Some(ids) => {
+                let text_end = self.trace.sandy_text_end();
+                (json!(ids), SandyTokenizer::Own { text_end })
+            }
             None => (json!(self.trace.ricky_ids()), SandyTokenizer::Ricky),
         };
         let streamed_increments = (self.sandy_increments)

@@ -91,6 +91,12 @@ impl FrankySandyTokens {
         adapter::encode_answer_text(&self.tokenizer, self.backend, text)
     }
 
+    /// The token where Sandy's answer's text ends before its template closes
+    /// the answer, at which Sandy's calls stop.
+    pub fn text_end(&self) -> Option<u32> {
+        self.adapter.text_end()
+    }
+
     /// Errors: Sandy's template does not render `chat`.
     pub fn render(&self, chat: &Value) -> Result<SandyChat> {
         let input_ids = self.formatter.encode(&self.tokenizer, chat)?;
