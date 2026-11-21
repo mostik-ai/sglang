@@ -252,12 +252,7 @@ impl TokenizerRegistry {
         let tokenizer = self
             .get(model_id)
             .ok_or_else(|| anyhow::anyhow!("model {model_id}'s tokenizer is not loaded"))?;
-        let segment = [EncodeSegment::new(text, false)];
-        if self.stats.backend() == stats::EncodeBackend::Tiktoken {
-            return kimi::encode(&tokenizer, &segment);
-        }
-        let encoding = tokenizer.encode_segments(&segment)?;
-        Ok(encoding.token_ids().to_vec())
+        adapter::encode_answer_text(&tokenizer, self.stats.backend(), text)
     }
 
     /// Whether this model has a chat formatter (and thus the chat-aware
