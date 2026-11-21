@@ -8,7 +8,7 @@ whatever the slot held before.
 """
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -292,6 +292,9 @@ class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
             _maybe_collect_routed_experts=lambda req: None,
             _maybe_collect_indexer_topk=lambda req: None,
             _maybe_collect_customized_info=lambda i, req, out: None,
+        )
+        processor.release_finished_kv = MethodType(
+            brp.SchedulerBatchResultProcessor.release_finished_kv, processor
         )
         released = []
         with (
