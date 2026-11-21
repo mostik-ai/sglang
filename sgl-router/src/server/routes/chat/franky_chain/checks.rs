@@ -56,8 +56,18 @@ pub(super) fn refused(what: &str) -> ApiError {
     ))
 }
 
+/// Whether a request field asks for something. Null, false, zero and empty
+/// values ask for nothing, and the chat lowering writes some of them on every
+/// request (`return_logprob: false`, `top_logprobs_num: 0`).
 fn is_set(value: &Value) -> bool {
-    !matches!(value, Value::Null | Value::Bool(false))
+    match value {
+        Value::Null | Value::Bool(false) => false,
+        Value::Bool(true) => true,
+        Value::Number(number) => number.as_f64() != Some(0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+    }
 }
 
 #[cfg(test)]
@@ -96,5 +106,31 @@ mod tests {
         }
         let logprobs = object(json!({"return_logprob": true, "stream": true}));
         assert!(check_chains_can_serve(&logprobs, &FrankyChainConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn fields_that_ask_for_nothing_pass_while_sandy_writes() {
+        let writes = FrankyChainConfig {
+            sandy_call_tokens: 8,
+            ..FrankyChainConfig::default()
+        };
+        // As the chat lowering writes every request.
+        let lowered_chat = object(json!({
+            "return_logprob": false,
+            "top_logprobs_num": 0,
+            "token_ids_logprob": [],
+            "sampling_params": {"regex": null, "json_schema": ""},
+            "session_params": {},
+        }));
+        assert!(check_chains_can_serve(&lowered_chat, &writes).is_ok());
+        for body in [
+            json!({"top_logprobs_num": 2}),
+            json!({"token_ids_logprob": [5]}),
+        ] {
+            assert!(
+                check_chains_can_serve(&object(body.clone()), &writes).is_err(),
+                "{body}"
+            );
+        }
     }
 }

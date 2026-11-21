@@ -719,6 +719,26 @@ async fn sandy_writes_before_each_leg_and_the_leg_reads_its_room() {
     }
 }
 
+/// The chat lowering writes `return_logprob: false` and `top_logprobs_num: 0`
+/// on every request; a chain where Sandy writes serves them.
+#[tokio::test]
+async fn a_chain_where_sandy_writes_serves_what_the_chat_lowering_writes() {
+    let (ctx, [ricky, sandy], _stop) = chain_router(12, chain_config(2, true, 4)).await;
+    let body = json!({
+        "input_ids": PROMPT,
+        "return_logprob": false,
+        "top_logprobs_num": 0,
+        "sampling_params": {"max_new_tokens": 100},
+    });
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = json_answer(res).await;
+    assert_eq!(answer["output_ids"], json!((3..15).collect::<Vec<_>>()));
+    assert_eq!((sandy.requests().len(), ricky.requests().len()), (2, 2));
+}
+
 /// Sandy calls to PD Sandys go to a Sandy prefill and decode pair with PD
 /// bootstrap fields at the prefill's PD port; the decode answers, and each
 /// call's room, which the next leg reads, opens at the decode's tap port.
