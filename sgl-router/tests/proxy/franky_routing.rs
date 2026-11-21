@@ -24,10 +24,12 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::{AppContext, ChatRouting};
 use sgl_router::state::kv_events::KvEventIndex;
+use sgl_router::tokenizer::chat_template_adapter::ChatTemplateAdapter;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
 use sglang_processor::openai::OpenAiSettings;
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower::ServiceExt;
@@ -600,7 +602,7 @@ async fn streamed_frames(response: Response) -> (Vec<Value>, usize) {
     (frames, text.matches("[DONE]").count())
 }
 
-fn trace(answer: std::ops::Range<u64>) -> Value {
+fn trace(answer: Range<u64>) -> Value {
     json!(PROMPT.into_iter().chain(answer).collect::<Vec<_>>())
 }
 
@@ -711,6 +713,45 @@ async fn sandy_writes_before_each_leg_and_the_leg_reads_its_room() {
             engine.wait_for_chain_end().await,
             [json!({"chain_id": chain})]
         );
+    }
+}
+
+/// A served model's template that closes an answer with more than its EOS,
+/// starting at token 98.
+struct ClosingTemplate;
+
+impl ChatTemplateAdapter for ClosingTemplate {
+    fn generated_spans(&self, _input_ids: &[u32]) -> Vec<Range<usize>> {
+        Vec::new()
+    }
+
+    fn text_end(&self) -> Option<u32> {
+        Some(98)
+    }
+}
+
+/// A Sandy that reads the served model's tokens stops where that model's
+/// template starts closing an answer, beside the client's stop tokens.
+#[tokio::test]
+async fn sandy_calls_stop_at_the_text_end_of_their_inputs_template() {
+    let (ctx, [_ricky, sandy], _stop) = chain_router(12, chain_config(2, true, 4)).await;
+    let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+    ctx.franky_chat_adapter = Some(Arc::new(ClosingTemplate));
+    let body = json!({
+        "input_ids": PROMPT,
+        "sampling_params": {"max_new_tokens": 100, "stop_token_ids": [99]},
+    });
+
+    let res = build_router(Arc::new(ctx))
+        .oneshot(generate(body))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let calls = sandy.requests();
+    assert!(!calls.is_empty());
+    for call in calls {
+        assert_eq!(call["sampling_params"]["stop_token_ids"], json!([99, 98]));
     }
 }
 

@@ -12,11 +12,7 @@ const TOKEN_STOP_FIELDS: [&str; 1] = ["stop_token_ids"];
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum SandyTokenizer {
     Ricky,
-    /// Sandy's own, whose calls stop at `text_end`, where its template starts
-    /// closing an answer before Sandy's EOS.
-    Own {
-        text_end: Option<u32>,
-    },
+    Own,
 }
 
 /// Which limit a Sandy call's `max_new_tokens` was.
@@ -58,12 +54,14 @@ pub(super) enum SandyRead {
 
 /// The `/generate` body of a Sandy call that writes the answer after
 /// `input_ids` within `limits`, with the client's sampling and stop rules,
-/// but the stop rules in Ricky's ids only for a Sandy that reads them; a Sandy
-/// with its own tokenizer stops where its answer's text ends.
+/// but the stop rules in Ricky's ids only for a Sandy that reads them. The
+/// call also stops at `text_end`, the token where the template of Sandy's
+/// input starts closing an answer before Sandy's EOS.
 pub(super) fn sandy_call_body(
     client_body: &Map<String, Value>,
     input_ids: Value,
     limits: WriteLimits,
+    text_end: Option<u32>,
     tokenizer: SandyTokenizer,
     streamed: bool,
 ) -> Map<String, Value> {
@@ -72,12 +70,19 @@ pub(super) fn sandy_call_body(
     body.insert("stream".into(), streamed.into());
     let sampling = body.entry("sampling_params").or_insert_with(|| json!({}));
     limits.set_on(sampling);
-    if let (SandyTokenizer::Own { text_end }, Value::Object(sampling)) = (tokenizer, sampling) {
-        for field in TOKEN_STOP_FIELDS {
-            sampling.remove(field);
+    if let Value::Object(sampling) = sampling {
+        if tokenizer == SandyTokenizer::Own {
+            for field in TOKEN_STOP_FIELDS {
+                sampling.remove(field);
+            }
         }
         if let Some(text_end) = text_end {
-            sampling.insert("stop_token_ids".into(), json!([text_end]));
+            let stops = sampling
+                .entry("stop_token_ids")
+                .or_insert_with(|| json!([]));
+            if let Value::Array(stops) = stops {
+                stops.push(text_end.into());
+            }
         }
     }
     body
@@ -127,19 +132,19 @@ impl SandyStream {
         if finish_reason.is_null() {
             return Ok(SandyRead::Adds(match self.tokenizer {
                 SandyTokenizer::Ricky => added,
-                SandyTokenizer::Own { .. } => SandyDelta::default(),
+                SandyTokenizer::Own => SandyDelta::default(),
             }));
         }
         let adds = match self.tokenizer {
             SandyTokenizer::Ricky => added,
-            SandyTokenizer::Own { .. } => SandyDelta {
+            SandyTokenizer::Own => SandyDelta {
                 ids: ricky_ids_of(&self.text)?,
                 text: std::mem::take(&mut self.text),
             },
         };
         let ricky_ids = match self.tokenizer {
             SandyTokenizer::Ricky => self.ids.clone(),
-            SandyTokenizer::Own { .. } => adds.ids.clone(),
+            SandyTokenizer::Own => adds.ids.clone(),
         };
         let text = SandyText {
             ricky_ids,
@@ -187,8 +192,8 @@ impl SandyStream {
     }
 }
 
-/// The id of Sandy's own EOS when it stopped the call: a stop token that is
-/// none of the client's.
+/// The id of Sandy's own EOS, or of its template's text end, when it stopped
+/// the call: a stop token that is none of the client's.
 fn stopped_at_eos(finish_reason: &Value, client_stop_ids: &[u64]) -> Option<u64> {
     let matched = finish_reason["matched"].as_u64()?;
     (finish_reason["type"] == "stop" && !client_stop_ids.contains(&matched)).then_some(matched)
@@ -224,11 +229,13 @@ mod tests {
             min: None,
         };
 
-        let shared = sandy_call_body(&client, json!([1, 2]), limits, SandyTokenizer::Ricky, false);
-        let own = SandyTokenizer::Own { text_end: None };
-        let own = sandy_call_body(&client, json!([9]), limits, own, false);
-        let closing = SandyTokenizer::Own { text_end: Some(5) };
-        let closing = sandy_call_body(&client, json!([9]), limits, closing, false);
+        let body = |input_ids: Value, text_end, tokenizer| {
+            sandy_call_body(&client, input_ids, limits, text_end, tokenizer, false)
+        };
+        let shared = body(json!([1, 2]), None, SandyTokenizer::Ricky);
+        let own = body(json!([9]), None, SandyTokenizer::Own);
+        let shared_closing = body(json!([1, 2]), Some(5), SandyTokenizer::Ricky);
+        let own_closing = body(json!([9]), Some(5), SandyTokenizer::Own);
 
         assert_eq!(shared["input_ids"], json!([1, 2]));
         assert_eq!(shared["stream"], json!(false));
@@ -241,7 +248,11 @@ mod tests {
             json!({"temperature": 0.5, "stop": ["\n\n"], "max_new_tokens": 64})
         );
         assert_eq!(
-            closing["sampling_params"],
+            shared_closing["sampling_params"]["stop_token_ids"],
+            json!([7, 5])
+        );
+        assert_eq!(
+            own_closing["sampling_params"],
             json!({"temperature": 0.5, "stop": ["\n\n"], "stop_token_ids": [5], "max_new_tokens": 64})
         );
     }
@@ -346,8 +357,7 @@ mod tests {
 
     #[test]
     fn a_sandy_with_its_own_tokenizer_adds_its_text_once_the_call_ends() {
-        let own = SandyTokenizer::Own { text_end: None };
-        let mut stream = SandyStream::new(own, SandyLimit::Call, true);
+        let mut stream = SandyStream::new(SandyTokenizer::Own, SandyLimit::Call, true);
         let ricky_ids_of = |text: &str| {
             assert_eq!(text, "ab");
             Ok(vec![40, 41, 42])
