@@ -84,21 +84,23 @@ class TestFrankyChainHolds(CustomTestCase):
 
         self.assertEqual(self.tree.locked, ["other-block"])
 
-    def test_ended_chains_are_announced_once_in_the_order_they_ended(self):
-        ended = self._holds(hold_seconds=0.0)
+    def test_holds_and_ended_chains_are_announced_once_in_the_order_they_came(self):
+        expired = self._holds(hold_seconds=0.0)
         live = self._holds(hold_seconds=3600.0)
-        for holds in (ended, live):
-            holds.end(chain_id="a")
+        for holds in (expired, live):
+            holds.hold_for_next_request(_block("a", node="a"))
             holds.end(chain_id="b")
+            holds.hold_for_next_request(_block("c", node="c"))
 
         self.assertEqual(
-            ended.expired_messages(),
+            expired.expired_messages(),
             [
                 FrankyHoldExpired(chain_id="a", order=0),
                 FrankyHoldExpired(chain_id="b", order=1),
+                FrankyHoldExpired(chain_id="c", order=2),
             ],
         )
-        self.assertEqual(ended.expired_messages(), [])
+        self.assertEqual(expired.expired_messages(), [])
         self.assertEqual(live.expired_messages(), [])
 
     def test_an_ended_chain_is_forgotten_at_its_expiry_on_every_rank(self):

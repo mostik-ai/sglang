@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -19,17 +18,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class _Hold(msgspec.Struct, kw_only=True):
-    kv_lock: Optional[TreeLock]
-    tap_lock: Optional[TreeLock]
-    block: int
-    num_tokens: int
-    order: int
-    expires_at: float
-    announced: bool = False
+class _Kept(msgspec.Struct, kw_only=True):
+    """What the engine keeps for one chain: the locks its last request left,
+    or, once the router ended the chain, only that mark."""
 
-
-class _Ended(msgspec.Struct, kw_only=True):
+    ended: bool
+    kv_lock: Optional[TreeLock] = None
+    tap_lock: Optional[TreeLock] = None
+    block: int = 0
+    num_tokens: int = 0
     order: int
     expires_at: float
     announced: bool = False
@@ -60,8 +57,7 @@ class FrankyChainHolds:
         self._tree_cache = tree_cache
         self._tap_cache = tap_cache
         self._hold_seconds = hold_seconds
-        self._holds: dict[str, _Hold] = {}
-        self._ended: dict[str, _Ended] = {}
+        self._kept: dict[str, _Kept] = {}
         self._next_order = 0
 
     @staticmethod
@@ -89,29 +85,35 @@ class FrankyChainHolds:
                 the holds own from now on.
         """
         chain = FrankyRequest.of(req).chain
-        if chain is None or chain.id in self._ended:
+        kept = None if chain is None else self._kept.get(chain.id)
+        if chain is None or (kept is not None and kept.ended):
             self._release_tap_lock(tap_lock)
             return
         self.release(chain_id=chain.id)
-        self._holds[chain.id] = self._new_hold(req, tap_lock=tap_lock)
+        self._keep(
+            chain.id,
+            ended=False,
+            kv_lock=(
+                None
+                if self._tree_cache is None
+                else self._tree_cache.lock(req.last_node)
+            ),
+            tap_lock=tap_lock,
+            block=chain.block,
+            num_tokens=len(req.origin_input_ids),
+        )
 
     def end(self, *, chain_id: str) -> None:
-        """The router ended the chain on every engine: release its hold, and for
-        the hold time hold nothing for the chain's requests that still end here
-        after the router got its answer, as a PD prefill's does once its KV
-        transfer ends, and a Ricky leg that reads taps does twice.
+        """The router ended the chain on every engine: release its hold, and
+        hold nothing for its requests that still end here, until the hold time.
         """
         self.release(chain_id=chain_id)
-        self._ended.pop(chain_id, None)
-        self._ended[chain_id] = _Ended(
-            order=self._next_order,
-            expires_at=time.monotonic() + self._hold_seconds,
-        )
-        self._next_order += 1
+        self._keep(chain_id, ended=True)
 
     def holds_chain_of(self, req: Req) -> bool:
         chain = FrankyRequest.of(req).chain
-        return chain is not None and chain.id in self._holds
+        kept = None if chain is None else self._kept.get(chain.id)
+        return kept is not None and not kept.ended
 
     def put_held_chains_first(self, requests: list[Req]) -> None:
         """Keeps the order within the blocks of held chains and within the others."""
@@ -123,15 +125,12 @@ class FrankyChainHolds:
             self.release(chain_id=chain.id)
 
     def release(self, *, chain_id: str) -> None:
-        hold = self._holds.pop(chain_id, None)
-        if hold is None:
-            return
-        if hold.kv_lock is not None:
-            self._tree_cache.unlock(hold.kv_lock)
-        self._release_tap_lock(hold.tap_lock)
+        kept = self._kept.get(chain_id)
+        if kept is not None and not kept.ended:
+            self._drop(chain_id)
 
     def release_all(self) -> None:
-        for chain_id in list(self._holds):
+        for chain_id in list(self._kept):
             self.release(chain_id=chain_id)
 
     def release_least_progress(self, *, sparing_chain_id: Optional[str]) -> bool:
@@ -145,9 +144,9 @@ class FrankyChainHolds:
             Whether there was a hold to release.
         """
         candidates = [
-            (hold.block, -hold.num_tokens, chain_id)
-            for chain_id, hold in self._holds.items()
-            if chain_id != sparing_chain_id
+            (kept.block, -kept.num_tokens, chain_id)
+            for chain_id, kept in self._kept.items()
+            if not kept.ended and chain_id != sparing_chain_id
         ]
         if not candidates:
             return False
@@ -163,57 +162,47 @@ class FrankyChainHolds:
         return True
 
     def expired_messages(self) -> list[FrankyHoldExpired]:
-        """The leader rank only: the holds and the memories of ended chains past
-        their expiry, each once.
-        """
+        """The leader rank only: what the engine keeps past its time, each once."""
         now = time.monotonic()
-        expired = [
-            (chain_id, hold)
-            for chain_id, hold in self._holds.items()
-            if hold.expires_at <= now
-        ]
-        # Ended chains are kept in the order they expire.
-        expired += itertools.takewhile(
-            lambda item: item[1].expires_at <= now, self._ended.items()
-        )
         messages = []
-        for chain_id, kept in expired:
+        for chain_id, kept in self._kept.items():
+            if kept.expires_at > now:
+                break
             if not kept.announced:
                 kept.announced = True
                 messages.append(FrankyHoldExpired(chain_id=chain_id, order=kept.order))
         return messages
 
     def on_hold_expired(self, *, message: FrankyHoldExpired) -> None:
-        hold = self._holds.get(message.chain_id)
-        if hold is not None and hold.order == message.order:
-            self.release(chain_id=message.chain_id)
-        ended = self._ended.get(message.chain_id)
-        if ended is not None and ended.order == message.order:
-            del self._ended[message.chain_id]
+        kept = self._kept.get(message.chain_id)
+        if kept is not None and kept.order == message.order:
+            self._drop(message.chain_id)
 
     def locked_nodes(self) -> set[Any]:
         """The KV prefix tree nodes the holds lock, each once."""
         return {
-            hold.kv_lock.node
-            for hold in self._holds.values()
-            if hold.kv_lock is not None
+            kept.kv_lock.node
+            for kept in self._kept.values()
+            if kept.kv_lock is not None
         }
 
-    def _new_hold(self, req: Req, *, tap_lock: Optional[TreeLock]) -> _Hold:
-        hold = _Hold(
-            kv_lock=(
-                None
-                if self._tree_cache is None
-                else self._tree_cache.lock(req.last_node)
-            ),
-            tap_lock=tap_lock,
-            block=FrankyRequest.of(req).chain.block,
-            num_tokens=len(req.origin_input_ids),
+    def _keep(self, chain_id: str, **fields: Any) -> None:
+        """Keeps a new record for the chain, last: every record lives the same
+        hold time, so the records stand in the order they expire.
+        """
+        self._kept.pop(chain_id, None)
+        self._kept[chain_id] = _Kept(
+            **fields,
             order=self._next_order,
             expires_at=time.monotonic() + self._hold_seconds,
         )
         self._next_order += 1
-        return hold
+
+    def _drop(self, chain_id: str) -> None:
+        kept = self._kept.pop(chain_id)
+        if kept.kv_lock is not None:
+            self._tree_cache.unlock(kept.kv_lock)
+        self._release_tap_lock(kept.tap_lock)
 
     def _release_tap_lock(self, tap_lock: Optional[TreeLock]) -> None:
         if tap_lock is not None:
