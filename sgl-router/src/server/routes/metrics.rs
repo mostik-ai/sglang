@@ -9,9 +9,8 @@
 //! while the router is warming up so the "router started but no workers
 //! discovered" failure mode is observable.
 
-use crate::discovery::WorkerMode;
 use crate::server::app_context::AppContext;
-use crate::server::metrics::{escape_label, WorkerSnapshot};
+use crate::server::metrics::{escape_label, WorkerModeLabel, WorkerSnapshot};
 use crate::state::kv_events::bootstrap::{
     BootstrapTracker, PeerRegistry, RankOutcome, SnapshotOutcome, SweepOutcome,
 };
@@ -39,12 +38,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
             let cb = w.breaker.snapshot();
             WorkerSnapshot {
                 worker_url: w.url.clone(),
-                mode: match w.mode() {
-                    WorkerMode::Plain => "plain",
-                    WorkerMode::Prefill => "prefill",
-                    WorkerMode::Decode => "decode",
-                    WorkerMode::Sandy => "sandy",
-                },
+                mode: WorkerModeLabel::of(&w).as_str(),
                 healthy: cb.admit,
                 cb_state: cb.state_code,
                 // Saturating rather than `as i64`: a guard-accounting

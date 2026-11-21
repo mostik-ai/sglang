@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from sglang.srt.franky.cache.tap_buffers import TapBuffers
@@ -66,6 +67,23 @@ class SandyTapCache:
         pages = kv_slots[::page_size] // page_size
         local = torch.where(self.stripes.owns(pages), self.stripes.stripe(pages), -1)
         return local.to(torch.int32)
+
+    def pages_of_kv_pages(
+        self, *, kv_pages: np.ndarray, kv_page_size: int
+    ) -> np.ndarray:
+        """
+        Args:
+            kv_pages: KV pages of consecutive tokens, as PD's transfer sends them.
+            kv_page_size: tokens per KV page, a multiple of the tap page size.
+        Returns:
+            int32, per tap page of these KV pages in order, its local page on
+            this rank, or -1 where another rank keeps it.
+        """
+        per_kv_page = kv_page_size // self.buffers.page_size
+        first_pages = np.asarray(kv_pages, dtype=np.int64)[:, None] * per_kv_page
+        pages = (first_pages + np.arange(per_kv_page)).reshape(-1)
+        local = np.where(self.stripes.owns(pages), self.stripes.stripe(pages), -1)
+        return local.astype(np.int32)
 
     def _local_slots(self, kv_slots: torch.Tensor) -> torch.Tensor:
         page_size = self.buffers.page_size

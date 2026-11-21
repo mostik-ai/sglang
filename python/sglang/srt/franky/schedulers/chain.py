@@ -133,7 +133,7 @@ class FrankyChainScheduler(Scheduler):
 
     def _handle_end_chain(self, recv_req: FrankyEndChainReq) -> None:
         self.abort_request(AbortReq(rid=recv_req.chain_id))
-        self.franky_chain_holds.release(chain_id=recv_req.chain_id)
+        self.franky_chain_holds.end(chain_id=recv_req.chain_id)
 
     def _num_franky_startable_reqs(self) -> Optional[int]:
         if self.franky_mamba_room is None:

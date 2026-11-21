@@ -769,7 +769,7 @@ pub(super) fn model_openai_settings(
 ) -> Option<Arc<OpenAiSettings>> {
     let mut workers = ctx.registry.workers_for(model);
     // Sandy's frames reach a client only through a chain, which reads them by Sandy's own args.
-    workers.retain(|w| w.mode() != WorkerMode::Sandy);
+    workers.retain(|w| !w.is_sandy());
     let first = Arc::clone(workers.first()?.openai_settings()?);
     let agree = workers.iter().all(|w| w.openai_settings() == Some(&first));
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -780,11 +780,12 @@ pub(super) fn model_openai_settings(
     agree.then_some(first)
 }
 
-/// Whether every Sandy worker of `model` streams only what each frame adds;
-/// `None` if any is unread or they differ.
+/// Whether every Sandy worker of `model` that answers a call, any but a PD
+/// prefill, streams only what each frame adds; `None` if any is unread or they
+/// differ.
 pub(super) fn sandy_incremental_streaming(ctx: &AppContext, model: &ModelId) -> Option<bool> {
     let mut sandys = ctx.registry.workers_for(model);
-    sandys.retain(|w| w.mode() == WorkerMode::Sandy);
+    sandys.retain(|w| w.is_sandy() && w.mode() != WorkerMode::Prefill);
     let incremental =
         |w: &Arc<Worker>| (w.openai_settings()).map(|s| s.incremental_streaming_output);
     let first = incremental(sandys.first()?)?;
@@ -2013,9 +2014,11 @@ mod tests {
         let sandy = crate::discovery::WorkerSpec {
             id: crate::discovery::WorkerId("sandy".into()),
             url: "http://sandy:0".into(),
-            mode: WorkerMode::Sandy,
+            mode: WorkerMode::Plain,
             model_ids: vec![ModelId("stub-model".into())],
-            bootstrap_port: Some(8996),
+            franky: Some(crate::discovery::FrankyRole::Sandy {
+                tap_port: Some(8996),
+            }),
             ..Default::default()
         };
         ctx.registry.add(sandy).unwrap();
@@ -2027,7 +2030,7 @@ mod tests {
             .registry
             .workers_for(&ModelId("stub-model".into()))
             .into_iter())
-        .find(|w| w.mode() == WorkerMode::Sandy)
+        .find(|w| w.is_sandy())
         .expect("franky_stub registers a Sandy");
         SelectedWorkers {
             prefill: Arc::clone(&sandy),

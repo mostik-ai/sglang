@@ -26,7 +26,6 @@ class FrankyReceiver(NixlKVReceiver):
         manager: FrankyTapManager,
         franky_room: FrankyRoom,
         tap_pages: np.ndarray,
-        num_tokens: int,
         prefix_len: int = 0,
     ) -> None:
         """
@@ -38,7 +37,6 @@ class FrankyReceiver(NixlKVReceiver):
         super().__init__(manager, franky_room.bootstrap_address, franky_room.room)
         manager.track_room(franky_room.room)
         self.tap_pages = tap_pages
-        self.num_tokens = num_tokens
         self.prefix_len = prefix_len
         self.pages_registered = False
 
@@ -55,7 +53,6 @@ class FrankyReceiver(NixlKVReceiver):
             manager=manager,
             franky_room=franky_room,
             tap_pages=tap_cache.pages_to_land(reservation),
-            num_tokens=reservation.num_taps,
             prefix_len=reservation.cached.num_taps,
         )
 
@@ -68,11 +65,11 @@ class FrankyReceiver(NixlKVReceiver):
     def landed(self) -> int:
         """
         Returns:
-            The prompt tokens whose taps have landed on this rank.
+            The leading tokens, in whole tap pages, whose taps have landed on
+            this rank; the last page may run past the request's taps.
         """
         landed_pages = self.kv_mgr.landed_pages(self.bootstrap_room)
-        landed = self.prefix_len + landed_pages * self.kv_mgr.kv_args.page_size
-        return min(landed, self.num_tokens)
+        return self.prefix_len + landed_pages * self.kv_mgr.kv_args.page_size
 
     def writes_stopped(self) -> bool:
         """

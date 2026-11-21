@@ -1004,9 +1004,10 @@ async fn manager_registers_a_franky_pair_from_introspection() {
     assert!(registered, "both workers must join model m");
     let sandy = registry.get(&WorkerId("s".into())).unwrap();
     assert_eq!(
-        (sandy.mode(), sandy.bootstrap_port(), sandy.needs_taps()),
-        (WorkerMode::Sandy, Some(8996), false)
+        (sandy.mode(), sandy.is_sandy(), sandy.tap_port()),
+        (WorkerMode::Plain, true, Some(8996))
     );
+    assert_eq!((sandy.bootstrap_port(), sandy.needs_taps()), (None, false));
     let ricky = registry.get(&WorkerId("r".into())).unwrap();
     assert_eq!(
         (ricky.mode(), ricky.needs_taps()),

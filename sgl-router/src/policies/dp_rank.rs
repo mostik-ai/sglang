@@ -67,13 +67,13 @@ mod tests {
             bootstrap_port: None,
             version_group: None,
             services: Default::default(),
+            franky: None,
         };
         let profile = EngineProfile {
             protocol: WireProtocol::default(),
             dp_ranks,
             openai: None,
             grpc_port: None,
-            needs_taps: false,
         };
         Worker::with_cb_config(spec, None, profile)
     }

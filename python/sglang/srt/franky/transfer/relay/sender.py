@@ -15,9 +15,8 @@ if TYPE_CHECKING:
 
 
 class FrankyRelaySender(NixlKVSender):
-    """PD's KV sender on Ricky prefill that also relays the request's taps to
-    Ricky decode in the same room, once they all landed here, and ends only
-    when both transfers ended.
+    """PD's KV sender on a prefill with taps that also relays the request's taps
+    to its decode in the same room, and ends only when both transfers ended.
     """
 
     kv_mgr: FrankyRelayManager
@@ -81,6 +80,6 @@ class FrankyRelaySender(NixlKVSender):
         host = self.bootstrap_server_url.rsplit(":", 1)[0].strip("[]")
         return FrankyRoom(
             bootstrap_host=host,
-            bootstrap_port=self.kv_mgr.relay_bootstrap_port,
+            bootstrap_port=self.kv_mgr.tap_relay.franky_bootstrap_port,
             room=self.bootstrap_room,
         )

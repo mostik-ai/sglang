@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::config::{ChatTemplateAdapterKind, Config, FrankySandyConfig, PolicyKind};
-use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::discovery::{FrankyRole, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::policies_reorg::factory::build_sandy_group;
 use sgl_router::proxy::Proxy;
@@ -64,17 +64,19 @@ fn router_context(config: Config, engines: &[(&MockWorker, Engine)]) -> AppConte
         let spec = WorkerSpec {
             id: WorkerId(worker.url.clone()),
             url: worker.url.clone(),
-            mode: match engine {
-                Engine::Sandy => WorkerMode::Sandy,
-                Engine::Ricky | Engine::Solo => WorkerMode::Plain,
-            },
+            mode: WorkerMode::Plain,
             model_ids: vec![ModelId(config.model.id.clone())],
-            bootstrap_port: matches!(engine, Engine::Sandy).then_some(SANDY_PORT),
+            franky: match engine {
+                Engine::Sandy => Some(FrankyRole::Sandy {
+                    tap_port: Some(SANDY_PORT),
+                }),
+                Engine::Ricky => Some(FrankyRole::Ricky { reads_taps: true }),
+                Engine::Solo => None,
+            },
             ..Default::default()
         };
         let profile = EngineProfile {
             openai: Some(Arc::default()),
-            needs_taps: matches!(engine, Engine::Ricky),
             ..WireProtocol::default().into()
         };
         registry.add_with_cb(spec, None, profile).unwrap();

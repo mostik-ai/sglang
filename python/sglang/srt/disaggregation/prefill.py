@@ -1225,7 +1225,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 # unlock the tree
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
+                self.batch_result_processor.release_finished_kv(req, checkpoint=True)
                 self.tree_cache.finish(
                     req.cache_request_handle, CacheRequestOutcome.SUCCESS
                 )

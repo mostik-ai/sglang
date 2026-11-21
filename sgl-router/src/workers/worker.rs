@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::discovery::{ModelId, WorkerId, WorkerMode};
+use crate::discovery::{FrankyRole, ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_processor::openai::OpenAiSettings;
@@ -51,8 +51,6 @@ pub struct EngineProfile {
     pub openai: Option<Arc<OpenAiSettings>>,
     /// The engine's native gRPC port; `None` means gRPC clients cannot reach it.
     pub grpc_port: Option<u16>,
-    /// A Franky Ricky engine (`--franky-side ricky`): each request needs a Sandy.
-    pub needs_taps: bool,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -62,7 +60,6 @@ impl From<WireProtocol> for EngineProfile {
             dp_ranks: 1,
             openai: None,
             grpc_port: None,
-            needs_taps: false,
         }
     }
 }
@@ -201,7 +198,6 @@ impl WorkerMode {
             WorkerMode::Plain => 0,
             WorkerMode::Prefill => 1,
             WorkerMode::Decode => 2,
-            WorkerMode::Sandy => 3,
         }
     }
 
@@ -215,7 +211,6 @@ impl WorkerMode {
             0 => WorkerMode::Plain,
             1 => WorkerMode::Prefill,
             2 => WorkerMode::Decode,
-            3 => WorkerMode::Sandy,
             other => unreachable!("invalid WorkerMode discriminant {other}"),
         }
     }
@@ -261,7 +256,7 @@ pub struct Worker {
     /// Round-robin position over this worker's DP ranks.
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
-    needs_taps: bool,
+    franky: Option<FrankyRole>,
 }
 
 impl Worker {
@@ -282,7 +277,6 @@ impl Worker {
             dp_ranks,
             openai,
             grpc_port,
-            needs_taps,
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -310,7 +304,7 @@ impl Worker {
             dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
             dp_rank_turn: AtomicUsize::new(0),
             openai,
-            needs_taps,
+            franky: spec.franky,
         }
     }
 
@@ -318,9 +312,26 @@ impl Worker {
         self.openai.as_ref()
     }
 
-    /// A Franky Ricky worker: each request it serves needs a Sandy to send its taps.
+    /// Its side of a Franky pair; `None` for a solo engine.
+    pub fn franky_role(&self) -> Option<FrankyRole> {
+        self.franky
+    }
+
+    /// A Franky Ricky worker that reads taps: each request it serves needs a
+    /// Sandy to send them.
     pub fn needs_taps(&self) -> bool {
-        self.needs_taps
+        self.franky.is_some_and(FrankyRole::reads_taps)
+    }
+
+    /// A Franky Sandy worker, which serves a pair's frozen model, never its
+    /// requests.
+    pub fn is_sandy(&self) -> bool {
+        self.franky.is_some_and(FrankyRole::is_sandy)
+    }
+
+    /// A Sandy worker's tap bootstrap port, where the rooms of its taps open.
+    pub fn tap_port(&self) -> Option<u16> {
+        self.franky.and_then(FrankyRole::tap_port)
     }
 
     pub fn services(&self) -> BTreeSet<String> {

@@ -395,9 +395,11 @@ sgl-router --model-id ricky --chat-routing reorg --policy cache_aware \
   --worker-urls http://ricky-0:30000 http://sandy-0:30000
 ```
 
-- The router reads each engine's side from `/server_info` (`franky_side`). A
-  Sandy joins the router's model whatever name it serves under, and its tap
-  port is its `franky_bootstrap_port`.
+- The router reads each engine's side from `/server_info` (`franky_side`),
+  apart from its PD role. A Sandy joins the router's model whatever name it
+  serves under, and its tap port is its `franky_bootstrap_port`. Sandy workers
+  are a pool apart from the workers serving requests: each pool is all plain
+  or all PD, and Ricky's pool may be PD with plain Sandys or the other way.
 - Each request to a Ricky worker also gets a Sandy, picked from all Sandy
   workers, not per bucket, by `--policy` and the admission flags as a prefill
   group is. `cache_aware` picks the Sandy holding the longest cached prefix of
@@ -416,7 +418,7 @@ sgl-router --model-id ricky --chat-routing reorg --policy cache_aware \
   classify and rerank are refused.
 - With Kubernetes discovery, `--sandy-selector` (equality terms) finds Sandy
   EndpointSlices in plain or PD mode; next to `--selector`, that selector must
-  use equality terms too.
+  use equality terms too. A Sandy's PD role comes from its `/server_info`.
 
 ### Chains
 
@@ -440,7 +442,10 @@ request beside a Sandy leg that sends the prompt's taps.
 
 - A Sandy call (rid `{chain}-s{n}`) gets the trace as `input_ids` and writes at
   most `sandy_call_tokens` of the answer; with taps it gets a new
-  `franky_room` at its tap port. It streams to a streaming client when Sandy
+  `franky_room` at its tap port. With PD Sandys it goes to a Sandy prefill and a
+  Sandy decode of one version group, with PD bootstrap fields; the room opens
+  at the decode, which writes the call. Sandy prefill relays the trace's taps
+  to the decode with its KV. It streams to a streaming client when Sandy
   reads Ricky's tokens and all Sandy workers report the same
   `incremental_streaming_output`; otherwise it is unary. Its text joins the trace and the answer. Its
   EOS ends only its text; a client stop rule or the answer's token limit ends
@@ -475,8 +480,10 @@ request beside a Sandy leg that sends the prompt's taps.
   (see [Chat rendering](#chat-rendering)).
 - A stop string across two requests is not matched; each checks its own output.
 - Engines started with `--franky-side` and without `--franky-config` write text
-  only; run them with `"taps": false`. Such a Ricky may run prefill-decode
-  disaggregation; a Sandy never does.
+  only; run them with `"taps": false`. Either side may run prefill-decode
+  disaggregation, with or without taps.
+- A Sandy leg only prefills, so the router refuses to register a PD Sandy
+  while `--franky-chain` makes Sandy legs (`sandy_call_tokens` 0 with taps).
 
 ### Earlier answers
 

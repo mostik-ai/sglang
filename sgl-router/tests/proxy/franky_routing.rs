@@ -17,7 +17,7 @@ use sgl_router::config::{
     Config, DiscoveryBackend, FrankyChainConfig, InflightLoadConfig, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
-use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::discovery::{FrankyRole, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::policies_reorg::factory::{build_resolver, build_sandy_group};
 use sgl_router::proxy::Proxy;
@@ -35,6 +35,7 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 const SANDY_PORT: u16 = 8996;
+const SANDY_PREFILL_PORT: u16 = 8995;
 const PREFILL_PORT: u16 = 8997;
 
 fn config(max_attempts: u32, policy: PolicyKind, franky_chain: FrankyChainConfig) -> Config {
@@ -102,10 +103,13 @@ fn franky_ctx_with_chain(
     reorg: bool,
     franky_chain: FrankyChainConfig,
 ) -> Arc<AppContext> {
+    let sandy: Vec<_> = (sandy.iter())
+        .map(|&(id, url)| (id, url, WorkerMode::Plain))
+        .collect();
     let sandy_settings = Some(OpenAiSettings::default());
     franky_ctx_with_sandy_settings(
         ricky,
-        sandy,
+        &sandy,
         max_attempts,
         reorg,
         franky_chain,
@@ -113,10 +117,11 @@ fn franky_ctx_with_chain(
     )
 }
 
-/// `franky_ctx_with_chain` whose Sandy workers report `sandy_settings`.
+/// `franky_ctx_with_chain` over Sandy workers of their own PD roles, which
+/// report `sandy_settings`.
 fn franky_ctx_with_sandy_settings(
     ricky: &[(&str, &str, WorkerMode)],
-    sandy: &[(&str, &str)],
+    sandy: &[(&str, &str, WorkerMode)],
     max_attempts: u32,
     reorg: bool,
     franky_chain: FrankyChainConfig,
@@ -136,21 +141,21 @@ fn franky_ctx_with_sandy_settings(
             mode: *mode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: (*mode == WorkerMode::Prefill).then_some(PREFILL_PORT),
+            franky: Some(FrankyRole::Ricky { reads_taps: true }),
             ..Default::default()
         };
-        let profile = EngineProfile {
-            needs_taps: true,
-            ..EngineProfile::from(WireProtocol::default())
-        };
-        registry.add_with_cb(spec, None, profile).unwrap();
+        registry.add(spec).unwrap();
     }
-    for (id, url) in sandy {
+    for (id, url, mode) in sandy {
         let spec = WorkerSpec {
             id: WorkerId((*id).into()),
             url: (*url).into(),
-            mode: WorkerMode::Sandy,
+            mode: *mode,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: Some(SANDY_PORT),
+            bootstrap_port: (*mode == WorkerMode::Prefill).then_some(SANDY_PREFILL_PORT),
+            franky: Some(FrankyRole::Sandy {
+                tap_port: Some(SANDY_PORT),
+            }),
             ..Default::default()
         };
         let profile = EngineProfile {
@@ -775,6 +780,43 @@ async fn a_chain_where_sandy_writes_serves_what_the_chat_lowering_writes() {
     assert_eq!((sandy.requests().len(), ricky.requests().len()), (2, 2));
 }
 
+/// Sandy calls to PD Sandys go to a Sandy prefill and decode pair with PD
+/// bootstrap fields at the prefill's PD port; the decode answers, and each
+/// call's room, which the next leg reads, opens at the decode's tap port.
+#[tokio::test]
+async fn sandy_calls_to_pd_sandys_go_to_a_prefill_and_decode_pair() {
+    let (ricky, ricky_url, _ricky_stop) = ChainEngine::start(12).await;
+    let (prefill, prefill_url, _prefill_stop) = ChainEngine::start(usize::MAX).await;
+    let (decode, decode_url, _decode_stop) = ChainEngine::start(usize::MAX).await;
+    let ctx = franky_ctx_with_sandy_settings(
+        &[("r", &ricky_url, WorkerMode::Plain)],
+        &[
+            ("sp", &prefill_url, WorkerMode::Prefill),
+            ("sd", &decode_url, WorkerMode::Decode),
+        ],
+        1,
+        false,
+        chain_config(2, true, 4),
+        Some(OpenAiSettings::default()),
+    );
+    let body = json!({"input_ids": PROMPT, "sampling_params": {"max_new_tokens": 100}});
+
+    let res = build_router(ctx).oneshot(generate(body)).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let answer = json_answer(res).await;
+    assert_eq!(answer["output_ids"], json!((3..15).collect::<Vec<_>>()));
+    let (prefill_calls, calls, legs) = (prefill.requests(), decode.requests(), ricky.requests());
+    assert_eq!((prefill_calls.len(), calls.len(), legs.len()), (2, 2, 2));
+    for ((prefill_call, call), leg) in prefill_calls.iter().zip(&calls).zip(&legs) {
+        assert_eq!(prefill_call["bootstrap_port"], json!(SANDY_PREFILL_PORT));
+        assert_eq!(prefill_call["bootstrap_room"], call["bootstrap_room"]);
+        assert_eq!(prefill_call["input_ids"], call["input_ids"]);
+        assert_eq!(call["franky_room"]["bootstrap_port"], json!(SANDY_PORT));
+        assert_eq!(leg["franky_room"], call["franky_room"]);
+    }
+}
+
 /// A Sandy call that writes all that is left of the answer ends it.
 #[tokio::test]
 async fn sandys_text_at_the_answers_limit_ends_the_answer() {
@@ -821,7 +863,7 @@ async fn a_sandy_that_does_not_say_how_it_streams_gets_unary_calls() {
     let (sandy, sandy_url, _sandy_stop) = ChainEngine::start(usize::MAX).await;
     let ctx = franky_ctx_with_sandy_settings(
         &[("r", &ricky_url, WorkerMode::Plain)],
-        &[("s", &sandy_url)],
+        &[("s", &sandy_url, WorkerMode::Plain)],
         1,
         false,
         chain_config(2, true, 4),

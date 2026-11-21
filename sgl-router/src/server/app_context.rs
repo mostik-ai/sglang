@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::buckets_reorg::{BucketResolver, EngineGroup};
+use crate::buckets_reorg::{BucketResolver, SandyPool};
 use crate::config::Config;
 use crate::discovery::ModelId;
 
@@ -61,8 +61,8 @@ pub struct AppContext {
     pub bucket_selector: Arc<BucketSelector>,
     /// Select legacy policies or model-specific bucket-first routing.
     pub chat_routing: ChatRouting,
-    /// Where a Franky Ricky's Sandy is picked from, under either routing.
-    pub sandy: Option<EngineGroup>,
+    /// Where a Franky request's Sandys are picked from, under either routing.
+    pub sandy: Option<SandyPool>,
     /// Finds the earlier answers in the chats the router renders for Franky
     /// workers; `None` without `--franky-chat-adapter`.
     pub franky_chat_adapter: Option<Arc<dyn ChatTemplateAdapter>>,

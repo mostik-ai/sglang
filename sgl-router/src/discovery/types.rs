@@ -25,9 +25,10 @@ impl std::fmt::Display for ModelId {
     }
 }
 
-/// Prefill/Decode/Plain role of a worker, or Sandy.
+/// Prefill/Decode/Plain role of a worker. A Franky pair's side is its
+/// [`FrankyRole`], apart from this.
 ///
-/// Serialises as `"plain"`, `"prefill"`, `"decode"`, `"sandy"` (snake_case).
+/// Serialises as `"plain"`, `"prefill"`, `"decode"` (snake_case).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerMode {
@@ -35,9 +36,38 @@ pub enum WorkerMode {
     Plain,
     Prefill,
     Decode,
-    /// The frozen model of a Franky pair: it computes a prompt's taps and sends
-    /// them to the Ricky worker that serves the request, and never decodes.
-    Sandy,
+}
+
+/// A worker's side of a Franky pair. Routing keeps Sandy workers apart from
+/// the ones serving requests, whatever their PD role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "side")]
+pub enum FrankyRole {
+    /// Runs the frozen model, writes what a chain asks, and serves its taps at
+    /// its tap bootstrap port (`--franky-bootstrap-port`); `None` until the
+    /// worker reports it.
+    Sandy { tap_port: Option<u16> },
+    /// Writes a chain's blocks; with `reads_taps` (its `--franky-config`),
+    /// each request needs a Sandy.
+    Ricky { reads_taps: bool },
+}
+
+impl FrankyRole {
+    pub fn is_sandy(self) -> bool {
+        matches!(self, Self::Sandy { .. })
+    }
+
+    /// A Ricky that reads taps: each request it serves needs a Sandy.
+    pub fn reads_taps(self) -> bool {
+        self == Self::Ricky { reads_taps: true }
+    }
+
+    pub fn tap_port(self) -> Option<u16> {
+        match self {
+            Self::Sandy { tap_port } => tap_port,
+            Self::Ricky { .. } => None,
+        }
+    }
 }
 
 /// Immutable worker description emitted by a discovery backend.
@@ -55,8 +85,7 @@ pub enum WorkerMode {
 /// `bootstrap_host`/`bootstrap_port` plus a random `bootstrap_room`
 /// u64 onto every PD-disagg request body so the prefill engine can
 /// match incoming KV-transfer requests from the decode peer. A Sandy
-/// worker's is its tap bootstrap port (`--franky-bootstrap-port`), sent
-/// the same way as the `franky_room` of the Ricky requests it serves.
+/// worker's tap bootstrap port is its [`FrankyRole`]'s.
 ///
 /// `version_group` scopes PD pairing: a prefill worker is only paired
 /// with a decode worker whose `version_group` is equal, so two engine
@@ -76,6 +105,9 @@ pub struct WorkerSpec {
     /// of the pod-incarnation ID; empty for static URL discovery.
     #[serde(default)]
     pub services: BTreeSet<String>,
+    /// Its side of a Franky pair; `None` for a solo engine.
+    #[serde(default)]
+    pub franky: Option<FrankyRole>,
 }
 
 /// Event produced by a discovery backend and consumed by `WorkerManager`.
@@ -165,10 +197,6 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&WorkerMode::Decode).unwrap(),
             "\"decode\""
-        );
-        assert_eq!(
-            serde_json::to_string(&WorkerMode::Sandy).unwrap(),
-            "\"sandy\""
         );
     }
 

@@ -4,7 +4,7 @@
 use super::*;
 use crate::common::mock_worker::MockWorker;
 use futures::future::BoxFuture;
-use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
+use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup, WorkerPool};
 use sgl_router::policies::PolicyRegistry;
 use sgl_router::policies_reorg::admission::{
     AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
@@ -97,6 +97,7 @@ fn group(id: &str, policy: Arc<FirstPolicy>) -> EngineGroup {
         worker_services: None,
         worker_ids: Some([WorkerId(id.into())].into_iter().collect()),
         policy,
+        pool: WorkerPool::Serving,
     }
 }
 
@@ -677,6 +678,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
             worker_services: None,
             worker_ids: Some([WorkerId("rejected".into())].into_iter().collect()),
             policy: Arc::new(rejecting),
+            pool: WorkerPool::Serving,
         }),
     );
     first.rank = 0;
@@ -690,6 +692,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
                     .collect(),
             ),
             policy: Arc::new(CacheAwarePolicy::new(source, table, config).unwrap()),
+            pool: WorkerPool::Serving,
         }),
     );
     second.rank = 1;
@@ -988,6 +991,7 @@ async fn full_decode_group_falls_back_to_another_version_group() {
                 bootstrap_port: Some(8998),
                 version_group: Some(group.into()),
                 services: Default::default(),
+                franky: None,
             })
             .unwrap();
     }

@@ -184,7 +184,7 @@ impl FrankyRoom {
     pub(super) fn at(sandy: &Worker) -> Self {
         Self {
             host: sandy.bootstrap_host().to_string(),
-            port: sandy.bootstrap_port(),
+            port: sandy.tap_port(),
             room: generate_room_id(),
         }
     }
@@ -234,9 +234,7 @@ impl TapSource {
             Self::None => None,
             Self::SandyLeg => workers.sandy.as_deref().map(FrankyRoom::at),
             Self::Room(room) => Some(room.clone()),
-            Self::SandyCall => Some(FrankyRoom::at(
-                workers.decode.as_deref().unwrap_or(&workers.prefill),
-            )),
+            Self::SandyCall => Some(FrankyRoom::at(workers.answering())),
         }
     }
 }

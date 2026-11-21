@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
     ensure!(
         config.model.tokenizer_path.is_some()
             || !(chat_routing.needs_request_tokens(&routing_policies)
-                || sandy.policy.needs_request_tokens()),
+                || sandy.needs_request_tokens()),
         "--no-tokenizer is incompatible with cache-aware routing and prefix-cache terms or filters"
     );
 

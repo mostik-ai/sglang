@@ -59,7 +59,7 @@ impl Policy for PowerOfTwoPolicy {
                     }
                     let (left, right) = (&admitted[i], &admitted[j]);
                     let ordering = match request.stage {
-                        Stage::Plain | Stage::Prefill | Stage::Sandy => {
+                        Stage::Plain | Stage::Prefill => {
                             compare_prefill_engines(left, right, Some(&load))
                         }
                         Stage::Decode => compare_decode_engines(left, right, Some(&load)),

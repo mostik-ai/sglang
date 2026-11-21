@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use crate::discovery::{FrankyRole, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::workers::worker::{EngineProfile, WireProtocol, Worker};
 use dashmap::DashMap;
@@ -95,8 +95,9 @@ impl WorkerRegistry {
         profile: impl Into<EngineProfile>,
     ) -> Result<(), AddWorkerError> {
         let incoming_mode = spec.mode;
+        let incoming_sandy = spec.franky.is_some_and(FrankyRole::is_sandy);
+        let incoming_needs_taps = spec.franky.is_some_and(FrankyRole::reads_taps);
         let profile = profile.into();
-        let incoming_needs_taps = profile.needs_taps;
         // Hold the write lock for the entire validate→insert sequence.
         // Without it, two concurrent callers for conflicting modes on
         // the same model can both see an empty pool and both proceed
@@ -124,6 +125,10 @@ impl WorkerRegistry {
                 if existing.id == spec.id {
                     continue;
                 }
+                // A model's Sandy workers are a pool apart from the ones serving it.
+                if incoming_sandy != existing.is_sandy() {
+                    continue;
+                }
                 if modes_are_mixed(incoming_mode, existing.mode()) {
                     return Err(AddWorkerError::MixedPdAndPlain {
                         worker: spec.id,
@@ -131,10 +136,7 @@ impl WorkerRegistry {
                         pd_mode: mode_name(incoming_mode),
                     });
                 }
-                let ricky_sides = [incoming_mode, existing.mode()]
-                    .iter()
-                    .all(|&mode| mode != WorkerMode::Sandy);
-                if ricky_sides && incoming_needs_taps != existing.needs_taps() {
+                if !incoming_sandy && incoming_needs_taps != existing.needs_taps() {
                     return Err(AddWorkerError::MixedFrankyAndSolo {
                         worker: spec.id,
                         model: model.clone(),
@@ -257,7 +259,6 @@ fn mode_name(m: WorkerMode) -> &'static str {
         WorkerMode::Plain => "plain",
         WorkerMode::Prefill => "prefill",
         WorkerMode::Decode => "decode",
-        WorkerMode::Sandy => "sandy",
     }
 }
 
@@ -300,30 +301,41 @@ mod tests {
         assert_eq!(ids, vec!["d", "p", "w1"]);
     }
 
-    /// A Sandy serves next to plain and PD Ricky workers, but a Ricky that reads
-    /// taps never serves next to a solo worker of the same model.
+    fn franky(id: &str, mode: WorkerMode, role: FrankyRole) -> WorkerSpec {
+        WorkerSpec {
+            franky: Some(role),
+            ..spec(id, mode, &["m"])
+        }
+    }
+
+    /// Sandy workers of any PD role serve next to plain and PD Ricky workers,
+    /// but a Ricky that reads taps never serves next to a solo worker of the
+    /// same model, and neither pool mixes plain and PD workers.
     #[test]
     fn franky_ricky_and_solo_workers_never_share_a_model() {
-        let ricky = || EngineProfile {
-            needs_taps: true,
-            ..EngineProfile::from(WireProtocol::default())
+        let ricky = FrankyRole::Ricky { reads_taps: true };
+        let sandy = FrankyRole::Sandy {
+            tap_port: Some(8996),
         };
         let r = WorkerRegistry::default();
-        r.add(spec("s", WorkerMode::Sandy, &["m"])).unwrap();
-        r.add_with_cb(spec("p", WorkerMode::Prefill, &["m"]), None, ricky())
-            .unwrap();
-        r.add_with_cb(spec("d", WorkerMode::Decode, &["m"]), None, ricky())
-            .unwrap();
-        let solo = r.add(spec("solo", WorkerMode::Decode, &["m"]));
+        r.add(franky("sp", WorkerMode::Prefill, sandy)).unwrap();
+        r.add(franky("sd", WorkerMode::Decode, sandy)).unwrap();
+        r.add(franky("r", WorkerMode::Plain, ricky)).unwrap();
+        let solo = r.add(spec("solo", WorkerMode::Plain, &["m"]));
         assert!(matches!(
             solo,
             Err(AddWorkerError::MixedFrankyAndSolo { .. })
         ));
+        let plain_sandy = r.add(franky("s", WorkerMode::Plain, sandy));
+        assert!(matches!(
+            plain_sandy,
+            Err(AddWorkerError::MixedPdAndPlain { .. })
+        ));
 
         let r = WorkerRegistry::default();
         r.add(spec("plain", WorkerMode::Plain, &["m"])).unwrap();
-        r.add(spec("s", WorkerMode::Sandy, &["m"])).unwrap();
-        let ricky = r.add_with_cb(spec("r", WorkerMode::Plain, &["m"]), None, ricky());
+        r.add(franky("s", WorkerMode::Plain, sandy)).unwrap();
+        let ricky = r.add(franky("r", WorkerMode::Plain, ricky));
         assert!(matches!(
             ricky,
             Err(AddWorkerError::MixedFrankyAndSolo { .. })

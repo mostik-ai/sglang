@@ -10,7 +10,7 @@ mod preparation;
 mod reorg;
 mod tap_runs;
 
-use crate::buckets_reorg::BucketResolver;
+use crate::buckets_reorg::{BucketPick, BucketRequest, BucketResolver};
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
@@ -19,7 +19,7 @@ use crate::policies::selection::{
 };
 use crate::policies::{Policy, PrefixLookupResult};
 use crate::policies_reorg::cache_aware::PrefixMemo;
-use crate::policies_reorg::{PickRequest, Stage};
+use crate::policies_reorg::PickError;
 use crate::proxy::grpc::{EngineRpc, GrpcResponse, TypedRpc};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
@@ -315,8 +315,7 @@ fn refuse_franky_over_grpc(ctx: &AppContext, model: &ModelId) -> Result<(), ApiE
 }
 
 fn serves_franky(ctx: &AppContext, model: &ModelId) -> bool {
-    (ctx.registry.workers_for(model).iter())
-        .any(|w| w.needs_taps() || w.mode() == WorkerMode::Sandy)
+    (ctx.registry.workers_for(model).iter()).any(|w| w.needs_taps() || w.is_sandy())
 }
 
 /// Whether requests to `model` read taps: its Ricky workers read them and
@@ -501,7 +500,8 @@ impl<'a> ModelRouting<'a> {
             }
         };
         if request.franky.tap_source.needs_sandy_leg() {
-            workers.sandy = Some(pick_sandy(ctx, request, headers, excluded, &prefix).await?);
+            let leg = pick_sandys(ctx, request, headers, excluded, &prefix, SandyUse::Leg);
+            workers.sandy = Some(leg.await?.prefill.engine);
         }
         Ok(workers)
     }
@@ -519,7 +519,8 @@ impl WorkerPicker for ModelRouting<'_> {
     }
 }
 
-/// Picks the Sandy of a Franky chain's Sandy call.
+/// Picks the Sandy of a Franky chain's Sandy call: a plain Sandy, or a Sandy
+/// prefill and decode pair.
 struct SandyPicker;
 
 impl WorkerPicker for SandyPicker {
@@ -531,53 +532,72 @@ impl WorkerPicker for SandyPicker {
         excluded: &[WorkerId],
     ) -> Result<SelectedWorkers, ApiError> {
         let prefix = PrefixMemo::default();
-        let sandy = pick_sandy(ctx, request, headers, excluded, &prefix).await?;
+        let pick = pick_sandys(ctx, request, headers, excluded, &prefix, SandyUse::Call).await?;
         Ok(SelectedWorkers {
-            prefill: sandy,
-            decode: None,
+            prefill: pick.prefill.engine,
+            decode: pick.decode.map(|pick| pick.engine),
             sandy: None,
             track_dispatch_timestamps: false,
         })
     }
 }
 
-/// The Sandy that sends a Franky request's taps: the model's Sandy group picks
-/// it, by prefix when its policy is cache-aware.
-async fn pick_sandy(
+/// What a Franky request picks a Sandy for.
+#[derive(Clone, Copy)]
+enum SandyUse {
+    /// A taps-only leg beside a Ricky request, which only prefills.
+    Leg,
+    /// A Sandy call, which writes: on PD Sandys, a prefill and decode pair.
+    Call,
+}
+
+/// A Franky request's Sandys from the model's Sandy pool, picked as any
+/// bucket's engines are: by prefix when its policy is cache-aware, and a PD
+/// pair within one version group.
+async fn pick_sandys(
     ctx: &AppContext,
     request: &PreparedRequest,
     headers: &HeaderMap,
     excluded: &[WorkerId],
     prefix: &PrefixMemo,
-) -> Result<Arc<Worker>, ApiError> {
+    sandy_use: SandyUse,
+) -> Result<BucketPick, ApiError> {
     let model = &request.model;
-    let group = ctx
-        .sandy
-        .as_ref()
-        .ok_or_else(|| ApiError::NoSandyWorkersAvailable {
-            model: model.0.clone(),
-        })?;
-    let session_key = (ctx.config.model.affinity.as_ref())
-        .and_then(|config| nonempty_header(headers, &config.session_id_header));
-    let routing_key = (ctx.config.model.sticky.as_ref())
-        .and_then(|config| nonempty_header(headers, &config.header_name));
-    let pick_request = PickRequest {
-        bucket: "sandy",
+    let no_sandy = || ApiError::NoSandyWorkersAvailable {
+        model: model.0.clone(),
+    };
+    let pool = ctx.sandy.as_ref().ok_or_else(no_sandy)?;
+    let bucket = match sandy_use {
+        SandyUse::Leg => &pool.plain,
+        SandyUse::Call => pool.call_bucket(&ctx.registry, model),
+    };
+    let bucket_request = BucketRequest {
+        model,
+        input_tokens: request.sequence_token_count as u64,
         total_input_tokens: request.input_token_count as u64,
         expected_peak_tokens: request.expected_peak_sequence_tokens,
         prefix: Some(prefix),
         token_ids: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
         cache_namespace: &request.cache_namespace,
-        session_key,
-        routing_key,
-        ..PickRequest::new(model, Stage::Sandy, request.sequence_token_count as u64)
+        session_key: (ctx.config.model.affinity.as_ref())
+            .and_then(|config| nonempty_header(headers, &config.session_id_header)),
+        routing_key: (ctx.config.model.sticky.as_ref())
+            .and_then(|config| nonempty_header(headers, &config.header_name)),
+        excluded,
     };
-    let pick = group
-        .pick_excluding(&ctx.registry, &pick_request, excluded)
-        .await
-        .map_err(|error| reorg::selection_error(error, model, Some(Stage::Sandy)))?;
-    record_prefill_route(ctx, prefix.local_signal().as_deref(), &pick.engine.url);
-    Ok(pick.engine)
+    let pick =
+        (bucket.pick_engines(&ctx.registry, &bucket_request).await).map_err(|(stage, error)| {
+            match error {
+                PickError::NoCandidates => no_sandy(),
+                error => reorg::selection_error(error, model, Some(stage)),
+            }
+        })?;
+    record_prefill_route(
+        ctx,
+        prefix.local_signal().as_deref(),
+        &pick.prefill.engine.url,
+    );
+    Ok(pick)
 }
 
 fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {

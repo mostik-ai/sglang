@@ -105,13 +105,12 @@ class TestFrankyTapsPastTheCachedPrefix(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "17 tokens"):
             sender.land(tap_pages=np.array([10], dtype=np.int32))
 
-    def test_the_receiver_counts_landed_taps_from_its_cached_prefix(self):
+    def test_the_receiver_counts_landed_tap_pages_from_its_cached_prefix(self):
         manager = _ReceivingManager()
         receiver = FrankyReceiver(
             manager=manager,
             franky_room=_ROOM,
             tap_pages=np.array([5, 6, 7], dtype=np.int32),
-            num_tokens=70,
             prefix_len=32,
         )
 
@@ -119,7 +118,7 @@ class TestFrankyTapsPastTheCachedPrefix(CustomTestCase):
         manager.pages_landed = 2
         self.assertEqual(receiver.landed(), 64)
         manager.pages_landed = 3
-        self.assertEqual(receiver.landed(), 70)
+        self.assertEqual(receiver.landed(), 80)
 
 
 def _tap_manager(*, attn_tp_size, pp_size, attn_tp_rank=0, senders_split_alike=False):

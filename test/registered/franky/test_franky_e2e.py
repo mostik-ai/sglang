@@ -32,7 +32,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=2250, stage="base-b", runner_config="4-gpu-b200")
 
 _MODEL = "Qwen/Qwen3.5-0.8B"
 _LAYERS = [6, 12, 18, 24]
@@ -49,6 +49,9 @@ _TEXT = (
     "The river ran through the old town, past the mill and the bakery, under the "
     "stone bridge where children threw pebbles into the water every evening. "
 )
+# A short prompt whose continuation is new text, so the taps of Sandy's tokens
+# are most of what Ricky reads, not near copies of the prompt's.
+_STORY_PROMPT = "Write a short story about a lighthouse keeper who finds a map."
 
 
 _HANDED_OUT_PORTS: set[int] = set()
@@ -151,7 +154,7 @@ class _FrankyPair(CustomTestCase):
         ]
 
     @classmethod
-    def _launch(cls, side, url, *, gpu, tp_size, extra=()):
+    def _launch(cls, side, url, *, gpu, tp_size, extra=(), franky_port=None):
         args = [
             "--franky-side", side,
             "--franky-config", os.path.join(cls.directory, "franky.json"),
@@ -169,7 +172,7 @@ class _FrankyPair(CustomTestCase):
             # attention backend is set.
             args += ["--attention-backend", "trtllm_mha"]
         if side == "sandy":
-            args += ["--franky-bootstrap-port", str(cls.bootstrap_port)]
+            args += ["--franky-bootstrap-port", str(franky_port or cls.bootstrap_port)]
         return popen_launch_server(
             _MODEL, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, other_args=args
         )
@@ -466,12 +469,7 @@ class TestFrankyEndToEnd(_FrankyPair):
             )
 
     def test_ricky_reads_the_taps_of_the_tokens_sandy_wrote(self):
-        # A short prompt whose continuation is new text, so the taps of
-        # Sandy's tokens are most of what Ricky reads, not near copies of the
-        # prompt's.
-        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(
-            "Write a short story about a lighthouse keeper who finds a map."
-        )
+        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(_STORY_PROMPT)
         room = self._room(4500)
         sandy = requests.post(
             f"{self.sandy_url}/generate",
@@ -678,24 +676,150 @@ class TestFrankyOwnSandyTokensPdEndToEnd(TestFrankyPdEndToEnd):
     shared_tokenizer = False
 
 
-@unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")
-class TestFrankyTextOnlyPdEndToEnd(CustomTestCase):
-    """A Ricky without Franky parts under PD, as a chain without taps runs it:
-    its legs go from prefill to decode over NIXL's own classes, and decode ends
-    a leg where its blocks call Sandy."""
+@unittest.skipUnless(torch.cuda.device_count() >= 3, "requires 3 GPUs")
+class TestFrankyPdSandyEndToEnd(_FrankyPair):
+    """A Sandy prefill and a Sandy decode, and an aggregated Ricky: Sandy
+    prefill relays the trace's taps to Sandy decode with its KV, and Sandy
+    decode writes the call and sends Ricky the taps of the trace and its text.
+    """
+
+    prefill_pp_size = 1
+    decode_flags = ()
+
+    @classmethod
+    def _servers(cls):
+        cls.pd_port = _free_port(19496)
+        relay_port = _free_port(19396)
+        cls.sandy_prefill_url = f"http://127.0.0.1:{_free_port(31700)}"
+        pd = ["--disaggregation-transfer-backend", "nixl"]
+        prefill = [
+            *pd,
+            "--disaggregation-mode", "prefill",
+            "--disaggregation-bootstrap-port", str(cls.pd_port),
+            "--pp-size", str(cls.prefill_pp_size),
+        ]  # fmt: skip
+        decode = [*pd, "--disaggregation-mode", "decode", *cls.decode_flags]
+        decode_gpu = cls.prefill_pp_size
+        return [
+            cls._launch(
+                "sandy",
+                cls.sandy_prefill_url,
+                gpu=0,
+                tp_size=1,
+                extra=prefill,
+                franky_port=relay_port,
+            ),
+            cls._launch(
+                "sandy", cls.sandy_url, gpu=decode_gpu, tp_size=1, extra=decode
+            ),
+            cls._launch("ricky", cls.ricky_url, gpu=decode_gpu + 1, tp_size=1),
+        ]
+
+    def test_ricky_reads_the_taps_of_a_pd_sandys_trace_and_text(self):
+        self._assert_ricky_reads_a_pd_sandy_call(_STORY_PROMPT, room_id=4700)
+
+    def _assert_ricky_reads_a_pd_sandy_call(self, prompt_text, *, room_id):
+        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(prompt_text)
+        room = self._room(room_id)
+        call = {
+            "input_ids": prompt,
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": _WRITTEN,
+                "ignore_eos": True,
+            },
+            "franky_room": room,
+            "bootstrap_host": "127.0.0.1",
+            "bootstrap_port": self.pd_port,
+            "bootstrap_room": room_id,
+        }
+        answers = {}
+
+        def post(url):
+            answers[url] = requests.post(
+                f"{url}/generate", json=call, timeout=600
+            ).json()
+
+        threads = [
+            threading.Thread(target=post, args=(url,))
+            for url in (self.sandy_prefill_url, self.sandy_url)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        sandy = answers[self.sandy_url]
+        written = sandy["output_ids"]
+        self.assertEqual(len(written), _WRITTEN)
+        trace = prompt + written
+        runs = [[len(prompt), len(trace)]]
+        ricky = requests.post(
+            f"{self.ricky_url}/generate",
+            json={
+                "input_ids": trace,
+                "sampling_params": {"temperature": 0, "max_new_tokens": _NEW_TOKENS},
+                "return_logprob": True,
+                "franky_room": room,
+                "franky_tap_runs": runs,
+            },
+            timeout=600,
+        ).json()
+
+        pairs = ricky["meta_info"]["output_token_logprobs"]
+        output = (
+            [pair[1] for pair in pairs],
+            torch.tensor([pair[0] for pair in pairs]),
+        )
+        without_written = [[len(prompt), len(prompt)]]
+        ref, ref_without_written = self._reference(
+            [trace, trace], [output, output], runs=[runs, without_written]
+        )
+        error = (output[1] - ref["readers"]).abs().max().item()
+        written_effect = (ref["readers"] - ref_without_written["readers"]).abs().max()
+        self.assertLess(error, 0.2)
+        self.assertGreater(written_effect.item(), 4 * error)
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 4, "requires 4 GPUs")
+class TestFrankyPdSandyPp2EndToEnd(TestFrankyPdSandyEndToEnd):
+    """Sandy prefill on two pipeline stages, each relaying its own encoders'
+    taps to Sandy decode."""
+
+    prefill_pp_size = 2
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 3, "requires 3 GPUs")
+class TestFrankyPdSandyDecodeCacheEndToEnd(TestFrankyPdSandyEndToEnd):
+    """Sandy decode with a prefix cache serves calls one after another. This
+    hybrid model keeps no state checkpoints on decode, so decode reuses no
+    prefix here; unit tests cover the relay past a decode prefix."""
+
+    decode_flags = ("--disaggregation-decode-enable-radix-cache",)
+
+    def test_calls_on_one_prompt_read_the_same_taps(self):
+        prompt = _TEXT * 2 + _STORY_PROMPT
+        self._assert_ricky_reads_a_pd_sandy_call(prompt, room_id=4800)
+        self._assert_ricky_reads_a_pd_sandy_call(prompt, room_id=4801)
+
+
+class _TextOnlyPd(CustomTestCase):
+    """A Franky side without Franky parts as a PD pair: requests go from
+    prefill to decode over NIXL's own classes."""
+
+    side = ""
 
     @classmethod
     def setUpClass(cls):
         cls.pd_port = _free_port(19296)
         cls.prefill_url = f"http://127.0.0.1:{_free_port(31500)}"
         cls.decode_url = f"http://127.0.0.1:{_free_port(31600)}"
-        ricky = [
-            "--franky-side", "ricky",
+        side = [
+            "--franky-side", cls.side,
             "--disaggregation-transfer-backend", "nixl",
             "--mem-fraction-static", "0.6",
         ]  # fmt: skip
         if torch.cuda.get_device_capability()[0] >= 10:
-            ricky += ["--attention-backend", "trtllm_mha"]
+            side += ["--attention-backend", "trtllm_mha"]
         prefill = [
             "--base-gpu-id", "0",
             "--disaggregation-mode", "prefill",
@@ -707,7 +831,7 @@ class TestFrankyTextOnlyPdEndToEnd(CustomTestCase):
                 _MODEL,
                 url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[*ricky, *stage],
+                other_args=[*side, *stage],
             )
             for url, stage in ((cls.prefill_url, prefill), (cls.decode_url, decode))
         ]
@@ -716,6 +840,38 @@ class TestFrankyTextOnlyPdEndToEnd(CustomTestCase):
     def tearDownClass(cls):
         for process in cls.processes:
             kill_process_tree(process.pid)
+
+    def _post_to_pair(self, body, *, room):
+        body = {
+            **body,
+            "bootstrap_host": "127.0.0.1",
+            "bootstrap_port": self.pd_port,
+            "bootstrap_room": room,
+        }
+        answers = {}
+
+        def post(url):
+            answers[url] = requests.post(
+                f"{url}/generate", json=body, timeout=600
+            ).json()
+
+        threads = [
+            threading.Thread(target=post, args=(url,))
+            for url in (self.prefill_url, self.decode_url)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return answers[self.decode_url]
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")
+class TestFrankyTextOnlyPdEndToEnd(_TextOnlyPd):
+    """A Ricky without Franky parts under PD, as a chain without taps runs it:
+    decode ends a leg where its blocks call Sandy."""
+
+    side = "ricky"
 
     def test_a_leg_ends_on_decode_where_its_blocks_call_sandy(self):
         leg = {
@@ -737,30 +893,39 @@ class TestFrankyTextOnlyPdEndToEnd(CustomTestCase):
                     },
                 },
             },
-            "bootstrap_host": "127.0.0.1",
-            "bootstrap_port": self.pd_port,
-            "bootstrap_room": 6100,
         }
-        answers = {}
 
-        def post(url):
-            answers[url] = requests.post(
-                f"{url}/generate", json=leg, timeout=600
-            ).json()
+        meta_info = self._post_to_pair(leg, room=6100)["meta_info"]
 
-        threads = [
-            threading.Thread(target=post, args=(url,))
-            for url in (self.prefill_url, self.decode_url)
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-        meta_info = answers[self.decode_url]["meta_info"]
         self.assertEqual(meta_info["finish_reason"]["type"], "franky_sandy_call")
         self.assertEqual(meta_info["finish_reason"]["next_block"], 3)
         self.assertEqual(meta_info["completion_tokens"], 16)
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 2, "requires 2 GPUs")
+class TestFrankyTextOnlySandyPdEndToEnd(_TextOnlyPd):
+    """A Sandy without Franky parts under PD, as a chain without taps calls it:
+    decode writes what the call asks."""
+
+    side = "sandy"
+
+    def test_a_sandy_call_writes_its_tokens_on_decode(self):
+        call = {
+            "input_ids": AutoTokenizer.from_pretrained(_MODEL).encode(_TEXT),
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": _WRITTEN,
+                "ignore_eos": True,
+            },
+        }
+
+        answer = self._post_to_pair(call, room=6200)
+
+        self.assertEqual(len(answer["output_ids"]), _WRITTEN)
+        self.assertEqual(
+            answer["meta_info"]["finish_reason"],
+            {"type": "length", "length": _WRITTEN},
+        )
 
 
 if __name__ == "__main__":

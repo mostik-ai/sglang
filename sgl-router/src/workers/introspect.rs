@@ -33,6 +33,7 @@ use sglang_processor::openai::OpenAiSettings;
 use tracing::warn;
 use url::Url;
 
+use crate::discovery::FrankyRole;
 use crate::state::kv_events::EventConfig;
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
@@ -83,16 +84,6 @@ pub struct ServerInfo {
     pub prefill_before_bootstrap: Option<bool>,
     /// The engine's side of a Franky pair; `None` for a solo engine.
     pub franky_role: Option<FrankyRole>,
-}
-
-/// A Franky engine's side, from `/server_info` `franky_side`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrankyRole {
-    /// Computes prompts' taps and serves them on its tap bootstrap port.
-    Sandy { bootstrap_port: u16 },
-    /// Writes a chain's blocks; with `reads_taps` (its `--franky-config`),
-    /// each request needs a Sandy.
-    Ricky { reads_taps: bool },
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -362,7 +353,9 @@ fn resolve_franky_role(
 ) -> Option<FrankyRole> {
     match (side?, bootstrap_port) {
         ("null", _) => None,
-        ("sandy", Some(bootstrap_port)) => Some(FrankyRole::Sandy { bootstrap_port }),
+        ("sandy", Some(tap_port)) => Some(FrankyRole::Sandy {
+            tap_port: Some(tap_port),
+        }),
         ("ricky", _) => Some(FrankyRole::Ricky {
             reads_taps: has_config,
         }),
@@ -534,7 +527,7 @@ mod tests {
                 Some(8996),
                 true,
                 Some(FrankyRole::Sandy {
-                    bootstrap_port: 8996,
+                    tap_port: Some(8996),
                 }),
             ),
             (

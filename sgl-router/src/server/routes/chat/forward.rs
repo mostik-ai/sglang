@@ -7,7 +7,7 @@ use super::nonempty_header;
 use super::preparation::{
     append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
-use crate::discovery::{ModelId, WorkerId, WorkerMode};
+use crate::discovery::{ModelId, WorkerId};
 use crate::policies::dp_rank::select_dp_rank;
 use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
@@ -47,6 +47,13 @@ pub(super) struct SelectedWorkers {
     pub(super) decode: Option<Arc<Worker>>,
     pub(super) sandy: Option<Arc<Worker>>,
     pub(super) track_dispatch_timestamps: bool,
+}
+
+impl SelectedWorkers {
+    /// The worker whose response reaches the client: the decode of a PD pair.
+    pub(super) fn answering(&self) -> &Arc<Worker> {
+        self.decode.as_ref().unwrap_or(&self.prefill)
+    }
 }
 
 /// PD sends to both workers and returns the decode response.
@@ -174,6 +181,7 @@ async fn dispatch<T: Transport>(
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<Dispatched<T::Response>, ApiError> {
     request.franky.open_room(&workers);
+    let answering = Arc::clone(workers.answering());
     let SelectedWorkers {
         prefill,
         decode,
@@ -210,13 +218,7 @@ async fn dispatch<T: Transport>(
         request_started_at.elapsed(),
     );
     // Attribute the outcome to the worker supplying the client-visible response.
-    let metrics = DispatchMetrics::new(
-        ctx,
-        request,
-        decode.as_deref().unwrap_or(&prefill),
-        request_started_at,
-        duration,
-    );
+    let metrics = DispatchMetrics::new(ctx, request, &answering, request_started_at, duration);
     let pd_prefill = decode.is_some().then(|| prefill.id.clone());
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
     let pd = decode.map(|decode| {
@@ -296,7 +298,7 @@ async fn dispatch<T: Transport>(
             ctx,
             &metrics,
             Arc::clone(&sandy),
-            WorkerModeLabel::Sandy,
+            WorkerModeLabel::of(&sandy),
             path,
             leg,
             load_guards,
@@ -316,7 +318,7 @@ async fn dispatch<T: Transport>(
                 ctx,
                 &metrics,
                 Arc::clone(&prefill),
-                WorkerModeLabel::Prefill,
+                WorkerModeLabel::of(&prefill),
                 path,
                 prefill_leg,
                 prefill_load_guards,
@@ -1027,12 +1029,7 @@ impl DispatchMetrics {
             registry: Arc::clone(&ctx.metrics),
             model: request.model.0.clone(),
             worker_url: response_worker.url.clone(),
-            mode: match response_worker.mode() {
-                WorkerMode::Prefill => WorkerModeLabel::Prefill,
-                WorkerMode::Decode => WorkerModeLabel::Decode,
-                WorkerMode::Plain => WorkerModeLabel::Plain,
-                WorkerMode::Sandy => WorkerModeLabel::Sandy,
-            },
+            mode: WorkerModeLabel::of(response_worker),
             streaming: request.streaming,
             request_started_at,
             duration: Arc::clone(duration),
@@ -1158,6 +1155,7 @@ impl Drop for RequestDurationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::WorkerMode;
 
     #[tokio::test]
     async fn stream_after_prefill_waits_for_prefill() {

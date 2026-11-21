@@ -5,22 +5,21 @@ from typing import TYPE_CHECKING, List, Optional
 
 from typing_extensions import override
 
-from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
-from sglang.srt.disaggregation.utils import DisaggregationMode, is_aborted
+from sglang.srt.disaggregation.utils import is_aborted
 from sglang.srt.franky.finish_rules.tap_step import TapStep
 from sglang.srt.franky.request import FrankyRequest
 from sglang.srt.franky.schedulers.chain import FrankyChainScheduler
 from sglang.srt.franky.schedulers.sandy_batch_result_processor import (
     SandyBatchResultProcessor,
 )
-from sglang.srt.franky.transfer.manager import FrankyTapManager
 from sglang.srt.franky.transfer.messages import FrankySendDone
 from sglang.srt.franky.transfer.rank_reports import FrankyRankReports
+from sglang.srt.franky.transfer.relay.ends import FrankySendingEnd
 from sglang.srt.franky.transfer.send_queue import FrankySendQueue
 from sglang.srt.franky.transfer.senders.room import FrankyRoomSender
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.runtime_context import get_device, get_franky, get_parallel, get_serving
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import ceil_div
 from sglang.utils import TypeBasedDispatcher
 
@@ -54,25 +53,9 @@ class SandyScheduler(FrankyChainScheduler):
         )
 
     def init_franky_sending(self) -> None:
-        """Sandy's end of tap transfers over PD's NIXL classes: the bootstrap
-        server on the first rank, and a tap manager on every rank, since Ricky
-        waits for every rank and the server for every rank to register.
-        """
-        parallel = get_parallel()
-        port = get_franky().franky_bootstrap_port
-        self.franky_bootstrap_server = (
-            CommonKVBootstrapServer(host=get_serving().host, port=port)
-            if parallel.tp_rank == 0 and parallel.pp_rank == 0
-            else None
-        )
-        self.franky_tap_manager = FrankyTapManager.from_buffers(
+        self.franky_sending = FrankySendingEnd.build(
             buffers=self.tp_worker.model_runner.franky_parts.tap_cache.buffers,
-            side=DisaggregationMode.PREFILL,
             server_args=self.server_args,
-            bootstrap_port=port,
-            engine_rank=parallel.tp_rank,
-            pp_rank=parallel.pp_rank,
-            gpu_id=get_device().gpu_id,
         )
 
     def init_franky_send_queue(self) -> None:
@@ -102,18 +85,10 @@ class SandyScheduler(FrankyChainScheduler):
         *,
         mm_input_error: Optional[str] = None,
     ) -> None:
-        # SGLang's server warmup sends requests without a room, which no Ricky reads.
-        has_embeds = recv_req.mm_inputs is not None or recv_req.input_embeds is not None
-        if has_embeds and recv_req.franky is not None and recv_req.franky.room:
-            mm_input_error = "--franky-side sandy takes token ids only in a room."
-        if recv_req.franky is not None and recv_req.franky.taps_only:
-            recv_req.sampling_params.max_new_tokens = 0
-        recv_req.sampling_params.json_schema = None
-        recv_req.sampling_params.regex = None
-        recv_req.sampling_params.ebnf = None
-        recv_req.sampling_params.structural_tag = None
-        recv_req.return_logprob = False
-        super().handle_generate_request(recv_req, mm_input_error=mm_input_error)
+        refusal = prepare_sandy_request(recv_req)
+        super().handle_generate_request(
+            recv_req, mm_input_error=refusal or mm_input_error
+        )
 
     @override
     def init_req_max_new_tokens(self, req: Req) -> None:
@@ -167,10 +142,31 @@ class SandyScheduler(FrankyChainScheduler):
 
     def _open_franky_room(self, req: Req, num_tokens: int) -> FrankyTapSender:
         return FrankyRoomSender(
-            manager=self.franky_tap_manager,
+            manager=self.franky_sending.manager,
             franky_room=FrankyRequest.of(req).room,
             num_pages=ceil_div(
                 num_tokens,
                 self.tp_worker.model_runner.franky_parts.tap_cache.buffers.page_size,
             ),
         )
+
+
+def prepare_sandy_request(recv_req: TokenizedGenerateReqInput) -> Optional[str]:
+    """Sandy writes plain text: no constrained decoding and no logprobs; a
+    taps-only request writes nothing.
+
+    Returns:
+        Why the request is refused, or None.
+    """
+    if recv_req.franky is not None and recv_req.franky.taps_only:
+        recv_req.sampling_params.max_new_tokens = 0
+    recv_req.sampling_params.json_schema = None
+    recv_req.sampling_params.regex = None
+    recv_req.sampling_params.ebnf = None
+    recv_req.sampling_params.structural_tag = None
+    recv_req.return_logprob = False
+    has_embeds = recv_req.mm_inputs is not None or recv_req.input_embeds is not None
+    # SGLang's server warmup sends requests without a room, which no Ricky reads.
+    if has_embeds and recv_req.franky is not None and recv_req.franky.room:
+        return "--franky-side sandy takes token ids only in a room."
+    return None

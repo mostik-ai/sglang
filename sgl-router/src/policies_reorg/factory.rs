@@ -8,7 +8,8 @@ use anyhow::{bail, ensure, Result};
 use serde::Deserialize;
 
 use crate::buckets_reorg::{
-    Bucket, BucketGroups, BucketResolver, EngineGroup, SloPreference, TokenLimits,
+    Bucket, BucketGroups, BucketResolver, EngineGroup, SandyPool, SloPreference, TokenLimits,
+    WorkerPool,
 };
 use crate::config::{
     AffinityConfig, AffinityMode, BalancedBy, DecodePolicyKind, FilterKind, ModelConfig,
@@ -187,7 +188,7 @@ pub fn build_resolver(
     model: &ModelConfig,
     state: &KvEventIndex,
     external_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
-) -> Result<(BucketResolver, EngineGroup, Option<JanitorHandle>)> {
+) -> Result<(BucketResolver, SandyPool, Option<JanitorHandle>)> {
     let mut groups = Groups {
         model,
         state,
@@ -254,18 +255,18 @@ pub fn build_resolver(
     resolver.ttft_slo = config.ttft_slo;
     resolver.tps_slo = config.tps_slo;
     // Shares the buckets' cache source, so one prefix lookup serves both picks.
-    let sandy = groups.build("sandy", Stage::Sandy, &GroupSpec::default())?;
+    let sandy = groups.build_sandy(&GroupSpec::default())?;
     Ok((resolver, sandy, groups.cleanup))
 }
 
-/// The model's Sandy group under legacy routing. `--policy cache_aware` and
+/// The model's Sandy pool under legacy routing. `--policy cache_aware` and
 /// `session_aware` pick as they do under reorg, in prefer mode; any other
 /// policy picks by load.
 pub fn build_sandy_group(
     model: &ModelConfig,
     state: &KvEventIndex,
     external_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
-) -> Result<(EngineGroup, Option<JanitorHandle>)> {
+) -> Result<(SandyPool, Option<JanitorHandle>)> {
     let policy = match model.policy {
         PolicyKind::CacheAware | PolicyKind::SessionAware => model.policy,
         _ => PolicyKind::PowerOfTwo,
@@ -290,7 +291,7 @@ pub fn build_sandy_group(
         policy: Some(policy),
         ..Default::default()
     };
-    let sandy = groups.build("sandy", Stage::Sandy, &spec)?;
+    let sandy = groups.build_sandy(&spec)?;
     Ok((sandy, groups.cleanup))
 }
 
@@ -377,7 +378,26 @@ impl Groups<'_> {
             worker_ids: spec.worker_ids.clone(),
             worker_services: spec.worker_services.clone(),
             policy,
+            pool: WorkerPool::Serving,
         })
+    }
+
+    /// The model's Sandy pool: a plain bucket, and a PD bucket whose decode
+    /// group picks as a decode group with default settings does.
+    fn build_sandy(&mut self, spec: &GroupSpec) -> Result<SandyPool> {
+        let mut sandy = |stage, spec: &GroupSpec| -> Result<EngineGroup> {
+            let group = self.build("sandy", stage, spec)?;
+            Ok(EngineGroup {
+                pool: WorkerPool::Sandy,
+                ..group
+            })
+        };
+        let plain = Bucket::new("sandy", BucketGroups::Plain(sandy(Stage::Plain, spec)?));
+        let pd = BucketGroups::Pd {
+            prefill: sandy(Stage::Prefill, spec)?,
+            decode: sandy(Stage::Decode, &GroupSpec::default())?,
+        };
+        Ok(SandyPool::new(plain, Bucket::new("sandy", pd))?)
     }
 
     fn store(&mut self) -> Arc<AffinityStore> {
@@ -427,5 +447,32 @@ mod tests {
             (AffinityMode::Balanced, BalancedBy::RunningRequests, 4)
         );
         assert_eq!(AffinitySpec::default().or(&cli).unwrap().load_gap(), 2_048);
+    }
+
+    /// Under any `--policy`, a Sandy pool's PD decode group picks as a decode
+    /// group does, so PD Sandys serve under cache-aware routing too.
+    #[tokio::test]
+    async fn a_sandy_pools_decode_group_serves_decode_under_every_policy() {
+        let config = crate::server::app_context::AppContext::stub()
+            .config
+            .clone();
+        for policy in [
+            PolicyKind::CacheAware,
+            PolicyKind::SessionAware,
+            PolicyKind::RoundRobin,
+        ] {
+            let model = ModelConfig {
+                policy,
+                ..config.model.clone()
+            };
+
+            let (pool, _) = build_sandy_group(&model, &KvEventIndex::new(), None).unwrap();
+
+            let BucketGroups::Pd { decode, .. } = &pool.pd.groups else {
+                panic!("a Sandy pool's PD bucket has a prefill and a decode group");
+            };
+            assert!(decode.policy.supports(Stage::Decode), "{policy:?}");
+            assert_eq!(decode.pool, WorkerPool::Sandy, "{policy:?}");
+        }
     }
 }
