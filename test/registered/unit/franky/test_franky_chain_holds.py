@@ -84,6 +84,36 @@ class TestFrankyChainHolds(CustomTestCase):
 
         self.assertEqual(self.tree.locked, ["other-block"])
 
+    def test_ended_chains_are_announced_once_in_the_order_they_ended(self):
+        ended = self._holds(hold_seconds=0.0)
+        live = self._holds(hold_seconds=3600.0)
+        for holds in (ended, live):
+            holds.end(chain_id="a")
+            holds.end(chain_id="b")
+
+        self.assertEqual(
+            ended.expired_messages(),
+            [
+                FrankyHoldExpired(chain_id="a", order=0),
+                FrankyHoldExpired(chain_id="b", order=1),
+            ],
+        )
+        self.assertEqual(ended.expired_messages(), [])
+        self.assertEqual(live.expired_messages(), [])
+
+    def test_an_ended_chain_is_forgotten_at_its_expiry_on_every_rank(self):
+        leader, other = self._holds(hold_seconds=0.0), self._holds(hold_seconds=0.0)
+        for holds in (leader, other):
+            holds.end(chain_id="c")
+
+        [expired] = leader.expired_messages()
+        for holds in (leader, other):
+            holds.on_hold_expired(message=expired)
+            holds.hold_for_next_request(_block("c", node="next-block"))
+
+        self.assertEqual(expired.chain_id, "c")
+        self.assertEqual(self.tree.locked, ["next-block", "next-block"])
+
     def test_a_request_outside_chains_holds_nothing(self):
         holds = self._holds()
         plain = SimpleNamespace(franky=None, last_node="n", origin_input_ids=[0])
@@ -250,6 +280,16 @@ class TestFrankyChainHoldsOfTaps(CustomTestCase):
 
                 self.assertEqual(self.tap_cache.released, ["taps-c"])
                 holds.release_all()
+
+    def test_a_leg_held_twice_after_its_chain_ended_holds_nothing(self):
+        # A Ricky leg that reads taps is held for its KV, then for its taps.
+        self.holds.end(chain_id="c")
+
+        self.holds.hold_for_next_request(_block("c", node="c"))
+        self.holds.hold_for_next_request(_block("c", node="c"), tap_lock="taps-c")
+
+        self.assertEqual(self.tree.locked, [])
+        self.assertEqual(self.tap_cache.released, ["taps-c"])
 
     def test_a_request_outside_chains_releases_its_tap_lock_at_once(self):
         plain = SimpleNamespace(
