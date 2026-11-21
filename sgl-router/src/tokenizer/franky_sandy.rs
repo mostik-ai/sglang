@@ -83,16 +83,14 @@ impl FrankySandyTokens {
         })
     }
 
-    /// Sandy's tokens of `text` inside an answer it already holds the start of:
-    /// plain text, which cannot name special tokens.
+    /// Sandy's tokens of `text` inside an answer it already holds the start of,
+    /// as `adapter::encode_answer_text` encodes it on Sandy's backend.
     ///
     /// Errors: the tokenizer fails.
     pub fn encode_answer_text(&self, text: &str) -> Result<Vec<u32>> {
         adapter::encode_answer_text(&self.tokenizer, self.backend, text)
     }
 
-    /// The token where Sandy's answer's text ends before its template closes
-    /// the answer, at which Sandy's calls stop.
     pub fn text_end(&self) -> Option<u32> {
         self.adapter.text_end()
     }

@@ -54,11 +54,8 @@ class FrankyRelaySender(NixlKVSender):
 
     @override
     def poll(self) -> int:
-        """The less advanced of the two transfers. The decode's tap receiver
-        joins the room apart from its KV receiver, so the taps may still wait
-        for it once the KV is on its way: PD's queues see that as waiting for
-        input, and a receiver that never comes fails at the bootstrap timeout.
-        """
+        """The less advanced of the KV transfer and the relay; a relay still
+        waiting for its receiver counts as waiting for input."""
         state = super().poll()
         if self.tap_sender is None:
             return state
