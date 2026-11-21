@@ -32,7 +32,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=2250, stage="base-b", runner_config="4-gpu-b200")
 
 _MODEL = "Qwen/Qwen3.5-0.8B"
 _LAYERS = [6, 12, 18, 24]
@@ -49,6 +49,9 @@ _TEXT = (
     "The river ran through the old town, past the mill and the bakery, under the "
     "stone bridge where children threw pebbles into the water every evening. "
 )
+# A short prompt whose continuation is new text, so the taps of Sandy's tokens
+# are most of what Ricky reads, not near copies of the prompt's.
+_STORY_PROMPT = "Write a short story about a lighthouse keeper who finds a map."
 
 
 def _hf_model():
@@ -452,12 +455,7 @@ class TestFrankyEndToEnd(_FrankyPair):
             )
 
     def test_ricky_reads_the_taps_of_the_tokens_sandy_wrote(self):
-        # A short prompt whose continuation is new text, so the taps of
-        # Sandy's tokens are most of what Ricky reads, not near copies of the
-        # prompt's.
-        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(
-            "Write a short story about a lighthouse keeper who finds a map."
-        )
+        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(_STORY_PROMPT)
         room = self._room(4500)
         sandy = requests.post(
             f"{self.sandy_url}/generate",
@@ -671,6 +669,9 @@ class TestFrankyPdSandyEndToEnd(_FrankyPair):
     decode writes the call and sends Ricky the taps of the trace and its text.
     """
 
+    prefill_pp_size = 1
+    decode_flags = ()
+
     @classmethod
     def _servers(cls):
         cls.pd_port = find_available_port(19496)
@@ -681,8 +682,10 @@ class TestFrankyPdSandyEndToEnd(_FrankyPair):
             *pd,
             "--disaggregation-mode", "prefill",
             "--disaggregation-bootstrap-port", str(cls.pd_port),
+            "--pp-size", str(cls.prefill_pp_size),
         ]  # fmt: skip
-        decode = [*pd, "--disaggregation-mode", "decode"]
+        decode = [*pd, "--disaggregation-mode", "decode", *cls.decode_flags]
+        decode_gpu = cls.prefill_pp_size
         return [
             cls._launch(
                 "sandy",
@@ -692,15 +695,18 @@ class TestFrankyPdSandyEndToEnd(_FrankyPair):
                 extra=prefill,
                 franky_port=relay_port,
             ),
-            cls._launch("sandy", cls.sandy_url, gpu=1, tp_size=1, extra=decode),
-            cls._launch("ricky", cls.ricky_url, gpu=2, tp_size=1),
+            cls._launch(
+                "sandy", cls.sandy_url, gpu=decode_gpu, tp_size=1, extra=decode
+            ),
+            cls._launch("ricky", cls.ricky_url, gpu=decode_gpu + 1, tp_size=1),
         ]
 
     def test_ricky_reads_the_taps_of_a_pd_sandys_trace_and_text(self):
-        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(
-            "Write a short story about a lighthouse keeper who finds a map."
-        )
-        room = self._room(4700)
+        self._assert_ricky_reads_a_pd_sandy_call(_STORY_PROMPT, room_id=4700)
+
+    def _assert_ricky_reads_a_pd_sandy_call(self, prompt_text, *, room_id):
+        prompt = AutoTokenizer.from_pretrained(_MODEL).encode(prompt_text)
+        room = self._room(room_id)
         call = {
             "input_ids": prompt,
             "sampling_params": {
@@ -711,7 +717,7 @@ class TestFrankyPdSandyEndToEnd(_FrankyPair):
             "franky_room": room,
             "bootstrap_host": "127.0.0.1",
             "bootstrap_port": self.pd_port,
-            "bootstrap_room": 4700,
+            "bootstrap_room": room_id,
         }
         answers = {}
 
@@ -758,6 +764,28 @@ class TestFrankyPdSandyEndToEnd(_FrankyPair):
         written_effect = (ref["readers"] - ref_without_written["readers"]).abs().max()
         self.assertLess(error, 0.2)
         self.assertGreater(written_effect.item(), 4 * error)
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 4, "requires 4 GPUs")
+class TestFrankyPdSandyPp2EndToEnd(TestFrankyPdSandyEndToEnd):
+    """Sandy prefill on two pipeline stages, each relaying its own encoders'
+    taps to Sandy decode."""
+
+    prefill_pp_size = 2
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 3, "requires 3 GPUs")
+class TestFrankyPdSandyDecodeCacheEndToEnd(TestFrankyPdSandyEndToEnd):
+    """Sandy decode with a prefix cache serves calls one after another. This
+    hybrid model keeps no state checkpoints on decode, so decode reuses no
+    prefix here; unit tests cover the relay past a decode prefix."""
+
+    decode_flags = ("--disaggregation-decode-enable-radix-cache",)
+
+    def test_calls_on_one_prompt_read_the_same_taps(self):
+        prompt = _TEXT * 2 + _STORY_PROMPT
+        self._assert_ricky_reads_a_pd_sandy_call(prompt, room_id=4800)
+        self._assert_ricky_reads_a_pd_sandy_call(prompt, room_id=4801)
 
 
 class _TextOnlyPd(CustomTestCase):
