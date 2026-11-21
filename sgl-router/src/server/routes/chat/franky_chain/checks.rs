@@ -5,16 +5,29 @@ use crate::config::FrankyChainConfig;
 use crate::server::error::ApiError;
 use serde_json::{Map, Value};
 
-const CONSTRAINED_DECODING_FIELDS: [&str; 4] = ["json_schema", "regex", "ebnf", "structural_tag"];
-const FIELDS_CHAINS_CANNOT_JOIN: [&str; 4] = [
-    "return_hidden_states",
-    "return_routed_experts",
-    "return_flat_raw_top_logprobs",
-    "session_params",
+/// A request field and when it asks for something: each field has its own
+/// rule, since the lowering of chats and completions writes some of them
+/// switched off on every request (`return_logprob: false`, `top_logprobs_num: 0`).
+type FieldRule = (&'static str, fn(&Value) -> bool);
+
+const CONSTRAINED_DECODING_FIELDS: [FieldRule; 4] = [
+    ("json_schema", is_given),
+    ("regex", is_given),
+    ("ebnf", is_given),
+    ("structural_tag", is_given),
+];
+const FIELDS_CHAINS_CANNOT_JOIN: [FieldRule; 4] = [
+    ("return_hidden_states", is_true),
+    ("return_routed_experts", is_true),
+    ("return_flat_raw_top_logprobs", is_true),
+    ("session_params", is_given),
 ];
 /// Per-token output, which Sandy's text has none of in Ricky's terms.
-const PER_TOKEN_OUTPUT_FIELDS: [&str; 3] =
-    ["return_logprob", "top_logprobs_num", "token_ids_logprob"];
+const PER_TOKEN_OUTPUT_FIELDS: [FieldRule; 3] = [
+    ("return_logprob", is_true),
+    ("top_logprobs_num", is_positive),
+    ("token_ids_logprob", is_given),
+];
 
 /// Refuses a `/generate` body that a chain under `config` cannot serve.
 ///
@@ -23,31 +36,31 @@ pub(super) fn check_chains_can_serve(
     body: &Map<String, Value>,
     config: &FrankyChainConfig,
 ) -> Result<(), ApiError> {
-    let sampling = body.get("sampling_params");
-    let constrained = CONSTRAINED_DECODING_FIELDS.iter().any(|field| {
-        sampling
-            .and_then(|params| params.get(field))
-            .is_some_and(is_set)
-    });
-    if constrained {
+    let empty = Map::new();
+    let sampling = body
+        .get("sampling_params")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    if asked(sampling, &CONSTRAINED_DECODING_FIELDS).is_some() {
         return Err(refused(
             "constrained decoding, whose state each request of a chain would restart",
         ));
     }
-    if let Some(field) = FIELDS_CHAINS_CANNOT_JOIN
-        .iter()
-        .find(|field| body.get(**field).is_some_and(is_set))
-    {
+    if let Some(field) = asked(body, &FIELDS_CHAINS_CANNOT_JOIN) {
         return Err(refused(&format!("`{field}`")));
     }
-    let sandy_writes = config.sandy_call_tokens > 0;
-    match PER_TOKEN_OUTPUT_FIELDS
-        .iter()
-        .find(|field| sandy_writes && body.get(**field).is_some_and(is_set))
-    {
+    match asked(body, &PER_TOKEN_OUTPUT_FIELDS).filter(|_| config.sandy_call_tokens > 0) {
         Some(field) => Err(refused(&format!("`{field}` while Sandy writes"))),
         None => Ok(()),
     }
+}
+
+/// The first of `rules`' fields that `fields` asks for.
+fn asked(fields: &Map<String, Value>, rules: &[FieldRule]) -> Option<&'static str> {
+    rules
+        .iter()
+        .find(|(field, asks)| fields.get(*field).is_some_and(asks))
+        .map(|(field, _)| *field)
 }
 
 pub(super) fn refused(what: &str) -> ApiError {
@@ -56,17 +69,20 @@ pub(super) fn refused(what: &str) -> ApiError {
     ))
 }
 
-/// Whether a request field asks for something. Null, false, zero and empty
-/// values ask for nothing, and the chat lowering writes some of them on every
-/// request (`return_logprob: false`, `top_logprobs_num: 0`).
-fn is_set(value: &Value) -> bool {
+fn is_true(value: &Value) -> bool {
+    value.as_bool() == Some(true)
+}
+
+fn is_positive(value: &Value) -> bool {
+    value.as_f64().is_some_and(|number| number > 0.0)
+}
+
+fn is_given(value: &Value) -> bool {
     match value {
-        Value::Null | Value::Bool(false) => false,
-        Value::Bool(true) => true,
-        Value::Number(number) => number.as_f64() != Some(0.0),
         Value::String(text) => !text.is_empty(),
         Value::Array(items) => !items.is_empty(),
         Value::Object(fields) => !fields.is_empty(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }
 
@@ -114,10 +130,11 @@ mod tests {
             sandy_call_tokens: 8,
             ..FrankyChainConfig::default()
         };
-        // As the chat lowering writes every request.
+        // As the chat and completion lowering write every request.
         let lowered_chat = object(json!({
             "return_logprob": false,
             "top_logprobs_num": 0,
+            "logprob_start_len": -1,
             "token_ids_logprob": [],
             "sampling_params": {"regex": null, "json_schema": ""},
             "session_params": {},
