@@ -74,6 +74,16 @@ class TestFrankyChainHolds(CustomTestCase):
         holds.release(chain_id="stop")
         self.assertEqual(self.tree.locked, ["call", "limit"])
 
+    def test_a_request_that_ends_after_its_chain_ended_holds_nothing(self):
+        holds = self._holds()
+        holds.hold_for_next_request(_block("c", node="block-1"))
+
+        holds.end(chain_id="c")
+        holds.hold_for_next_request(_block("c", node="late-block"))
+        holds.hold_for_next_request(_block("other", node="other-block"))
+
+        self.assertEqual(self.tree.locked, ["other-block"])
+
     def test_a_request_outside_chains_holds_nothing(self):
         holds = self._holds()
         plain = SimpleNamespace(franky=None, last_node="n", origin_input_ids=[0])

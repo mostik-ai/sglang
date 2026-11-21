@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -16,6 +17,10 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, TreeLock
 
 logger = logging.getLogger(__name__)
+
+# Ended chains remembered, so a request that ends after its chain does holds
+# nothing; a count rather than a time keeps every rank deciding alike.
+_ENDED_CHAINS_KEPT = 4096
 
 
 class _Hold(msgspec.Struct, kw_only=True):
@@ -54,6 +59,7 @@ class FrankyChainHolds:
         self._tap_cache = tap_cache
         self._hold_seconds = hold_seconds
         self._holds: dict[str, _Hold] = {}
+        self._ended: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._next_order = 0
 
     @staticmethod
@@ -81,11 +87,22 @@ class FrankyChainHolds:
                 the holds own from now on.
         """
         chain = FrankyRequest.of(req).chain
-        if chain is None:
+        if chain is None or chain.id in self._ended:
             self._release_tap_lock(tap_lock)
             return
         self.release(chain_id=chain.id)
         self._holds[chain.id] = self._new_hold(req, tap_lock=tap_lock)
+
+    def end(self, *, chain_id: str) -> None:
+        """The router ended the chain on every engine: release its hold, and
+        hold nothing more for it, since one of its requests may still end here
+        after the router got its answer, as a PD prefill's does once its KV
+        transfer ends.
+        """
+        self.release(chain_id=chain_id)
+        self._ended[chain_id] = None
+        if len(self._ended) > _ENDED_CHAINS_KEPT:
+            self._ended.popitem(last=False)
 
     def holds_chain_of(self, req: Req) -> bool:
         chain = FrankyRequest.of(req).chain

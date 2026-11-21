@@ -125,4 +125,4 @@ class RickyDecodeScheduler(Scheduler):
 
     def _handle_end_chain(self, recv_req: FrankyEndChainReq) -> None:
         self.abort_request(AbortReq(rid=recv_req.chain_id))
-        self.franky_taps.chain_holds.release(chain_id=recv_req.chain_id)
+        self.franky_taps.chain_holds.end(chain_id=recv_req.chain_id)
