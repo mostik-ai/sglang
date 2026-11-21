@@ -12,7 +12,11 @@ const TOKEN_STOP_FIELDS: [&str; 1] = ["stop_token_ids"];
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum SandyTokenizer {
     Ricky,
-    Own,
+    /// Sandy's own, whose calls stop at `text_end`, where its template starts
+    /// closing an answer before Sandy's EOS.
+    Own {
+        text_end: Option<u32>,
+    },
 }
 
 /// Which limit a Sandy call's `max_new_tokens` was.
@@ -54,7 +58,8 @@ pub(super) enum SandyRead {
 
 /// The `/generate` body of a Sandy call that writes the answer after
 /// `input_ids` within `limits`, with the client's sampling and stop rules,
-/// but the stop rules in Ricky's ids only for a Sandy that reads them.
+/// but the stop rules in Ricky's ids only for a Sandy that reads them; a Sandy
+/// with its own tokenizer stops where its answer's text ends.
 pub(super) fn sandy_call_body(
     client_body: &Map<String, Value>,
     input_ids: Value,
@@ -67,11 +72,12 @@ pub(super) fn sandy_call_body(
     body.insert("stream".into(), streamed.into());
     let sampling = body.entry("sampling_params").or_insert_with(|| json!({}));
     limits.set_on(sampling);
-    if tokenizer == SandyTokenizer::Own {
-        if let Value::Object(sampling) = sampling {
-            for field in TOKEN_STOP_FIELDS {
-                sampling.remove(field);
-            }
+    if let (SandyTokenizer::Own { text_end }, Value::Object(sampling)) = (tokenizer, sampling) {
+        for field in TOKEN_STOP_FIELDS {
+            sampling.remove(field);
+        }
+        if let Some(text_end) = text_end {
+            sampling.insert("stop_token_ids".into(), json!([text_end]));
         }
     }
     body
@@ -121,19 +127,19 @@ impl SandyStream {
         if finish_reason.is_null() {
             return Ok(SandyRead::Adds(match self.tokenizer {
                 SandyTokenizer::Ricky => added,
-                SandyTokenizer::Own => SandyDelta::default(),
+                SandyTokenizer::Own { .. } => SandyDelta::default(),
             }));
         }
         let adds = match self.tokenizer {
             SandyTokenizer::Ricky => added,
-            SandyTokenizer::Own => SandyDelta {
+            SandyTokenizer::Own { .. } => SandyDelta {
                 ids: ricky_ids_of(&self.text)?,
                 text: std::mem::take(&mut self.text),
             },
         };
         let ricky_ids = match self.tokenizer {
             SandyTokenizer::Ricky => self.ids.clone(),
-            SandyTokenizer::Own => adds.ids.clone(),
+            SandyTokenizer::Own { .. } => adds.ids.clone(),
         };
         let text = SandyText {
             ricky_ids,
@@ -219,7 +225,10 @@ mod tests {
         };
 
         let shared = sandy_call_body(&client, json!([1, 2]), limits, SandyTokenizer::Ricky, false);
-        let own = sandy_call_body(&client, json!([9]), limits, SandyTokenizer::Own, false);
+        let own = SandyTokenizer::Own { text_end: None };
+        let own = sandy_call_body(&client, json!([9]), limits, own, false);
+        let closing = SandyTokenizer::Own { text_end: Some(5) };
+        let closing = sandy_call_body(&client, json!([9]), limits, closing, false);
 
         assert_eq!(shared["input_ids"], json!([1, 2]));
         assert_eq!(shared["stream"], json!(false));
@@ -230,6 +239,10 @@ mod tests {
         assert_eq!(
             own["sampling_params"],
             json!({"temperature": 0.5, "stop": ["\n\n"], "max_new_tokens": 64})
+        );
+        assert_eq!(
+            closing["sampling_params"],
+            json!({"temperature": 0.5, "stop": ["\n\n"], "stop_token_ids": [5], "max_new_tokens": 64})
         );
     }
 
@@ -333,7 +346,8 @@ mod tests {
 
     #[test]
     fn a_sandy_with_its_own_tokenizer_adds_its_text_once_the_call_ends() {
-        let mut stream = SandyStream::new(SandyTokenizer::Own, SandyLimit::Call, true);
+        let own = SandyTokenizer::Own { text_end: None };
+        let mut stream = SandyStream::new(own, SandyLimit::Call, true);
         let ricky_ids_of = |text: &str| {
             assert_eq!(text, "ab");
             Ok(vec![40, 41, 42])

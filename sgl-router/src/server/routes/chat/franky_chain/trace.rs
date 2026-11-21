@@ -64,6 +64,12 @@ impl ChainTrace {
         Some([sandy.prompt_ids.as_slice(), sandy.answer_ids.as_slice()].concat())
     }
 
+    /// Where a Sandy that tokenizes on its own ends its answer's text, when its
+    /// template closes an answer with more than its EOS.
+    pub(super) fn sandy_text_end(&self) -> Option<u32> {
+        self.sandy.as_ref()?.tokens.text_end()
+    }
+
     /// How many tokens the chain wrote, in Ricky's ids.
     pub(super) fn num_written(&self) -> u64 {
         self.answer_ids.len() as u64

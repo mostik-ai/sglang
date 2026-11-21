@@ -14,6 +14,7 @@ pub struct MarkedAnswers {
     answer_header: Vec<u32>,
     openings: Vec<Vec<u32>>,
     answer_end: u32,
+    text_end: Option<u32>,
 }
 
 /// A template's markers, as text.
@@ -25,6 +26,9 @@ struct Markers {
     /// Tried in order, so a longer opening comes before its prefixes.
     openings: &'static [&'static str],
     answer_end: &'static str,
+    /// Where the answer's text ends when the template closes the answer with
+    /// more than the model's EOS.
+    text_end: Option<&'static str>,
 }
 
 impl MarkedAnswers {
@@ -41,6 +45,7 @@ impl MarkedAnswers {
                 answer_header: "<|im_start|>assistant\n",
                 openings: &["<think>\n\n</think>\n\n", "<think>\n"],
                 answer_end: "<|im_end|>",
+                text_end: None,
             },
         )
     }
@@ -64,12 +69,14 @@ impl MarkedAnswers {
                 answer_header: "<｜Assistant｜>",
                 openings: &["<think>", "</think>"],
                 answer_end: "<｜end▁of▁sentence｜>",
+                text_end: None,
             },
         )
     }
 
     /// Kimi K3: after `<|open|>message role="assistant"<|sep|>` and its think or
-    /// response opening, up to its `<|end_of_msg|>`.
+    /// response opening, up to its `<|end_of_msg|>`. Its text ends at the first
+    /// `<|close|>`, which starts closing the response and the message.
     ///
     /// Errors: `tokenizer` has no token of its own for a marker.
     pub fn kimi_k3(tokenizer: &Tokenizer) -> Result<Self> {
@@ -77,10 +84,11 @@ impl MarkedAnswers {
             tokenizer,
             &Markers {
                 template: "Kimi K3",
-                special_tokens: &["<|open|>", "<|sep|>", "<|end_of_msg|>"],
+                special_tokens: &["<|open|>", "<|sep|>", "<|close|>", "<|end_of_msg|>"],
                 answer_header: "<|open|>message role=\"assistant\"<|sep|>",
                 openings: &["<|open|>think<|sep|>", "<|open|>response<|sep|>"],
                 answer_end: "<|end_of_msg|>",
+                text_end: Some("<|close|>"),
             },
         )
     }
@@ -98,6 +106,10 @@ impl MarkedAnswers {
             answer_header: encode(tokenizer, markers.answer_header)?,
             openings,
             answer_end: single_token(tokenizer, markers.answer_end, markers.template)?,
+            text_end: markers
+                .text_end
+                .map(|marker| single_token(tokenizer, marker, markers.template))
+                .transpose()?,
         })
     }
 
@@ -112,6 +124,10 @@ impl MarkedAnswers {
 }
 
 impl ChatTemplateAdapter for MarkedAnswers {
+    fn text_end(&self) -> Option<u32> {
+        self.text_end
+    }
+
     fn generated_spans(&self, input_ids: &[u32]) -> Vec<Range<usize>> {
         let mut spans = Vec::new();
         let mut position = 0;
