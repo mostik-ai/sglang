@@ -245,7 +245,7 @@ impl TokenizerRegistry {
     }
 
     /// The model's tokens of `text` inside an answer it already holds the start
-    /// of: plain text, which cannot name special tokens.
+    /// of, as `adapter::encode_answer_text` encodes it on this model's backend.
     ///
     /// Errors: the model's tokenizer is not loaded, or fails on the text.
     pub fn encode_answer_text(&self, model_id: &str, text: &str) -> Result<Vec<u32>> {
