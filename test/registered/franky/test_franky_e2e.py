@@ -54,6 +54,20 @@ _TEXT = (
 _STORY_PROMPT = "Write a short story about a lighthouse keeper who finds a map."
 
 
+_HANDED_OUT_PORTS: set[int] = set()
+
+
+def _free_port(base: int) -> int:
+    """A free port that no earlier draw in this file handed out. An SGLang
+    server binds its HTTP port with SO_REUSEPORT, so two servers that drew one
+    port would share it without an error."""
+    while True:
+        port = find_available_port(base)
+        if port not in _HANDED_OUT_PORTS:
+            _HANDED_OUT_PORTS.add(port)
+            return port
+
+
 def _hf_model():
     from transformers import AutoModelForImageTextToText
 
@@ -121,9 +135,9 @@ class _FrankyPair(CustomTestCase):
     def setUpClass(cls):
         cls.directory = tempfile.mkdtemp(prefix="franky_e2e_")
         cls.sandy_weights, cls.ricky_weights = cls._write_files()
-        cls.bootstrap_port = find_available_port(18996)
-        cls.sandy_url = f"http://127.0.0.1:{find_available_port(31200)}"
-        cls.ricky_url = f"http://127.0.0.1:{find_available_port(31300)}"
+        cls.bootstrap_port = _free_port(18996)
+        cls.sandy_url = f"http://127.0.0.1:{_free_port(31200)}"
+        cls.ricky_url = f"http://127.0.0.1:{_free_port(31300)}"
         cls.processes = cls._servers()
 
     @classmethod
@@ -520,10 +534,10 @@ class TestFrankyPdEndToEnd(_FrankyPair):
 
     @classmethod
     def _servers(cls):
-        cls.relay_port = find_available_port(19096)
-        cls.pd_port = find_available_port(19196)
+        cls.relay_port = _free_port(19096)
+        cls.pd_port = _free_port(19196)
         cls.prefill_url = cls.ricky_url
-        cls.decode_url = f"http://127.0.0.1:{find_available_port(31400)}"
+        cls.decode_url = f"http://127.0.0.1:{_free_port(31400)}"
         pd = ["--disaggregation-transfer-backend", "nixl"]
         relay = ["--franky-bootstrap-port", str(cls.relay_port)]
         return [
@@ -674,9 +688,9 @@ class TestFrankyPdSandyEndToEnd(_FrankyPair):
 
     @classmethod
     def _servers(cls):
-        cls.pd_port = find_available_port(19496)
-        relay_port = find_available_port(19396)
-        cls.sandy_prefill_url = f"http://127.0.0.1:{find_available_port(31700)}"
+        cls.pd_port = _free_port(19496)
+        relay_port = _free_port(19396)
+        cls.sandy_prefill_url = f"http://127.0.0.1:{_free_port(31700)}"
         pd = ["--disaggregation-transfer-backend", "nixl"]
         prefill = [
             *pd,
@@ -796,9 +810,9 @@ class _TextOnlyPd(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.pd_port = find_available_port(19296)
-        cls.prefill_url = f"http://127.0.0.1:{find_available_port(31500)}"
-        cls.decode_url = f"http://127.0.0.1:{find_available_port(31600)}"
+        cls.pd_port = _free_port(19296)
+        cls.prefill_url = f"http://127.0.0.1:{_free_port(31500)}"
+        cls.decode_url = f"http://127.0.0.1:{_free_port(31600)}"
         side = [
             "--franky-side", cls.side,
             "--disaggregation-transfer-backend", "nixl",
